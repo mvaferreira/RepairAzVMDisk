@@ -364,10 +364,8 @@ All actions are logged to a JSON-line audit file (`Repair-AzVMDisk_actions.log`)
 | Blue screen from bad driver | `-DisableDriverOrService "drivername"` |
 | Locked out of VM | `-ResetLocalAdminPassword` or `-AddTempUser` |
 | Stuck on Windows Update | `-FixPendingUpdates` |
-| Third-party EDR/filter driver blocking boot | `-DisableDriverOrService "drivername"` |
+| EDR/filter driver blocking boot | `-DisableDriverOrService "drivername"` |
 | Azure VM agent broken | `-FixAzureGuestAgent` or `-InstallAzureVMAgent` |
-| Disk not coming online in Azure | `-FixSanPolicy` |
-| Credential Guard issues | `-DisableCredentialGuard` |
 | Corrupted system files | `-RunSFC` then `-RepairComponentStore` |
 
 ## Author
