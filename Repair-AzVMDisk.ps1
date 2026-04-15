@@ -1405,6 +1405,65 @@ $($htmlRows -join "`n")
                 }
             }
 
+            # Pre-flight: bcdboot requires the BCD-Template hive to create a new BCD store.
+            # If it is missing, bcdboot will fail with BFSVC error c000000f (cannot open BCD template store).
+            $bcdTemplatePath = Join-Path $script:WinDriveLetter 'Windows\System32\config\BCD-Template'
+            if (-not (Test-Path -LiteralPath $bcdTemplatePath)) {
+
+                # Check whether the host can supply a matching copy before reporting an error
+                $hostTemplate = "$env:SystemRoot\System32\config\BCD-Template"
+                $guestBuildNum = $null
+                try {
+                    Invoke-WithHive 'SOFTWARE' {
+                        $cv = Get-ItemProperty 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+                        if ($cv) { $script:_guestBuild = $cv.CurrentBuildNumber }
+                    }
+                    $guestBuildNum = $script:_guestBuild
+                }
+                catch {}
+                $hostBuildNum = [System.Environment]::OSVersion.Version.Build.ToString()
+                $buildsMatch = $guestBuildNum -and ($guestBuildNum -eq $hostBuildNum)
+
+                if ((Test-Path -LiteralPath $hostTemplate) -and $buildsMatch) {
+                    # Offer to copy the file from the host and continue with -FixBoot
+                    $doCopy = Confirm-CriticalOperation `
+                        -Operation 'Restore BCD-Template from host before rebuilding BCD' `
+                        -Details @"
+BCD-Template hive is missing from the guest:
+  $bcdTemplatePath
+
+A compatible copy was found on this host (guest and host are both build $hostBuildNum).
+The script will copy it to the guest before running bcdboot, then proceed with -FixBoot normally.
+
+  Source : $hostTemplate
+  Target : $bcdTemplatePath
+"@
+                    if ($doCopy) {
+                        Copy-Item -LiteralPath $hostTemplate -Destination $bcdTemplatePath -Force
+                        Write-Host "  [OK] BCD-Template copied from host. Proceeding with BCD rebuild." -ForegroundColor Green
+                    }
+                    else {
+                        $script:_userFacingError = $true
+                        throw "BCD-Template hive is missing: $bcdTemplatePath"
+                    }
+                }
+                else {
+                    # No usable copy available on this host - print actionable error and stop
+                    $guestLabel = if ($guestBuildNum) { "build $guestBuildNum" } else { 'unknown build' }
+                    Write-Host "`n[ERROR] -FixBoot pre-flight check failed" -ForegroundColor Red
+                    Write-Host "  BCD-Template hive is missing: $bcdTemplatePath" -ForegroundColor Red
+                    Write-Host "  bcdboot requires this file to rebuild the BCD store." -ForegroundColor Yellow
+                    if ((Test-Path -LiteralPath $hostTemplate)) {
+                        Write-Host "  Note  : A BCD-Template exists on this host (build $hostBuildNum) but the guest is $guestLabel." -ForegroundColor Yellow
+                        Write-Host "          Using a mismatched copy may cause subtle boot issues." -ForegroundColor Yellow
+                    }
+                    Write-Host "  Fix   : Copy BCD-Template from a source matching the guest OS version, then re-run -FixBoot." -ForegroundColor Yellow
+                    Write-Host "          (e.g. mount a matching WinPE/recovery ISO and copy from X:\Windows\System32\config\BCD-Template)" -ForegroundColor Yellow
+                    $script:_userFacingError = $true
+                    throw "BCD-Template hive is missing: $bcdTemplatePath"
+                }
+            }
+
             $storePath = Get-BcdStorePath -Generation $script:VMGen -BootDrive $script:BootDriveLetter
 
             # Backup existing BCD if present
@@ -1426,6 +1485,14 @@ $($htmlRows -join "`n")
             $rebuildCmd = "bcdboot $WinDrive\Windows /s $SysDrive /v /f $format"
             Write-Host "Rebuilding BCD (Gen$script:VMGen): $rebuildCmd"
             & cmd.exe /c $rebuildCmd
+            if ($LASTEXITCODE -ne 0) {
+                # bcdboot failed - restore original BCD if we backed it up
+                if ($bakPath -and (Test-Path -LiteralPath $bakPath)) {
+                    Write-Warning "bcdboot failed (exit $LASTEXITCODE). Restoring original BCD from backup: $bakPath -> $storePath"
+                    Move-Item -LiteralPath $bakPath -Destination $storePath -Force
+                }
+                throw "bcdboot failed with exit code $LASTEXITCODE. BCD was not created. See BFSVC output above for details."
+            }
 
             # Verify rebuild
             $verifyCmd = "bcdedit /store `"$storePath`" /enum"
@@ -1478,7 +1545,7 @@ $($htmlRows -join "`n")
             }
         }
         catch {
-            Write-Error "RebuildBCD failed: $_"
+            if (-not $script:_userFacingError) { Write-Error "RebuildBCD failed: $_" }
             throw
         }
     }
@@ -4343,6 +4410,7 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
 
         # Critical boot files (on-disk binary presence checks)
         $sevCriticalBootFileMissing = 2   # Core boot binary (winload/bootmgr/hal/ntdll/kernel32) missing or 0-byte
+        $sevBcdTemplateMissing = 2   # BCD-Template hive missing - bcdboot fails with c000000f if absent
         $sevSyntheticDriverBroken = 2   # Azure synthetic driver (vmbus/storvsc/netvsc) wrong Start value or binary missing
         $sevSessionInitMissing = 2   # Session init executable (smss/wininit/services/lsass/winlogon/logonui) missing or 0-byte
         $sevBinarySignatureBad = 2   # Critical boot/session binary is not Microsoft-signed (possible tampering)
@@ -4613,6 +4681,20 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
         )
         if ($script:VMGen -eq 1) {
             $bootBinaries += @{ Name = 'bootmgr'; Path = (Join-Path $script:BootDriveLetter 'bootmgr'); Fix = '-FixBoot' }
+        }
+
+        # BCD-Template hive: required by bcdboot to create a new BCD store. If missing, -FixBoot
+        # will fail with BFSVC error c000000f (cannot open BCD template store).
+        $bcdTemplateHive = Join-Path $script:WinDriveLetter 'Windows\System32\config\BCD-Template'
+        $bcdTemplateItem = Get-Item -LiteralPath $bcdTemplateHive -Force -ErrorAction SilentlyContinue
+        if (-not $bcdTemplateItem) {
+            & $emit 'Boot' (& $toSev $sevBcdTemplateMissing) "BCD-Template hive MISSING ($bcdTemplateHive) - bcdboot will fail with error c000000f; -FixBoot cannot succeed until this file is restored" '-FixBoot'
+        }
+        elseif ($bcdTemplateItem.Length -eq 0) {
+            & $emit 'Boot' (& $toSev $sevBcdTemplateMissing) "BCD-Template hive is 0 bytes (corrupt) ($bcdTemplateHive) - bcdboot will fail with error c000000f; restore from a healthy Windows source" '-FixBoot'
+        }
+        else {
+            & $emit 'Boot' 'OK' "BCD-Template hive present ($bcdTemplateHive)"
         }
         $bootFileIssues = 0
         $sigIssues = 0
@@ -9341,7 +9423,7 @@ AVAILABLE DISKS:
             }
         }
         catch {
-            Write-Error "Repair-OfflineDisk encountered an error: $_"
+            if (-not $script:_userFacingError) { Write-Error "Repair-OfflineDisk encountered an error: $_" }
             throw
         }
         finally {
@@ -9393,5 +9475,12 @@ AVAILABLE DISKS:
     }
 
     # Invoke consolidated helper with script-bound parameters
-    Repair-OfflineDisk @PSBoundParameters
+    try {
+        Repair-OfflineDisk @PSBoundParameters
+    }
+    catch {
+        # User-facing pre-flight errors are already printed cleanly; suppress the redundant
+        # unhandled-exception trace that PowerShell would otherwise show at the prompt.
+        if (-not $script:_userFacingError) { throw }
+    }
 } # end
