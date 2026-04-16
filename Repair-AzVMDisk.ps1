@@ -1,4 +1,4 @@
-﻿<#
+<#
     Disclaimer
         The sample scripts are not supported under any Microsoft standard support program or service.
         The sample scripts are provided AS IS without warranty of any kind.
@@ -15,7 +15,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.3.9
+        Version: 0.3.10
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -4279,6 +4279,8 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
         $sevBootPartitionMissing = 2   # Separate boot partition (System Reserved / EFI SP) not found on disk
 
         # Registry
+        $sevHiveMissing = 2   # Expected registry hive file not found on disk
+        $sevHiveEmpty = 2   # Expected registry hive file is 0 bytes (corrupt)
         $sevControlSetMismatch = 1   # Current ControlSet != Default
         $sevRegBackEmpty = 1   # RegBack\SYSTEM is 0 bytes
         $sevRegBackMissing = 0   # RegBack\SYSTEM not found
@@ -4522,6 +4524,38 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
             if ($smiFiles.Count -gt 0) {
                 & $emit 'WindowsUpdate' (& $toSev $sevUpdateSmiLogs) "$($smiFiles.Count) SMI Store transaction log file(s) found (.blf/.regtrans-ms) - may cause update boot loop" "-FixPendingUpdates"
             }
+        }
+
+        # -- 2b. Registry Hive Files -----------------------------------------------
+        Write-Host "--- Registry Hive Files" -ForegroundColor DarkGray
+        $configDir = Join-Path $script:WinDriveLetter 'Windows\System32\config'
+        $expectedHives = @(
+            @{ Name = 'SYSTEM';       IsCrit = $true;  Desc = 'kernel config - BSOD 0xC0000218 if missing' }
+            @{ Name = 'SOFTWARE';     IsCrit = $true;  Desc = 'app/system config - BSOD 0xC0000218 if missing' }
+            @{ Name = 'SAM';          IsCrit = $true;  Desc = 'account database - logon failure if missing' }
+            @{ Name = 'SECURITY';     IsCrit = $true;  Desc = 'security policy - logon failure if missing' }
+            @{ Name = 'DEFAULT';      IsCrit = $false; Desc = 'default user profile hive' }
+            @{ Name = 'COMPONENTS';   IsCrit = $false; Desc = 'CBS/servicing store - update/install failures' }
+            @{ Name = 'BCD-Template'; IsCrit = $false; Desc = 'bcdboot template - needed only for BCD rebuild' }
+            @{ Name = 'DRIVERS';      IsCrit = $false; Desc = 'driver database' }
+        )
+        $hiveIssues = 0
+        foreach ($h in $expectedHives) {
+            $hivePath = Join-Path $configDir $h.Name
+            $hiveItem = Get-Item -LiteralPath $hivePath -Force -ErrorAction SilentlyContinue
+            if (-not $hiveItem) {
+                $missingSev = if ($h.IsCrit) { & $toSev $sevHiveMissing } else { 'WARN' }
+                & $emit 'Registry' $missingSev "$($h.Name) hive MISSING ($hivePath) - $($h.Desc)" '-RestoreRegistryFromRegBack'
+                $hiveIssues++
+            }
+            elseif ($hiveItem.Length -eq 0) {
+                $emptySev = if ($h.IsCrit) { & $toSev $sevHiveEmpty } else { 'WARN' }
+                & $emit 'Registry' $emptySev "$($h.Name) hive is 0 bytes ($hivePath) - $($h.Desc)" '-RestoreRegistryFromRegBack'
+                $hiveIssues++
+            }
+        }
+        if ($hiveIssues -eq 0) {
+            & $emit 'Registry' 'OK' "All expected registry hive files present and non-empty ($($expectedHives.Count) checked)"
         }
 
         # -- 3. BCD ---------------------------------------------------------------
