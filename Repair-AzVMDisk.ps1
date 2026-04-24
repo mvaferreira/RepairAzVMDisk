@@ -15,7 +15,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.3.10
+        Version: 0.3.11
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -4877,7 +4877,7 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                     $sdBinExists = Test-Path -LiteralPath $sdBinPath
                     $sdBinZero = $sdBinExists -and (Get-Item -LiteralPath $sdBinPath -Force -ErrorAction SilentlyContinue).Length -eq 0
                     if (-not $sdExists) {
-                        & $emit 'Drivers' (& $toSev $sevSyntheticDriverBroken) "$($sd.Name) service key missing - $($sd.Desc) will not load" "-EnsureSyntheticDriversEnabled"
+                        & $emit 'Drivers' (& $toSev $sevSyntheticDriverBroken) "$($sd.Name) service key missing - $($sd.Desc) will not load" "-RepairSystemFile $($sd.Bin)"
                         $synBad++
                     }
                     elseif (-not $sdBinExists -or $sdBinZero) {
@@ -4886,7 +4886,7 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                         $synBad++
                     }
                     elseif ($null -ne $sdStart -and [int]$sdStart -ne [int]$sd.Start) {
-                        & $emit 'Drivers' (& $toSev $sevSyntheticDriverBroken) "$($sd.Name) Start=$sdStart (expected $($sd.Start)) - $($sd.Desc)" "-EnsureSyntheticDriversEnabled"
+                        & $emit 'Drivers' (& $toSev $sevSyntheticDriverBroken) "$($sd.Name) Start=$sdStart (expected $($sd.Start)) - $($sd.Desc)" "-RepairSystemFile $($sd.Bin)"
                         $synBad++
                     }
                     else {
@@ -7349,7 +7349,7 @@ to .disabled extension. Does NOT remove them; they can be re-enabled by renaming
             $rows | Format-Table -AutoSize
             $bad = @($rows | Where-Object { -not $_.Healthy })
             if ($bad.Count -gt 0) {
-                Write-Warning "One or more synthetic drivers are not healthy. Consider -EnsureSyntheticDriversEnabled."
+                Write-Warning "One or more synthetic drivers are not healthy. Use -RepairSystemFile <driver.sys> for the affected driver, then rerun checks."
             }
             else {
                 Write-Host "Synthetic driver checks look healthy." -ForegroundColor Green
