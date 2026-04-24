@@ -1,3 +1,5 @@
+#Requires -Version 5.1
+#Requires -RunAsAdministrator
 <#
     Disclaimer
         The sample scripts are not supported under any Microsoft standard support program or service.
@@ -15,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.4.0
+        Version: 0.4.1
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -33,7 +35,9 @@
     .NOTES
         - Must be run as Administrator on the Hyper-V rescue VM.
         - The broken VM's OS disk must be attached to the rescue VM.
-        - Tested on Windows Server 2016 / 2019 / 2022 rescue environments.
+        - Rescue host: Windows 10/11 or Windows Server 2016/2019/2022/2025 with Desktop Experience
+          and the Hyper-V role/feature enabled. Requires Windows PowerShell 5.1.
+        - Target (broken) VM may be any of the above, including Server Core variants.
         - Use -LeaveDiskOnline to keep the disk online after repair (required for chkdsk via -FixNTFS).
 
     .PARAMETER DiskNumber
@@ -619,7 +623,7 @@ end {
             return
         }
 
-        $entries = Get-Content $LogPath | ForEach-Object {
+        $entries = Get-Content -LiteralPath $LogPath -Encoding UTF8 | ForEach-Object {
             try { $_ | ConvertFrom-Json } catch { $null }
         } | Where-Object { $_ }
 
@@ -9889,6 +9893,11 @@ No destructive file or registry cleanup is performed.
         $script:AutoMountedVHDPath = $null   # track if we auto-mounted a VHD for cleanup
         if (-not [string]::IsNullOrWhiteSpace($VMName)) {
             Write-Host "Resolving Hyper-V VM '$VMName'..." -ForegroundColor Cyan
+
+            if (-not (Get-Command Get-VM -ErrorAction SilentlyContinue)) {
+                Write-Error "Hyper-V module is not available on this host. Install/enable the Hyper-V role or use -DiskNumber instead of -VMName."
+                return $false
+            }
 
             $vm = Get-VM -Name $VMName -ErrorAction SilentlyContinue
             if (-not $vm) {
