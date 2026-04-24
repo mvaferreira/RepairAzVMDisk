@@ -15,7 +15,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.3.11
+        Version: 0.4.0
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -245,6 +245,208 @@ end {
         }
     }
 
+    function Get-BcdTextSections {
+        param(
+            [Parameter(Mandatory = $true)][string]$Text
+        )
+
+        $sections = [System.Collections.Generic.List[PSCustomObject]]::new()
+        $lines = @($Text -split "`r?`n")
+        $lineIndex = 0
+        while ($lineIndex -lt $lines.Count) {
+            $currentLine = $lines[$lineIndex]
+            $nextLine = if (($lineIndex + 1) -lt $lines.Count) { $lines[$lineIndex + 1] } else { '' }
+            if (-not [string]::IsNullOrWhiteSpace($currentLine) -and $nextLine -match '^-{3,}\s*$') {
+                $title = $currentLine.Trim()
+                $lineIndex += 2
+                $bodyLines = [System.Collections.Generic.List[string]]::new()
+                while ($lineIndex -lt $lines.Count) {
+                    $probeLine = $lines[$lineIndex]
+                    $probeNextLine = if (($lineIndex + 1) -lt $lines.Count) { $lines[$lineIndex + 1] } else { '' }
+                    if (-not [string]::IsNullOrWhiteSpace($probeLine) -and $probeNextLine -match '^-{3,}\s*$') {
+                        break
+                    }
+                    $bodyLines.Add($probeLine)
+                    $lineIndex++
+                }
+                $body = (($bodyLines | Where-Object { $_ -ne $null }) -join "`n").Trim()
+                if (-not [string]::IsNullOrWhiteSpace($body)) {
+                    $sections.Add([PSCustomObject]@{ Title = $title; Body = $body })
+                }
+                continue
+            }
+            $lineIndex++
+        }
+
+        return @($sections)
+    }
+
+    function Get-BcdInventory {
+        param(
+            [Parameter(Mandatory = $true)][string]$StorePath
+        )
+
+        $inventory = [ordered]@{
+            StorePath       = $StorePath
+            RawText         = ''
+            DefaultId       = ''
+            Timeout         = ''
+            DisplayBootMenu = ''
+            Loaders         = @()
+        }
+
+        if (-not (Test-Path -LiteralPath $StorePath)) {
+            return [PSCustomObject]$inventory
+        }
+
+        $raw = & bcdedit.exe /store $StorePath /enum all 2>&1
+        $inventory.RawText = ($raw -join "`n")
+
+        $loaders = [System.Collections.Generic.List[PSCustomObject]]::new()
+        foreach ($section in (Get-BcdTextSections -Text $inventory.RawText)) {
+            $title = $section.Title
+            $body = $section.Body
+
+            if ($title -match '^Windows Boot Manager$' -or $body -match '(?im)^\s*identifier\s+\{bootmgr\}\s*$') {
+                $inventory.DefaultId = [regex]::Match($body, '(?im)^\s*default\s+(.+)$').Groups[1].Value.Trim()
+                $inventory.Timeout = [regex]::Match($body, '(?im)^\s*timeout\s+(.+)$').Groups[1].Value.Trim()
+                $inventory.DisplayBootMenu = [regex]::Match($body, '(?im)^\s*displaybootmenu\s+(.+)$').Groups[1].Value.Trim()
+                continue
+            }
+
+            $identifier = [regex]::Match($body, '(?im)^\s*identifier\s+(.+)$').Groups[1].Value.Trim()
+            if ([string]::IsNullOrWhiteSpace($identifier)) {
+                continue
+            }
+
+            $description = [regex]::Match($body, '(?im)^\s*description\s+(.+)$').Groups[1].Value.Trim()
+            $device = [regex]::Match($body, '(?im)^\s*device\s+(.+)$').Groups[1].Value.Trim()
+            $osdevice = [regex]::Match($body, '(?im)^\s*osdevice\s+(.+)$').Groups[1].Value.Trim()
+            $path = [regex]::Match($body, '(?im)^\s*path\s+(.+)$').Groups[1].Value.Trim()
+            $systemroot = [regex]::Match($body, '(?im)^\s*systemroot\s+(.+)$').Groups[1].Value.Trim()
+            $isOsLoader = ($title -match '^Windows Boot Loader$') -or ($path -match '(?i)\\winload\.(efi|exe)$')
+            if (-not $isOsLoader) {
+                continue
+            }
+
+            $partitionDrive = ''
+            foreach ($bcdValue in @($osdevice, $device)) {
+                $partitionMatch = [regex]::Match($bcdValue, '(?im)\bpartition\s*=\s*([A-Z]:)')
+                if ($partitionMatch.Success) {
+                    $partitionDrive = $partitionMatch.Groups[1].Value.ToUpperInvariant()
+                    break
+                }
+            }
+
+            $loaders.Add([PSCustomObject]@{
+                Identifier     = $identifier
+                Description    = $description
+                Device         = $device
+                OsDevice       = $osdevice
+                Path           = $path
+                SystemRoot     = $systemroot
+                PartitionDrive = $partitionDrive
+                IsSetupEntry   = (($description -match '(?i)windows setup|setup') -or ($path -match '(?i)setup'))
+            })
+        }
+
+        $inventory.Loaders = @($loaders)
+        return [PSCustomObject]$inventory
+    }
+
+    function Get-BcdPreferredOsGuid {
+        param(
+            [Parameter(Mandatory = $true)][string]$StorePath
+        )
+
+        if (-not (Test-Path -LiteralPath $StorePath)) {
+            return ''
+        }
+
+        $raw = & bcdedit.exe /store $StorePath /enum all /v 2>&1
+        $text = ($raw -join "`n")
+        $defaultId = ''
+        $loaders = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+        foreach ($section in (Get-BcdTextSections -Text $text)) {
+            $title = $section.Title
+            $body = $section.Body
+            if ($title -match '^Windows Boot Manager$' -or $body -match '(?im)^\s*identifier\s+\{bootmgr\}\s*$') {
+                $defaultId = [regex]::Match($body, '(?im)^\s*default\s+(.+)$').Groups[1].Value.Trim()
+                continue
+            }
+
+            $identifier = [regex]::Match($body, '(?im)^\s*identifier\s+(.+)$').Groups[1].Value.Trim()
+            $description = [regex]::Match($body, '(?im)^\s*description\s+(.+)$').Groups[1].Value.Trim()
+            $path = [regex]::Match($body, '(?im)^\s*path\s+(.+)$').Groups[1].Value.Trim()
+            $isOsLoader = ($title -match '^Windows Boot Loader$') -or ($path -match '(?i)\\winload\.(efi|exe)$')
+            if (-not $isOsLoader -or [string]::IsNullOrWhiteSpace($identifier)) {
+                continue
+            }
+
+            $loaders.Add([PSCustomObject]@{
+                Identifier   = $identifier
+                Description  = $description
+                Path         = $path
+                IsSetupEntry = (($description -match '(?i)windows setup|setup') -or ($path -match '(?i)setup'))
+            })
+        }
+
+        $preferred = @($loaders | Where-Object { $_.Identifier -eq $defaultId -and -not $_.IsSetupEntry } | Select-Object -First 1)
+        if (-not $preferred) {
+            $preferred = @($loaders | Where-Object { -not $_.IsSetupEntry } | Select-Object -First 1)
+        }
+        if (-not $preferred) {
+            $preferred = @($loaders | Select-Object -First 1)
+        }
+
+        if ($preferred) { return [string]$preferred[0].Identifier }
+        return ''
+    }
+
+    function Get-BcdLoaderDetails {
+        param(
+            [Parameter(Mandatory = $true)][string]$StorePath,
+            [Parameter(Mandatory = $true)][string]$Identifier
+        )
+
+        if (-not (Test-Path -LiteralPath $StorePath)) {
+            return $null
+        }
+
+        $raw = & bcdedit.exe /store $StorePath /enum $Identifier 2>&1
+        $text = ($raw -join "`n")
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            return $null
+        }
+
+        $device = [regex]::Match($text, '(?im)^\s*device\s+(.+)$').Groups[1].Value.Trim()
+        $osdevice = [regex]::Match($text, '(?im)^\s*osdevice\s+(.+)$').Groups[1].Value.Trim()
+        $path = [regex]::Match($text, '(?im)^\s*path\s+(.+)$').Groups[1].Value.Trim()
+        $systemroot = [regex]::Match($text, '(?im)^\s*systemroot\s+(.+)$').Groups[1].Value.Trim()
+        $description = [regex]::Match($text, '(?im)^\s*description\s+(.+)$').Groups[1].Value.Trim()
+        $partitionDrive = ''
+        foreach ($bcdValue in @($osdevice, $device)) {
+            $partitionMatch = [regex]::Match($bcdValue, '(?im)\bpartition\s*=\s*([A-Z]:)')
+            if ($partitionMatch.Success) {
+                $partitionDrive = $partitionMatch.Groups[1].Value.ToUpperInvariant()
+                break
+            }
+        }
+
+        return [PSCustomObject]@{
+            Identifier     = $Identifier
+            Description    = $description
+            Device         = $device
+            OsDevice       = $osdevice
+            Path           = $path
+            SystemRoot     = $systemroot
+            PartitionDrive = $partitionDrive
+            RawText        = $text
+            IsSetupEntry   = (($description -match '(?i)windows setup|setup') -or ($path -match '(?i)setup'))
+        }
+    }
+
     # Helper: Extract Windows Boot Loader identifier from BCD
     function Get-BcdBootLoaderId {
         param(
@@ -254,12 +456,44 @@ end {
             Write-Warning "BCD not found at $StorePath."
             return $null
         }
-    
-        $cmd = "bcdedit /store `"$StorePath`" /enum"
-        $raw = & cmd.exe /c $cmd
-        $identifier = (($raw -join "`n") -replace '(?s).*Windows Boot Loader.*?identifier\s+([^\r\n]+).*', '$1').Trim()
-    
+
+        $inventory = Get-BcdInventory -StorePath $StorePath
+        $preferredLoader = @($inventory.Loaders | Where-Object { $_.Identifier -eq $inventory.DefaultId -and -not $_.IsSetupEntry } | Select-Object -First 1)
+        if (-not $preferredLoader) {
+            $preferredLoader = @($inventory.Loaders | Where-Object { -not $_.IsSetupEntry } | Select-Object -First 1)
+        }
+        if (-not $preferredLoader) {
+            $preferredLoader = @($inventory.Loaders | Select-Object -First 1)
+        }
+
+        $identifier = ''
+        if ($preferredLoader) {
+            $canUseDefaultAlias = $false
+            if ($inventory.DefaultId) {
+                if ($preferredLoader[0].Identifier -eq $inventory.DefaultId) {
+                    $canUseDefaultAlias = $true
+                }
+                elseif ($inventory.DefaultId -eq '{default}' -and @($inventory.Loaders).Count -eq 1) {
+                    $canUseDefaultAlias = $true
+                }
+            }
+
+            if ($canUseDefaultAlias) {
+                $identifier = [string]$inventory.DefaultId
+            }
+            else {
+                $identifier = [string]$preferredLoader[0].Identifier
+            }
+        }
+
         if ([string]::IsNullOrWhiteSpace($identifier)) {
+            $rawEnum = & bcdedit.exe /store $StorePath /enum 2>&1
+            $enumText = ($rawEnum -join "`n")
+            $fallbackIdentifier = [regex]::Match($enumText, '(?is)Windows Boot Loader.*?^\s*identifier\s+([^\r\n]+)', [System.Text.RegularExpressions.RegexOptions]::Multiline).Groups[1].Value.Trim()
+            if (-not [string]::IsNullOrWhiteSpace($fallbackIdentifier)) {
+                return $fallbackIdentifier
+            }
+
             Write-Warning "Could not extract boot loader identifier from $StorePath"
             return $null
         }
@@ -712,6 +946,198 @@ $($htmlRows -join "`n")
     
         return $null
     }
+
+        function Get-OfflineWindowsInstallInfo {
+            param(
+                [Parameter(Mandatory = $true)][string]$AccessPath,
+                [Parameter(Mandatory = $true)]$PartitionInfo,
+                [Parameter(Mandatory = $true)][int]$Generation,
+                [PSCustomObject[]]$BcdLoaders = @(),
+                [string]$BcdDefaultId = ''
+            )
+
+            $normalizedPath = if ($AccessPath -match '\\$') { $AccessPath } else { "$AccessPath\" }
+            $drive = $normalizedPath.TrimEnd('\').ToUpperInvariant()
+            $windowsRoot = Join-Path $normalizedPath 'Windows'
+            $systemHivePath = Join-Path $windowsRoot 'System32\Config\SYSTEM'
+            $softwareHivePath = Join-Path $windowsRoot 'System32\Config\SOFTWARE'
+            $expectedWinloadPath = Join-Path $windowsRoot $(if ($Generation -eq 2) { 'System32\winload.efi' } else { 'System32\winload.exe' })
+            $mappedLoaders = @($BcdLoaders | Where-Object { $_.PartitionDrive -and $_.PartitionDrive -eq $drive })
+            $setupLoaders = @($mappedLoaders | Where-Object { $_.IsSetupEntry })
+            $healthyLoaders = @($mappedLoaders | Where-Object { -not $_.IsSetupEntry })
+
+            $candidate = [ordered]@{
+                AccessPath            = $normalizedPath
+                Drive                 = $drive
+                PartitionNumber       = $PartitionInfo.PartitionNumber
+                PartitionType         = $PartitionInfo.Type
+                IsActive              = [bool]$PartitionInfo.IsActive
+                WindowsRoot           = $windowsRoot
+                SystemHivePresent     = [bool](Test-Path -LiteralPath $systemHivePath)
+                SoftwareHivePresent   = [bool](Test-Path -LiteralPath $softwareHivePath)
+                ExpectedWinloadPath   = $expectedWinloadPath
+                HasExpectedWinload    = [bool](Test-Path -LiteralPath $expectedWinloadPath)
+                ProductName           = ''
+                EditionID             = ''
+                CurrentBuildNumber    = ''
+                UBR                   = ''
+                DisplayVersion        = ''
+                GuestComputerName     = ''
+                SetupType             = ''
+                SetupCmdLine          = ''
+                HasWindowsBt          = [bool](Test-Path -LiteralPath (Join-Path $normalizedPath '$WINDOWS.~BT'))
+                HasPanther            = [bool](Test-Path -LiteralPath (Join-Path $windowsRoot 'Panther'))
+                SetupInProgress       = $false
+                MappedBcdCount        = $mappedLoaders.Count
+                MappedSetupEntryCount = $setupLoaders.Count
+                IsBcdDefault          = [bool]($mappedLoaders | Where-Object { $_.Identifier -eq $BcdDefaultId } | Select-Object -First 1)
+                MappedBcdEntries      = ($mappedLoaders | ForEach-Object {
+                    $label = if ($_.Description) { $_.Description } else { $_.Identifier }
+                    if ($_.IsSetupEntry) { "$label [setup]" } else { $label }
+                }) -join '; '
+                SetupEvidence         = ''
+                SelectionNotes        = ''
+                Score                 = 0
+                Selected              = $false
+            }
+
+            if ($candidate.SystemHivePresent -and $candidate.SoftwareHivePresent) {
+                $tempBase = 'RVMTEMP_{0}' -f ([guid]::NewGuid().ToString('N'))
+                $softwareKeyName = '{0}_SOFTWARE' -f $tempBase
+                $systemKeyName = '{0}_SYSTEM' -f $tempBase
+                $loadedKeys = [System.Collections.Generic.List[string]]::new()
+                try {
+                    $null = reg.exe load "HKLM\$softwareKeyName" "$softwareHivePath" 2>&1 | Out-String
+                    if ($LASTEXITCODE -eq 0) {
+                        $loadedKeys.Add($softwareKeyName)
+                        $cv = Get-ItemProperty "HKLM:\$softwareKeyName\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue
+                        if ($cv) {
+                            $candidate.ProductName = [string]$cv.ProductName
+                            $candidate.EditionID = [string]$cv.EditionID
+                            $candidate.CurrentBuildNumber = [string]$cv.CurrentBuildNumber
+                            $candidate.UBR = if ($null -ne $cv.UBR) { [string]$cv.UBR } else { '' }
+                            $candidate.DisplayVersion = if ($cv.DisplayVersion) { [string]$cv.DisplayVersion } elseif ($cv.ReleaseId) { [string]$cv.ReleaseId } else { '' }
+                        }
+                    }
+
+                    $null = reg.exe load "HKLM\$systemKeyName" "$systemHivePath" 2>&1 | Out-String
+                    if ($LASTEXITCODE -eq 0) {
+                        $loadedKeys.Add($systemKeyName)
+                        $currentSet = (Get-ItemProperty "HKLM:\$systemKeyName\Select" -ErrorAction SilentlyContinue).Current
+                        $controlSetName = if ($currentSet) { 'ControlSet{0:d3}' -f $currentSet } else { 'ControlSet001' }
+                        $candidate.GuestComputerName = [string]((Get-ItemProperty "HKLM:\$systemKeyName\$controlSetName\Control\ComputerName\ComputerName" -ErrorAction SilentlyContinue).ComputerName)
+                        $setupProps = Get-ItemProperty "HKLM:\$systemKeyName\Setup" -ErrorAction SilentlyContinue
+                        if ($setupProps) {
+                            $candidate.SetupType = if ($null -ne $setupProps.SetupType) { [string]$setupProps.SetupType } else { '' }
+                            $candidate.SetupCmdLine = [string]$setupProps.CmdLine
+                        }
+                    }
+                }
+                finally {
+                    for ($i = $loadedKeys.Count - 1; $i -ge 0; $i--) {
+                        reg.exe unload "HKLM\$($loadedKeys[$i])" 2>&1 | Out-Null
+                    }
+                }
+            }
+
+            $setupEvidence = [System.Collections.Generic.List[string]]::new()
+            if ($candidate.SetupType -and $candidate.SetupType -ne '0') {
+                $setupEvidence.Add("SetupType=$($candidate.SetupType)")
+            }
+            if (-not [string]::IsNullOrWhiteSpace($candidate.SetupCmdLine)) {
+                $setupEvidence.Add("CmdLine=$($candidate.SetupCmdLine)")
+            }
+            if ($candidate.HasWindowsBt) {
+                $setupEvidence.Add('$WINDOWS.~BT present')
+            }
+            if ($setupLoaders.Count -gt 0) {
+                $setupEvidence.Add(($setupLoaders | ForEach-Object { if ($_.Description) { "BCD=$($_.Description)" } else { "BCD=$($_.Identifier)" } }) -join ', ')
+            }
+            $candidate.SetupEvidence = $setupEvidence -join '; '
+            $candidate.SetupInProgress = ($setupEvidence.Count -gt 0)
+
+            $selectionNotes = [System.Collections.Generic.List[string]]::new()
+            $score = 0
+            if ($candidate.SystemHivePresent) { $score += 10 }
+            if ($candidate.SoftwareHivePresent) { $score += 10 }
+            if ($candidate.HasExpectedWinload) {
+                $score += 30
+                $selectionNotes.Add('winload present')
+            }
+            else {
+                $score -= 25
+                $selectionNotes.Add('winload missing')
+            }
+            if ($candidate.ProductName) {
+                $score += 10
+                $selectionNotes.Add($candidate.ProductName)
+            }
+            $buildInt = 0
+            if ([int]::TryParse($candidate.CurrentBuildNumber, [ref]$buildInt)) {
+                $score += [Math]::Min([int]($buildInt / 1000), 30)
+                $selectionNotes.Add("build $buildInt")
+            }
+            if ($candidate.MappedBcdCount -gt 0) {
+                $score += 8
+                $selectionNotes.Add("$($candidate.MappedBcdCount) BCD entr$(if ($candidate.MappedBcdCount -eq 1) { 'y' } else { 'ies' })")
+            }
+            if ($healthyLoaders.Count -gt 0) {
+                $score += 10
+                $selectionNotes.Add('non-setup BCD loader mapped')
+            }
+            if ($candidate.IsBcdDefault) {
+                $score += 15
+                $selectionNotes.Add('matches BCD default')
+            }
+            if ($candidate.MappedSetupEntryCount -gt 0) {
+                $score -= (10 * $candidate.MappedSetupEntryCount)
+                $selectionNotes.Add('setup loader mapped')
+            }
+            if ($candidate.SetupInProgress) {
+                $score -= 20
+                $selectionNotes.Add('setup state detected')
+            }
+
+            $candidate.Score = $score
+            $candidate.SelectionNotes = $selectionNotes -join '; '
+            return [PSCustomObject]$candidate
+        }
+
+        function Get-WindowsInstallCandidates {
+            param(
+                [Parameter(Mandatory = $true)][int]$DiskNumber,
+                [Parameter(Mandatory = $true)][int]$Generation,
+                [PSCustomObject[]]$BcdLoaders = @(),
+                [string]$BcdDefaultId = ''
+            )
+
+            $candidates = [System.Collections.Generic.List[PSCustomObject]]::new()
+            foreach ($part in (Get-Partition -DiskNumber $DiskNumber -ErrorAction SilentlyContinue)) {
+                $accessPaths = @($part.AccessPaths | Where-Object { $_ -and $_ -match ':' })
+                foreach ($accessPath in $accessPaths) {
+                    if (-not (Test-Path -LiteralPath (Join-Path $accessPath 'Windows\System32\ntdll.dll'))) {
+                        continue
+                    }
+
+                    $normalizedPath = if ($accessPath -match '\\$') { $accessPath } else { "$accessPath\" }
+                    if ($candidates | Where-Object { $_.AccessPath -eq $normalizedPath } | Select-Object -First 1) {
+                        continue
+                    }
+
+                    $candidates.Add((Get-OfflineWindowsInstallInfo -AccessPath $normalizedPath -PartitionInfo $part -Generation $Generation -BcdLoaders $BcdLoaders -BcdDefaultId $BcdDefaultId))
+                }
+            }
+
+            $sorted = @($candidates | Sort-Object @{ Expression = 'Score'; Descending = $true }, @{ Expression = { [int]($_.CurrentBuildNumber -as [int]) }; Descending = $true }, PartitionNumber)
+            if ($sorted.Count -gt 0) {
+                $selectedDrive = $sorted[0].Drive
+                foreach ($candidate in $sorted) {
+                    $candidate.Selected = ($candidate.Drive -eq $selectedDrive)
+                }
+            }
+
+            return $sorted
+        }
 
     # Helper: Executes a PowerShell command as the SYSTEM account using a temporary scheduled task.
     function ExecuteAsSystem($cmd) {
@@ -1503,13 +1929,33 @@ The script will copy it to the guest before running bcdboot, then proceed with -
             $identifier = Get-BcdBootLoaderId -StorePath $storePath
             if (-not $identifier) { return }
 
+            $originalBcdInventory = $script:BcdInventory
+            $originalLoaders = @($originalBcdInventory.Loaders)
+            $originalSetupLoaders = @($originalLoaders | Where-Object { $_.IsSetupEntry })
+            $hideBootMenu = ($originalLoaders.Count -gt 1) -or ($originalSetupLoaders.Count -gt 0) -or ($script:WindowsInstallCandidates.Count -gt 1)
+            if ($script:SelectedWindowsInstall) {
+                $selectedBuild = if ($script:SelectedWindowsInstall.CurrentBuildNumber) {
+                    if ($script:SelectedWindowsInstall.UBR) { "$($script:SelectedWindowsInstall.CurrentBuildNumber).$($script:SelectedWindowsInstall.UBR)" } else { $script:SelectedWindowsInstall.CurrentBuildNumber }
+                }
+                else {
+                    'unknown'
+                }
+                Write-Host "Selected Windows install for BCD rebuild: $($script:SelectedWindowsInstall.Drive) ($($script:SelectedWindowsInstall.ProductName), build $selectedBuild)" -ForegroundColor Cyan
+            }
+            if ($originalSetupLoaders.Count -gt 0) {
+                $setupLabels = ($originalSetupLoaders | ForEach-Object { if ($_.Description) { $_.Description } else { $_.Identifier } }) -join ', '
+                Write-Host "Detected setup/stale BCD loader entries in the previous store: $setupLabels" -ForegroundColor Yellow
+                Write-Host "The rebuilt store will boot directly into the selected Windows installation." -ForegroundColor Yellow
+            }
+
             # Apply additional boot configuration flags (same for both Gen1 and Gen2)
             $extraCmds = @(
+                "/set {bootmgr} default $identifier",
                 "/set $identifier integrityservices enable",
                 "/set $identifier recoveryenabled Off",
                 "/set $identifier bootstatuspolicy IgnoreAllFailures",
-                "/set {bootmgr} displaybootmenu yes",
-                "/set {bootmgr} timeout 5",
+                "/set {bootmgr} displaybootmenu $(if ($hideBootMenu) { 'no' } else { 'yes' })",
+                "/set {bootmgr} timeout $(if ($hideBootMenu) { '0' } else { '5' })",
                 "/set {bootmgr} bootems yes",
                 "/ems $identifier on",
                 "/emssettings EMSPORT:1 EMSBAUDRATE:115200"
@@ -1519,6 +1965,8 @@ The script will copy it to the guest before running bcdboot, then proceed with -
                 Write-Host "Applying extra setting: $cmd" -ForegroundColor Yellow
                 Invoke-BcdEdit -StorePath $storePath -Command $cmd
             }
+
+            $script:BcdInventory = Get-BcdInventory -StorePath $storePath
 
             # Gen1 (BIOS/MBR): ensure the boot partition is marked as Active.
             # Without the Active flag the BIOS has no way to find the boot sector
@@ -2442,6 +2890,10 @@ Restart-Service -Name WinRM -Force
     }
 
     function DisableStartupRepair {
+        # BCD-only: removes the recovery trigger so the guest will not auto-launch
+        # WinRE on the next boot failure. Intentionally does NOT touch Winre.wim,
+        # the recovery partition, or reagentc registration - re-running
+        # -EnableStartupRepair is a clean toggle back on.
         Write-Host "Disabling automatic startup repair loop..." -ForegroundColor Yellow
         try {
             $storePath = Get-BcdStorePath -Generation $script:VMGen -BootDrive $script:BootDriveLetter
@@ -2451,7 +2903,7 @@ Restart-Service -Name WinRM -Force
             Invoke-BcdEdit -StorePath $storePath -Command "/set $identifier recoveryenabled No"
             Invoke-BcdEdit -StorePath $storePath -Command "/set $identifier bootstatuspolicy IgnoreAllFailures"
             Invoke-BcdEdit -StorePath $storePath -Command "/set {bootmgr} displaybootmenu no"
-            Write-Host "Startup repair disabled. The VM will skip WinRE on next failed boot." -ForegroundColor Green
+            Write-Host "Startup repair disabled in BCD. Existing WinRE files and registration were left untouched." -ForegroundColor Green
             Write-Host "To re-enable: use -EnableStartupRepair" -ForegroundColor DarkCyan
         }
         catch {
@@ -2461,20 +2913,541 @@ Restart-Service -Name WinRM -Force
     }
 
     function EnableStartupRepair {
+        # Make automatic startup repair work end-to-end on the offline guest.
+        # Order of operations is important: WinRE provisioning runs FIRST so that
+        # we never mutate BCD on a disk where WinRE cannot actually be registered.
+        #   1. Resolve BCD store + loader id (no writes).
+        #   2. Call EnableWinREOffline which discovers Winre.wim (including on hidden
+        #      recovery partitions), repairs a broken recovery partition if needed,
+        #      stages Winre.wim into \System32\Recovery, and registers via reagentc.
+        #      reagentc /enable already writes the BCD recoverysequence GUID.
+        #   3. Only on success: flip recoveryenabled Yes, clear bootstatuspolicy,
+        #      hide boot menu. These are safe no-op-style toggles once WinRE exists.
+        #   4. On failure: do nothing to BCD - the guest is left exactly as-is.
         Write-Host "Enabling automatic startup repair..." -ForegroundColor Yellow
         try {
             $storePath = Get-BcdStorePath -Generation $script:VMGen -BootDrive $script:BootDriveLetter
             $identifier = Get-BcdBootLoaderId -StorePath $storePath
             if (-not $identifier) { return }
 
+            $winreReady = EnableWinREOffline
+            if (-not $winreReady) {
+                Write-Host "Startup repair was NOT enabled because WinRE could not be provisioned on this disk." -ForegroundColor Red
+                Write-Host "BCD was left unchanged. Restore Winre.wim onto the disk (e.g. into <Win>\Windows\System32\Recovery\) and rerun -EnableStartupRepair." -ForegroundColor DarkCyan
+                return
+            }
+
+            # WinRE is registered. Now safely flip the BCD policy bits so the guest
+            # actually triggers it on the next boot failure.
             Invoke-BcdEdit -StorePath $storePath -Command "/set $identifier recoveryenabled Yes"
             Invoke-BcdEdit -StorePath $storePath -Command "/deletevalue $identifier bootstatuspolicy"
             Invoke-BcdEdit -StorePath $storePath -Command "/set {bootmgr} displaybootmenu no"
-            Write-Host "Startup repair re-enabled. Windows will enter WinRE on boot failure." -ForegroundColor Green
+
+            $loaderAfter = Get-BcdLoaderDetails -StorePath $storePath -Identifier $identifier
+            $newSeq = $null
+            if ($loaderAfter) {
+                $m = [regex]::Match($loaderAfter.RawText, '(?im)^\s*recoverysequence\s+(.+)$')
+                if ($m.Success) { $newSeq = $m.Groups[1].Value.Trim() }
+            }
+            Write-Host "Startup repair re-enabled and WinRE is registered for the offline guest." -ForegroundColor Green
+            if ($newSeq) {
+                Write-Host "BCD recoverysequence: $newSeq" -ForegroundColor Green
+            }
         }
         catch {
             Write-Error "EnableStartupRepair failed: $_"
             throw
+        }
+    }
+
+    function Mount-HiddenRecoveryPartition {
+        # Temporarily exposes any GPT/MBR Recovery-typed partitions on $script:DiskNumber
+        # that have no drive letter, so Winre.wim and ReAgent.xml can be read or repaired.
+        # On GPT (Gen2) the hidden attribute 0x8000000000000001 is cleared via diskpart
+        # so a drive letter can be assigned; the original attribute value is captured for
+        # restore in Dismount-HiddenRecoveryPartition.
+        # Returns: array of [pscustomobject] with PartitionNumber, DiskNumber, AccessPath,
+        # GptType, OriginalGptAttributes (uint64 or $null on MBR), WasMounted (bool).
+        $results = @()
+        try {
+            $disk = Get-Disk -Number $script:DiskNumber -ErrorAction Stop
+        }
+        catch {
+            return $results
+        }
+
+        $isGpt = ($disk.PartitionStyle -eq 'GPT')
+        $partitions = @(Get-Partition -DiskNumber $script:DiskNumber -ErrorAction SilentlyContinue |
+            Where-Object { $_.Type -eq 'Recovery' })
+        if ($partitions.Count -eq 0) { return $results }
+
+        foreach ($part in $partitions) {
+            $existingLetter = @($part.AccessPaths | Where-Object { $_ -and $_ -match '^[A-Za-z]:\\?$' })
+            if ($existingLetter.Count -gt 0) {
+                # Already mounted - record but do not touch.
+                $results += [pscustomobject]@{
+                    PartitionNumber       = $part.PartitionNumber
+                    DiskNumber            = $script:DiskNumber
+                    AccessPath            = ($existingLetter[0].TrimEnd('\') + '\')
+                    GptType               = if ($isGpt) { $part.GptType } else { $null }
+                    OriginalGptAttributes = $null
+                    WasMounted            = $true
+                }
+                continue
+            }
+
+            $origAttr = $null
+            if ($isGpt) {
+                # Capture current GPT attributes via diskpart so we can restore them later.
+                $detailScript = "select disk $script:DiskNumber`r`nselect partition $($part.PartitionNumber)`r`ndetail partition`r`nexit`r`n"
+                $tmpDetail = [System.IO.Path]::GetTempFileName()
+                try {
+                    Set-Content -LiteralPath $tmpDetail -Value $detailScript -Encoding ASCII -NoNewline
+                    $detailOut = & diskpart.exe /s $tmpDetail 2>&1
+                    $attrLine = ($detailOut | Select-String -Pattern '^\s*Attributes\s*:\s*(0x[0-9a-fA-F]+)' | Select-Object -First 1)
+                    if ($attrLine) {
+                        $origAttr = [Convert]::ToUInt64($attrLine.Matches[0].Groups[1].Value, 16)
+                    }
+                }
+                finally {
+                    Remove-Item -LiteralPath $tmpDetail -Force -ErrorAction SilentlyContinue
+                }
+
+                # Clear the no-drive-letter / hidden bits so Add-PartitionAccessPath succeeds.
+                # GPT_ATTRIBUTE_NO_DRIVE_LETTER = 0x8000000000000000
+                # GPT_BASIC_DATA_ATTRIBUTE_HIDDEN = 0x4000000000000000
+                $clearScript = "select disk $script:DiskNumber`r`nselect partition $($part.PartitionNumber)`r`ngpt attributes=0x0000000000000000`r`nexit`r`n"
+                $tmpClear = [System.IO.Path]::GetTempFileName()
+                try {
+                    Set-Content -LiteralPath $tmpClear -Value $clearScript -Encoding ASCII -NoNewline
+                    $null = & diskpart.exe /s $tmpClear 2>&1
+                }
+                finally {
+                    Remove-Item -LiteralPath $tmpClear -Force -ErrorAction SilentlyContinue
+                }
+            }
+
+            $assigned = $null
+            try {
+                $null = Add-PartitionAccessPath -DiskNumber $script:DiskNumber -PartitionNumber $part.PartitionNumber -AssignDriveLetter -ErrorAction Stop
+                Start-Sleep -Milliseconds 500
+                $refreshed = Get-Partition -DiskNumber $script:DiskNumber -PartitionNumber $part.PartitionNumber -ErrorAction SilentlyContinue
+                if ($refreshed) {
+                    $newLetter = @($refreshed.AccessPaths | Where-Object { $_ -and $_ -match '^[A-Za-z]:\\?$' })
+                    if ($newLetter.Count -gt 0) {
+                        $assigned = ($newLetter[0].TrimEnd('\') + '\')
+                    }
+                }
+            }
+            catch {
+                Write-Warning "Mount-HiddenRecoveryPartition: failed to assign drive letter to disk $script:DiskNumber partition $($part.PartitionNumber): $_"
+            }
+
+            $results += [pscustomobject]@{
+                PartitionNumber       = $part.PartitionNumber
+                DiskNumber            = $script:DiskNumber
+                AccessPath            = $assigned
+                GptType               = if ($isGpt) { $part.GptType } else { $null }
+                OriginalGptAttributes = $origAttr
+                WasMounted            = $false
+            }
+        }
+
+        return $results
+    }
+
+    function Dismount-HiddenRecoveryPartition {
+        # Reverses Mount-HiddenRecoveryPartition. Skips entries that were already mounted
+        # before we touched them. Restores GPT attributes captured at mount time.
+        param(
+            [Parameter(Mandatory = $false)]
+            [object[]]$MountInfo
+        )
+
+        if (-not $MountInfo) { return }
+        foreach ($info in $MountInfo) {
+            if ($null -eq $info) { continue }
+            if ($info.WasMounted) { continue }
+
+            if ($info.AccessPath) {
+                try {
+                    Remove-PartitionAccessPath -DiskNumber $info.DiskNumber -PartitionNumber $info.PartitionNumber -AccessPath $info.AccessPath -ErrorAction Stop
+                }
+                catch {
+                    Write-Warning "Dismount-HiddenRecoveryPartition: failed to remove access path $($info.AccessPath): $_"
+                }
+            }
+
+            if ($null -ne $info.OriginalGptAttributes) {
+                $hex = ('0x{0:X16}' -f [uint64]$info.OriginalGptAttributes)
+                $restoreScript = "select disk $($info.DiskNumber)`r`nselect partition $($info.PartitionNumber)`r`ngpt attributes=$hex`r`nexit`r`n"
+                $tmpRestore = [System.IO.Path]::GetTempFileName()
+                try {
+                    Set-Content -LiteralPath $tmpRestore -Value $restoreScript -Encoding ASCII -NoNewline
+                    $null = & diskpart.exe /s $tmpRestore 2>&1
+                }
+                catch {
+                    Write-Warning "Dismount-HiddenRecoveryPartition: failed to restore GPT attributes on partition $($info.PartitionNumber): $_"
+                }
+                finally {
+                    Remove-Item -LiteralPath $tmpRestore -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+    }
+
+    function Get-WinREStatus {
+        param(
+            [string]$WindowsPath = $(Join-Path $script:WinDriveLetter 'Windows'),
+            # When set, Recovery-typed partitions with no drive letter are temporarily
+            # mounted so their Winre.wim can be discovered. The caller MUST dismount
+            # them via Dismount-HiddenRecoveryPartition (pass RecoveryPartitionsMounted).
+            [switch]$MountHidden
+        )
+
+        $status = [ordered]@{
+            WindowsPath                 = $WindowsPath
+            ReagentcAvailable           = [bool](Get-Command reagentc.exe -ErrorAction SilentlyContinue)
+            ReagentInfoText             = ''
+            ReStatus                    = ''
+            ReLocation                  = ''
+            ReBcdIdentifier             = ''
+            CandidateDirectories        = @()
+            PreferredDirectory          = ''
+            ImageFound                  = $false
+            HiddenRecoveryPartitions    = 0
+            PreferredOsGuid             = ''
+            WinreSourcePath             = ''
+            PreferredIsRecoveryPart     = $false
+            RecoveryPartitions          = @()
+            RecoveryPartitionsMounted   = @()
+        }
+
+        if (-not $status.ReagentcAvailable) {
+            return [PSCustomObject]$status
+        }
+
+        if ($MountHidden) {
+            try {
+                $status.RecoveryPartitionsMounted = @(Mount-HiddenRecoveryPartition)
+            }
+            catch {
+                Write-Warning "Get-WinREStatus: Mount-HiddenRecoveryPartition failed: $_"
+            }
+        }
+
+        $infoRaw = & reagentc.exe /info /target $WindowsPath 2>&1
+        $status.ReagentInfoText = ($infoRaw -join "`n")
+        $status.ReStatus = [regex]::Match($status.ReagentInfoText, '(?im)^\s*Windows RE status:\s+(.+)$').Groups[1].Value.Trim()
+        $status.ReLocation = [regex]::Match($status.ReagentInfoText, '(?im)^\s*Windows RE location:\s+(.+)$').Groups[1].Value.Trim()
+        $status.ReBcdIdentifier = [regex]::Match($status.ReagentInfoText, '(?im)^\s*Boot Configuration Data \(BCD\) identifier:\s+(.+)$').Groups[1].Value.Trim()
+
+        $candidateDirs = [System.Collections.Generic.List[string]]::new()
+        $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $addCandidate = {
+            param([string]$Dir)
+            if ([string]::IsNullOrWhiteSpace($Dir)) { return }
+            $trimmed = $Dir.TrimEnd('\')
+            if ($seen.Add($trimmed)) {
+                $candidateDirs.Add($trimmed)
+            }
+        }
+
+        $defaultDir = Join-Path $script:WinDriveLetter 'Windows\System32\Recovery'
+        if (Test-Path -LiteralPath (Join-Path $defaultDir 'Winre.wim')) {
+            & $addCandidate $defaultDir
+        }
+
+        $recoveryParts = [System.Collections.Generic.List[object]]::new()
+        foreach ($partition in (Get-Partition -DiskNumber $script:DiskNumber -ErrorAction SilentlyContinue)) {
+            $accessPaths = @($partition.AccessPaths | Where-Object { $_ -and $_ -match ':' })
+            $isRecovery = ($partition.Type -eq 'Recovery')
+            if ($isRecovery -and $accessPaths.Count -eq 0) {
+                $status.HiddenRecoveryPartitions++
+            }
+            if ($isRecovery) {
+                $letter = @($accessPaths | Where-Object { $_ -match '^[A-Za-z]:\\?$' } | Select-Object -First 1)
+                $recoveryParts.Add([pscustomobject]@{
+                    PartitionNumber = $partition.PartitionNumber
+                    AccessPath      = if ($letter.Count -gt 0) { $letter[0].TrimEnd('\') + '\' } else { '' }
+                    HasImage        = $false
+                })
+            }
+            foreach ($accessPath in $accessPaths) {
+                $candidateDir = Join-Path $accessPath 'Recovery\WindowsRE'
+                if (Test-Path -LiteralPath (Join-Path $candidateDir 'Winre.wim')) {
+                    & $addCandidate $candidateDir
+                    if ($isRecovery -and $recoveryParts.Count -gt 0) {
+                        $recoveryParts[$recoveryParts.Count - 1].HasImage = $true
+                    }
+                }
+            }
+        }
+        $status.RecoveryPartitions = @($recoveryParts)
+
+        $status.CandidateDirectories = @($candidateDirs)
+        $status.ImageFound = ($candidateDirs.Count -gt 0)
+        if ($candidateDirs.Count -gt 0) {
+            # Prefer a dedicated recovery partition (\Recovery\WindowsRE) over \System32\Recovery
+            # since that matches the layout reagentc/OEM expect.
+            $status.PreferredDirectory = @($candidateDirs | Sort-Object @{ Expression = { if ($_ -match '\\Recovery\\WindowsRE$') { 0 } else { 1 } } }, @{ Expression = { if ($_ -like "$($script:WinDriveLetter.TrimEnd('\\'))*") { 1 } else { 0 } } } | Select-Object -First 1)[0]
+            $status.WinreSourcePath = Join-Path $status.PreferredDirectory 'Winre.wim'
+            $status.PreferredIsRecoveryPart = ($status.PreferredDirectory -match '\\Recovery\\WindowsRE$') -and `
+                (-not ($status.PreferredDirectory -like "$($script:WinDriveLetter.TrimEnd('\\'))*"))
+        }
+
+        $storePath = Get-BcdStorePath -Generation $script:VMGen -BootDrive $script:BootDriveLetter
+        $status.PreferredOsGuid = Get-BcdPreferredOsGuid -StorePath $storePath
+
+        return [PSCustomObject]$status
+    }
+
+    function Stage-WinReImage {
+        # Ensures <WindowsPath>\System32\Recovery\Winre.wim exists by copying from a
+        # discovered source if missing or different. This is the canonical layout
+        # reagentc /setreimage consumes most reliably.
+        # Returns the staged directory path (suitable for /setreimage /path) on success,
+        # or $null on failure.
+        param(
+            [Parameter(Mandatory)] [string]$WindowsPath,
+            [Parameter(Mandatory)] [string]$SourceWinrePath
+        )
+
+        if (-not (Test-Path -LiteralPath $SourceWinrePath)) {
+            Write-Warning "Stage-WinReImage: source not found: $SourceWinrePath"
+            return $null
+        }
+
+        $stagedDir = Join-Path $WindowsPath 'System32\Recovery'
+        $stagedWim = Join-Path $stagedDir 'Winre.wim'
+
+        try {
+            if (-not (Test-Path -LiteralPath $stagedDir)) {
+                $null = New-Item -ItemType Directory -Path $stagedDir -Force -ErrorAction Stop
+            }
+
+            $needsCopy = $true
+            if (Test-Path -LiteralPath $stagedWim) {
+                $srcInfo = Get-Item -LiteralPath $SourceWinrePath -Force
+                $dstInfo = Get-Item -LiteralPath $stagedWim -Force
+                if ($srcInfo.Length -eq $dstInfo.Length) {
+                    $srcHash = (Get-FileHash -LiteralPath $SourceWinrePath -Algorithm SHA256).Hash
+                    $dstHash = (Get-FileHash -LiteralPath $stagedWim -Algorithm SHA256).Hash
+                    if ($srcHash -eq $dstHash) {
+                        $needsCopy = $false
+                    }
+                }
+            }
+
+            if ($needsCopy) {
+                # Clear hidden/system/readonly so Copy-Item can overwrite.
+                if (Test-Path -LiteralPath $stagedWim) {
+                    & cmd.exe /c "attrib -s -h -r `"$stagedWim`"" 2>&1 | Out-Null
+                }
+                Copy-Item -LiteralPath $SourceWinrePath -Destination $stagedWim -Force -ErrorAction Stop
+                & cmd.exe /c "attrib +s +h +r `"$stagedWim`"" 2>&1 | Out-Null
+                Write-Host "Stage-WinReImage: copied Winre.wim -> $stagedWim" -ForegroundColor DarkCyan
+            }
+            else {
+                Write-Host "Stage-WinReImage: existing Winre.wim already matches source (no copy)" -ForegroundColor DarkCyan
+            }
+
+            return $stagedDir
+        }
+        catch {
+            Write-Warning "Stage-WinReImage failed: $_"
+            return $null
+        }
+    }
+
+    function Repair-RecoveryPartition {
+        # Restores Winre.wim (and ReAgent.xml when present) onto a mounted recovery
+        # partition that is missing a usable image. Uses chkdsk (best-effort) before
+        # writing files. Caller is responsible for mount/dismount lifecycle.
+        # Returns $true if Winre.wim ends up present at <AccessPath>\Recovery\WindowsRE\Winre.wim.
+        param(
+            [Parameter(Mandatory)] [string]$AccessPath,
+            [Parameter(Mandatory)] [string]$SourceWinrePath,
+            [string]$WindowsPath = $(Join-Path $script:WinDriveLetter 'Windows')
+        )
+
+        if (-not $AccessPath) {
+            Write-Warning "Repair-RecoveryPartition: AccessPath is empty."
+            return $false
+        }
+        if (-not (Test-Path -LiteralPath $SourceWinrePath)) {
+            Write-Warning "Repair-RecoveryPartition: source Winre.wim not found at $SourceWinrePath"
+            return $false
+        }
+
+        $driveLetter = ($AccessPath.Substring(0,2))
+        $targetDir = Join-Path $AccessPath 'Recovery\WindowsRE'
+        $targetWim = Join-Path $targetDir 'Winre.wim'
+        $targetXml = Join-Path $targetDir 'ReAgent.xml'
+
+        # Best-effort filesystem check. Tolerate non-zero exit if the volume root is still readable.
+        try {
+            Write-Host "Repair-RecoveryPartition: running chkdsk $driveLetter /F /X (best-effort)..." -ForegroundColor DarkCyan
+            $chkOut = & cmd.exe /c "echo Y| chkdsk $driveLetter /F /X" 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "chkdsk $driveLetter returned $LASTEXITCODE; will continue if volume is still readable."
+            }
+            if (-not (Test-Path -LiteralPath $AccessPath)) {
+                Write-Warning "Repair-RecoveryPartition: $AccessPath not accessible after chkdsk; aborting."
+                return $false
+            }
+        }
+        catch {
+            Write-Warning "Repair-RecoveryPartition: chkdsk invocation failed: $_"
+        }
+
+        try {
+            if (-not (Test-Path -LiteralPath $targetDir)) {
+                $null = New-Item -ItemType Directory -Path $targetDir -Force -ErrorAction Stop
+            }
+
+            if (Test-Path -LiteralPath $targetWim) {
+                & cmd.exe /c "attrib -s -h -r `"$targetWim`"" 2>&1 | Out-Null
+            }
+            Copy-Item -LiteralPath $SourceWinrePath -Destination $targetWim -Force -ErrorAction Stop
+            & cmd.exe /c "attrib +s +h +r `"$targetWim`"" 2>&1 | Out-Null
+
+            $sourceXml = Join-Path $WindowsPath 'System32\Recovery\ReAgent.xml'
+            if (Test-Path -LiteralPath $sourceXml) {
+                if (Test-Path -LiteralPath $targetXml) {
+                    & cmd.exe /c "attrib -s -h -r `"$targetXml`"" 2>&1 | Out-Null
+                }
+                Copy-Item -LiteralPath $sourceXml -Destination $targetXml -Force -ErrorAction Stop
+                & cmd.exe /c "attrib +s +h +r `"$targetXml`"" 2>&1 | Out-Null
+            }
+            elseif (-not (Test-Path -LiteralPath $targetXml)) {
+                # Minimal default ReAgent.xml so reagentc has something to update.
+                $minXml = @'
+<?xml version="1.0" encoding="utf-8"?>
+<WindowsRE version="2.0">
+  <WinreBCD id=""/>
+  <WinreLocation path="" id="0" offset="0" guid="{00000000-0000-0000-0000-000000000000}"/>
+  <ImageLocation path="" id="0" offset="0" guid="{00000000-0000-0000-0000-000000000000}"/>
+  <PBRImageLocation path="" id="0" offset="0" guid="{00000000-0000-0000-0000-000000000000}" index="0"/>
+  <PBRCustomImageLocation path="" id="0" offset="0" guid="{00000000-0000-0000-0000-000000000000}" index="0"/>
+  <InstallState state="0"/>
+  <OsInstallAvailable state="0"/>
+  <CustomImageAvailable state="0"/>
+  <IsAutoRepairOn state="1"/>
+  <WinREStaged state="0"/>
+  <OperationParam path=""/>
+  <OperationPermanent state="0"/>
+  <OsBuildVersion path=""/>
+  <OemTool state="0"/>
+  <IsServer state="0"/>
+  <DownlevelWinreLocation path="" id="0" offset="0" guid="{00000000-0000-0000-0000-000000000000}"/>
+  <ScheduledOperation state="4"/>
+</WindowsRE>
+'@
+                Set-Content -LiteralPath $targetXml -Value $minXml -Encoding ASCII -Force
+                & cmd.exe /c "attrib +s +h +r `"$targetXml`"" 2>&1 | Out-Null
+            }
+
+            Write-Host "Repair-RecoveryPartition: restored Winre.wim -> $targetWim" -ForegroundColor Green
+            return (Test-Path -LiteralPath $targetWim)
+        }
+        catch {
+            Write-Warning "Repair-RecoveryPartition: file copy failed: $_"
+            return $false
+        }
+    }
+
+    function EnableWinREOffline {
+        # Make WinRE functional for the offline guest using only data already on the
+        # broken disk. Discovers Winre.wim in <Win>\System32\Recovery or on a recovery
+        # partition (mounting it temporarily if hidden), repairs a broken recovery
+        # partition when an image is available elsewhere, stages Winre.wim into the
+        # canonical \System32\Recovery location, then registers via reagentc.
+        # Always cleans up any partitions it mounted (and restores GPT attributes on Gen2).
+        # Returns $true only if reagentc reports WinRE Enabled with a non-zero BCD identifier.
+        Write-Host "Registering Windows Recovery Environment (WinRE) from offline files..." -ForegroundColor Yellow
+        $mountInfo = @()
+        try {
+            $winre = Get-WinREStatus -MountHidden
+            $mountInfo = @($winre.RecoveryPartitionsMounted)
+
+            if (-not $winre.ReagentcAvailable) {
+                Write-Warning "reagentc.exe is not available on this rescue host. Cannot register WinRE offline."
+                return $false
+            }
+
+            # If a recovery partition exists but has no image, AND we found one elsewhere,
+            # repair the recovery partition first so we end up with the OEM-style layout.
+            $brokenRecParts = @($winre.RecoveryPartitions | Where-Object { -not $_.HasImage -and $_.AccessPath })
+            if ($winre.ImageFound -and $brokenRecParts.Count -gt 0) {
+                $sourceWim = $winre.WinreSourcePath
+                foreach ($brp in $brokenRecParts) {
+                    Write-Host "Recovery partition $($brp.AccessPath) is missing Winre.wim - repairing from $sourceWim ..." -ForegroundColor Yellow
+                    $repaired = Repair-RecoveryPartition -AccessPath $brp.AccessPath -SourceWinrePath $sourceWim -WindowsPath $winre.WindowsPath
+                    if ($repaired) {
+                        # Re-scan so PreferredDirectory now points at the recovery partition.
+                        $winre = Get-WinREStatus -WindowsPath $winre.WindowsPath
+                        # Re-attach the existing mount info (Get-WinREStatus without -MountHidden returns empty).
+                        $winre.RecoveryPartitionsMounted = $mountInfo
+                    }
+                }
+            }
+
+            if (-not $winre.ImageFound) {
+                Write-Warning "No usable Winre.wim was found on any partition of disk $script:DiskNumber."
+                if ($winre.HiddenRecoveryPartitions -gt 0) {
+                    Write-Warning "A hidden Recovery partition exists but does not contain a usable Winre.wim either."
+                }
+                return $false
+            }
+
+            if ([string]::IsNullOrWhiteSpace($winre.PreferredOsGuid)) {
+                Write-Warning "Could not resolve the preferred OS BCD GUID required for 'reagentc /enable /osguid'."
+                return $false
+            }
+
+            # Stage Winre.wim into <Win>\System32\Recovery if the source is on a recovery partition.
+            # reagentc /setreimage is most reliable when /path points to a directory under /target.
+            $stagedDir = $winre.PreferredDirectory
+            if ($winre.PreferredIsRecoveryPart -or ($winre.PreferredDirectory -notlike "$($winre.WindowsPath)*")) {
+                $maybeStaged = Stage-WinReImage -WindowsPath $winre.WindowsPath -SourceWinrePath $winre.WinreSourcePath
+                if ($maybeStaged) { $stagedDir = $maybeStaged }
+            }
+
+            $windowsPath = $winre.WindowsPath
+            Write-Host "reagentc /setreimage /path $stagedDir /target $windowsPath" -ForegroundColor DarkCyan
+            $setRaw = & reagentc.exe /setreimage /path $stagedDir /target $windowsPath 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "reagentc /setreimage failed (exit $LASTEXITCODE):`n$($setRaw -join "`n")"
+                return $false
+            }
+
+            Write-Host "reagentc /enable /osguid $($winre.PreferredOsGuid)" -ForegroundColor DarkCyan
+            $enableRaw = & reagentc.exe /enable /osguid $winre.PreferredOsGuid 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "reagentc /enable /osguid failed (exit $LASTEXITCODE):`n$($enableRaw -join "`n")"
+                return $false
+            }
+
+            $after = Get-WinREStatus -WindowsPath $windowsPath
+            $isEnabled = ($after.ReStatus -match '(?i)^enabled$') -and $after.ReBcdIdentifier -and ($after.ReBcdIdentifier -ne '00000000-0000-0000-0000-000000000000')
+            if ($isEnabled) {
+                Write-Host "WinRE enabled. Location: $($after.ReLocation)" -ForegroundColor Green
+                Write-Host "WinRE BCD identifier: $($after.ReBcdIdentifier)" -ForegroundColor Green
+                return $true
+            }
+
+            Write-Warning "WinRE registration commands completed, but WinRE still does not report as enabled.`n$($after.ReagentInfoText)"
+            return $false
+        }
+        catch {
+            Write-Error "EnableWinREOffline failed: $_"
+            throw
+        }
+        finally {
+            if ($mountInfo -and $mountInfo.Count -gt 0) {
+                try { Dismount-HiddenRecoveryPartition -MountInfo $mountInfo } catch { Write-Warning "Cleanup of mounted recovery partitions failed: $_" }
+            }
         }
     }
 
@@ -4272,11 +5245,18 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
         $sevBcdSafeMode = 1   # Safe Mode flag active in BCD
         $sevBcdBootStatusPolicy = 0   # bootstatuspolicy IgnoreAllFailures set
         $sevBcdRecoveryDisabled = 0   # recoveryenabled Off
+        $sevWinreDisabled = 1   # WinRE is disabled or not registered
+        $sevWinreImageMissing = 1   # Winre.wim not found on mounted guest partitions
         $sevBcdTestSigning = 1   # Test signing ON
         $sevBcdUnknownDevice = 2   # BCD contains unknown device/path entries
         $sevBcdImcHive = 2   # BCD has imcdevice/imchivename entries (BSOD 0x67 CONFIG_INITIALIZATION_FAILED)
         $sevBootPartitionNotActive = 2   # Gen1 (MBR) boot partition not flagged as Active (BIOS cannot find boot sector)
         $sevBootPartitionMissing = 2   # Separate boot partition (System Reserved / EFI SP) not found on disk
+        $sevBcdMultipleLoaders = 1   # More than one Windows Boot Loader entry found in BCD
+        $sevBcdSetupEntry = 1   # BCD contains Windows Setup or other stale setup loader entries
+        $sevMultipleWindowsInstalls = 1   # More than one Windows installation was detected on the disk
+        $sevWindowsInstallSetupState = 1   # Selected Windows installation still shows setup/upgrade markers
+        $sevWindowsInstallSelectionAmbiguous = 2   # Multiple Windows installations scored too closely to auto-pick confidently
 
         # Registry
         $sevHiveMissing = 2   # Expected registry hive file not found on disk
@@ -4602,6 +5582,43 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
         # of that root cause - redirect fix suggestions to -RecreateBootPartition
         $bcdFix = if ($bootPartMissing) { '-RecreateBootPartition' } else { '-FixBoot' }
 
+        $installCandidates = @($script:WindowsInstallCandidates)
+        if ($installCandidates.Count -gt 0) {
+            $selectedInstall = @($installCandidates | Where-Object { $_.Selected } | Select-Object -First 1)
+            if (-not $selectedInstall) {
+                $selectedInstall = @($installCandidates | Select-Object -First 1)
+            }
+            if ($selectedInstall) {
+                $selected = $selectedInstall[0]
+                $selectedBuild = if ($selected.CurrentBuildNumber) {
+                    if ($selected.UBR) { "$($selected.CurrentBuildNumber).$($selected.UBR)" } else { $selected.CurrentBuildNumber }
+                }
+                else {
+                    'unknown'
+                }
+                & $emit 'Windows' 'INFO' "Selected Windows install: $($selected.Drive) ($($selected.ProductName), build $selectedBuild, score=$($selected.Score))"
+                if ($selected.SetupEvidence) {
+                    & $emit 'Windows' (& $toSev $sevWindowsInstallSetupState) "Selected Windows install still shows setup/upgrade markers: $($selected.SetupEvidence)" '-AnalyzeServicingState'
+                }
+            }
+            if ($installCandidates.Count -gt 1) {
+                $candidateSummary = ($installCandidates | ForEach-Object {
+                    $build = if ($_.CurrentBuildNumber) {
+                        if ($_.UBR) { "$($_.CurrentBuildNumber).$($_.UBR)" } else { $_.CurrentBuildNumber }
+                    }
+                    else {
+                        'unknown'
+                    }
+                    $name = if ($_.ProductName) { $_.ProductName } else { 'Unknown Windows install' }
+                    "$($_.Drive)=$name build $build score=$($_.Score)"
+                }) -join '; '
+                & $emit 'Windows' (& $toSev $sevMultipleWindowsInstalls) "Multiple Windows installs detected: $candidateSummary" $bcdFix
+                if ($installCandidates.Count -gt 1 -and (($installCandidates[0].Score - $installCandidates[1].Score) -lt 5)) {
+                    & $emit 'Windows' (& $toSev $sevWindowsInstallSelectionAmbiguous) "Top Windows install candidates scored too closely to auto-pick confidently: $($installCandidates[0].Drive)=$($installCandidates[0].Score), $($installCandidates[1].Drive)=$($installCandidates[1].Score)" '-GetBootPathReport'
+                }
+            }
+        }
+
         $bcdPath = Get-BcdStorePath -Generation $script:VMGen -BootDrive $script:BootDriveLetter.TrimEnd('\')
         if (-not (Test-Path $bcdPath)) {
             & $emit 'BCD' (& $toSev $sevBcdMissing) "BCD store not found at $bcdPath - VM will fail to boot" $bcdFix
@@ -4612,12 +5629,28 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
         else {
             & $emit 'BCD' 'OK' "BCD store present: $bcdPath"
             try {
-                $bcdText = (& bcdedit.exe /store "$bcdPath" /enum all 2>&1) | Out-String
-                if ($bcdText -notmatch 'Windows Boot Loader|osloader') {
+                $bcdInventory = Get-BcdInventory -StorePath $bcdPath
+                $bcdText = $bcdInventory.RawText
+                $preferredLoaderId = Get-BcdBootLoaderId -StorePath $bcdPath
+                $preferredLoaderDetails = if ($preferredLoaderId) { Get-BcdLoaderDetails -StorePath $bcdPath -Identifier $preferredLoaderId } else { $null }
+                $startupRepairConfigured = [bool]($preferredLoaderDetails -and $preferredLoaderDetails.RawText -match '(?im)^\s*recoverysequence\s+\{[^\r\n]+\}\s*$')
+                if (@($bcdInventory.Loaders).Count -eq 0) {
                     & $emit 'BCD' (& $toSev $sevBcdNoBootLoader) 'No Windows Boot Loader entry found in BCD' "-FixBoot"
                 }
                 else {
-                    & $emit 'BCD' 'OK' 'Windows Boot Loader entry present'
+                    & $emit 'BCD' 'OK' "Windows Boot Loader entries present: $(@($bcdInventory.Loaders).Count)"
+                    if (@($bcdInventory.Loaders).Count -gt 1) {
+                        $loaderSummary = ($bcdInventory.Loaders | ForEach-Object {
+                            $desc = if ($_.Description) { $_.Description } else { $_.Identifier }
+                            if ($_.PartitionDrive) { "$desc@$($_.PartitionDrive)" } else { $desc }
+                        }) -join '; '
+                        & $emit 'BCD' (& $toSev $sevBcdMultipleLoaders) "Multiple Windows Boot Loader entries found: $loaderSummary" '-FixBoot'
+                    }
+                    $setupLoaders = @($bcdInventory.Loaders | Where-Object { $_.IsSetupEntry })
+                    if ($setupLoaders.Count -gt 0) {
+                        $setupSummary = ($setupLoaders | ForEach-Object { if ($_.Description) { $_.Description } else { $_.Identifier } }) -join '; '
+                        & $emit 'BCD' (& $toSev $sevBcdSetupEntry) "BCD contains setup/stale loader entries: $setupSummary" '-FixBoot'
+                    }
                 }
                 if ($bcdText -match 'safeboot\s+(\S+)') {
                     & $emit 'BCD' (& $toSev $sevBcdSafeMode) "Safe Mode boot flag is active (safeboot $($Matches[1])) - VM will boot into Safe Mode" "-RemoveSafeModeFlag"
@@ -4627,6 +5660,27 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                 }
                 if ($bcdText -match 'recoveryenabled\s+no') {
                     & $emit 'BCD' (& $toSev $sevBcdRecoveryDisabled) 'recoveryenabled is Off - WinRE recovery disabled'
+                }
+                $winre = Get-WinREStatus
+                if (-not $winre.ReagentcAvailable) {
+                    & $emit 'WinRE' 'INFO' 'reagentc.exe is not available on the rescue host, so offline WinRE status could not be evaluated'
+                }
+                elseif ($startupRepairConfigured -and -not $winre.ImageFound) {
+                    $detail = 'No usable Winre.wim found on mounted guest partitions.'
+                    if ($winre.HiddenRecoveryPartitions -gt 0) {
+                        $detail += " Hidden Recovery partition(s) without drive letters detected: $($winre.HiddenRecoveryPartitions)."
+                    }
+                    & $emit 'WinRE' (& $toSev $sevWinreImageMissing) "$detail WinRE cannot be registered until a recovery image is accessible." '-EnableStartupRepair'
+                }
+                elseif ($startupRepairConfigured) {
+                    $winreEnabled = ($winre.ReStatus -match '(?i)^enabled$') -and $winre.ReBcdIdentifier -and ($winre.ReBcdIdentifier -ne '00000000-0000-0000-0000-000000000000')
+                    if ($winreEnabled) {
+                        $locationLabel = if ($winre.ReLocation) { $winre.ReLocation } else { $winre.PreferredDirectory }
+                        & $emit 'WinRE' 'OK' "Windows RE is enabled and registered ($locationLabel)"
+                    }
+                    else {
+                        & $emit 'WinRE' (& $toSev $sevWinreDisabled) "WinRE image found at $($winre.PreferredDirectory), but Windows RE is disabled or not registered (BCD id: $($winre.ReBcdIdentifier))." '-EnableStartupRepair'
+                    }
                 }
                 if ($bcdText -match 'testsigning\s+yes') {
                     & $emit 'BCD' (& $toSev $sevBcdTestSigning) 'Test signing is ON - unsigned drivers are permitted to load' "-DisableTestSigning"
@@ -7693,6 +8747,33 @@ Use this when stale proxy/PAC settings prevent WinRM/RDP reachability after migr
         Write-ChainItem -Label "BCD store" -Status $bcdResult.Health -Detail $bcdResult.Detail
         $totalChecks++
         if ($bcdResult.Health -ne 'OK') { $issues.Add([PSCustomObject]@{ Phase = 2; Severity = $bcdResult.Health; Message = "BCD store: $($bcdResult.Detail)"; Fix = '-FixBoot' }) }
+        if ($script:WindowsInstallCandidates.Count -gt 0) {
+            $selectedInstall = @($script:WindowsInstallCandidates | Where-Object { $_.Selected } | Select-Object -First 1)
+            if (-not $selectedInstall) {
+                $selectedInstall = @($script:WindowsInstallCandidates | Select-Object -First 1)
+            }
+            if ($selectedInstall) {
+                $selected = $selectedInstall[0]
+                $buildLabel = if ($selected.CurrentBuildNumber) {
+                    if ($selected.UBR) { "$($selected.CurrentBuildNumber).$($selected.UBR)" } else { $selected.CurrentBuildNumber }
+                }
+                else {
+                    'unknown'
+                }
+                Write-ChainItem -Label "Selected Windows install: $($selected.Drive) ($($selected.ProductName), build $buildLabel, score=$($selected.Score))" -Status 'INFO'
+                if ($selected.SetupEvidence) {
+                    Write-ChainItem -Label 'Selected install has setup markers' -Status 'WARN' -Detail $selected.SetupEvidence
+                    $totalChecks++
+                    $issues.Add([PSCustomObject]@{ Phase = 2; Severity = 'WARN'; Message = "Selected Windows install still has setup/upgrade markers: $($selected.SetupEvidence)"; Fix = '-AnalyzeServicingState' })
+                }
+            }
+            if ($script:WindowsInstallCandidates.Count -gt 1) {
+                $candidateSummary = ($script:WindowsInstallCandidates | ForEach-Object { "$($_.Drive) score=$($_.Score)" }) -join '; '
+                Write-ChainItem -Label 'Multiple Windows installs detected' -Status 'WARN' -Detail $candidateSummary
+                $totalChecks++
+                $issues.Add([PSCustomObject]@{ Phase = 2; Severity = 'WARN'; Message = "Multiple Windows installs detected: $candidateSummary"; Fix = '-FixBoot' })
+            }
+        }
 
         # 2c. Parse BCD entries if store exists
         $bcdWinloadPath = $null
@@ -7700,7 +8781,8 @@ Use this when stale proxy/PAC settings prevent WinRM/RDP reachability after migr
         $bcdFlags = @()
         if ($bcdResult.Exists -and $bcdResult.Size -gt 0) {
             try {
-                $bcdText = (& bcdedit.exe /store "$bcdStore" /enum all 2>&1) | Out-String
+                $bcdInventory = Get-BcdInventory -StorePath $bcdStore
+                $bcdText = $bcdInventory.RawText
 
                 # Boot Manager section
                 $bmgrTimeout = if ($bcdText -match '(?im)timeout\s+(\d+)') { $Matches[1] + 's' } else { 'default' }
@@ -7728,31 +8810,46 @@ Use this when stale proxy/PAC settings prevent WinRM/RDP reachability after migr
                 }
 
                 # Windows Boot Loader section
-                $hasLoader = $bcdText -match 'Windows Boot Loader|osloader'
-                if (-not $hasLoader) {
+                if (@($bcdInventory.Loaders).Count -eq 0) {
                     Write-ChainItem -Label 'Windows Boot Loader entry' -Status 'FAIL' -Detail 'No osloader/Windows Boot Loader entry found in BCD'
                     $totalChecks++; $issues.Add([PSCustomObject]@{ Phase = 2; Severity = 'FAIL'; Message = 'No Windows Boot Loader entry in BCD'; Fix = '-FixBoot' })
                 }
                 else {
-                    Write-ChainItem -Label 'Windows Boot Loader entry present' -Status 'OK'
-
-                    # Extract key BCD values from the OS Loader section (not Boot Manager)
-                    # Split the full BCD output into sections; find the Windows Boot Loader block
-                    $loaderSection = ''
-                    $sections = $bcdText -split '(?m)^-{3,}'
-                    foreach ($sec in $sections) {
-                        if ($sec -match 'osloader|Windows Boot Loader') {
-                            $loaderSection = $sec
-                            break
+                    $preferredLoaderId = Get-BcdBootLoaderId -StorePath $bcdStore
+                    $preferredLoader = $null
+                    if ($preferredLoaderId) {
+                        $preferredLoader = Get-BcdLoaderDetails -StorePath $bcdStore -Identifier $preferredLoaderId
+                    }
+                    if (-not $preferredLoader) {
+                        $fallbackLoader = @($bcdInventory.Loaders | Select-Object -First 1)
+                        if ($fallbackLoader) {
+                            $preferredLoader = Get-BcdLoaderDetails -StorePath $bcdStore -Identifier $fallbackLoader[0].Identifier
+                            if (-not $preferredLoader) {
+                                $preferredLoader = $fallbackLoader[0]
+                            }
                         }
                     }
-                    if (-not $loaderSection) { $loaderSection = $bcdText }
+                    Write-ChainItem -Label 'Windows Boot Loader entry present' -Status 'OK'
+                    if (@($bcdInventory.Loaders).Count -gt 1) {
+                        $loaderSummary = ($bcdInventory.Loaders | ForEach-Object {
+                            $desc = if ($_.Description) { $_.Description } else { $_.Identifier }
+                            if ($_.PartitionDrive) { "$desc@$($_.PartitionDrive)" } else { $desc }
+                        }) -join '; '
+                        Write-ChainItem -Label 'Multiple Windows Boot Loader entries found' -Status 'WARN' -Detail $loaderSummary
+                        $totalChecks++; $issues.Add([PSCustomObject]@{ Phase = 2; Severity = 'WARN'; Message = "Multiple Windows Boot Loader entries found: $loaderSummary"; Fix = '-FixBoot' })
+                    }
+                    $setupLoaders = @($bcdInventory.Loaders | Where-Object { $_.IsSetupEntry })
+                    if ($setupLoaders.Count -gt 0) {
+                        $setupSummary = ($setupLoaders | ForEach-Object { if ($_.Description) { $_.Description } else { $_.Identifier } }) -join '; '
+                        Write-ChainItem -Label 'BCD setup/stale loader entries found' -Status 'WARN' -Detail $setupSummary
+                        $totalChecks++; $issues.Add([PSCustomObject]@{ Phase = 2; Severity = 'WARN'; Message = "BCD contains setup/stale loader entries: $setupSummary"; Fix = '-FixBoot' })
+                    }
 
-                    $bcdDevice   = if ($loaderSection -match '(?im)^\s*device\s+(.+)$') { $Matches[1].Trim() } else { '' }
-                    $bcdOsDevice = if ($loaderSection -match '(?im)^\s*osdevice\s+(.+)$') { $Matches[1].Trim() } else { '' }
-                    $bcdPath     = if ($loaderSection -match '(?im)^\s*path\s+(.+)$') { $Matches[1].Trim() } else { '' }
-                    $bcdSysRoot  = if ($loaderSection -match '(?im)^\s*systemroot\s+(.+)$') { $Matches[1].Trim() } else { '\Windows' }
-                    $bcdNx       = if ($loaderSection -match '(?im)^\s*nx\s+(.+)$') { $Matches[1].Trim() } else { '' }
+                    $bcdDevice = $preferredLoader.Device
+                    $bcdOsDevice = $preferredLoader.OsDevice
+                    $bcdPath = $preferredLoader.Path
+                    $bcdSysRoot = if ($preferredLoader.SystemRoot) { $preferredLoader.SystemRoot } else { '\Windows' }
+                    $bcdNx = if ($bcdText -match '(?im)^\s*nx\s+(.+)$') { $Matches[1].Trim() } else { '' }
 
                     $bcdWinloadPath = $bcdPath
                     $bcdSystemRoot = $bcdSysRoot
@@ -8431,22 +9528,66 @@ Use this when stale proxy/PAC settings prevent WinRM/RDP reachability after migr
     function AnalyzeBcdConsistency {
         Write-Host "Analyzing BCD consistency..." -ForegroundColor Yellow
         $store = Get-BcdStorePath -BootDrive $script:BootDriveLetter -Generation $script:VMGen
+        $hasStructuralWarnings = $false
         if (-not (Test-Path -LiteralPath $store)) {
             Write-Warning "BCD store not found: $store"
             return
         }
-        $id = Get-BcdBootLoaderId -StorePath $store
-        if (-not $id) {
+        $inventory = Get-BcdInventory -StorePath $store
+        $loaders = @($inventory.Loaders)
+        if ($loaders.Count -eq 0) {
             Write-Warning "Unable to resolve Windows Boot Loader identifier in BCD."
             return
         }
 
-        $raw = & cmd.exe /c "bcdedit /store `"$store`" /enum $id" 2>&1
-        $txt = ($raw -join "`n")
-        $device = [regex]::Match($txt, '(?im)^\s*device\s+(.+)$').Groups[1].Value.Trim()
-        $osdev = [regex]::Match($txt, '(?im)^\s*osdevice\s+(.+)$').Groups[1].Value.Trim()
-        $path = [regex]::Match($txt, '(?im)^\s*path\s+(.+)$').Groups[1].Value.Trim()
-        $sysrt = [regex]::Match($txt, '(?im)^\s*systemroot\s+(.+)$').Groups[1].Value.Trim()
+        $id = Get-BcdBootLoaderId -StorePath $store
+        $loader = $null
+        if ($id) {
+            $loader = Get-BcdLoaderDetails -StorePath $store -Identifier $id
+        }
+        if (-not $loader) {
+            $fallbackLoader = @($loaders | Select-Object -First 1)
+            if ($fallbackLoader) {
+                $loader = Get-BcdLoaderDetails -StorePath $store -Identifier $fallbackLoader[0].Identifier
+                if (-not $loader) {
+                    $loader = $fallbackLoader[0]
+                }
+            }
+        }
+
+        if ($loaders.Count -gt 1) {
+            Write-Host "Windows Boot Loader entries:" -ForegroundColor Cyan
+            $loaders | Select-Object Identifier, Description, PartitionDrive, Path, IsSetupEntry | Format-Table -AutoSize
+            Write-Warning "Multiple Windows Boot Loader entries were found. -FixBoot can rebuild the store around the selected Windows installation."
+            $hasStructuralWarnings = $true
+        }
+
+        $setupLoaders = @($loaders | Where-Object { $_.IsSetupEntry })
+        if ($setupLoaders.Count -gt 0) {
+            $setupSummary = ($setupLoaders | ForEach-Object { if ($_.Description) { $_.Description } else { $_.Identifier } }) -join '; '
+            Write-Warning "BCD contains setup/stale loader entries: $setupSummary"
+            $hasStructuralWarnings = $true
+        }
+
+        if ($script:SelectedWindowsInstall) {
+            $selected = $script:SelectedWindowsInstall
+            $selectedBuild = if ($selected.CurrentBuildNumber) {
+                if ($selected.UBR) { "$($selected.CurrentBuildNumber).$($selected.UBR)" } else { $selected.CurrentBuildNumber }
+            }
+            else {
+                'unknown'
+            }
+            Write-Host "Selected Windows install: $($selected.Drive) ($($selected.ProductName), build $selectedBuild, score=$($selected.Score))" -ForegroundColor Cyan
+            if ($selected.SetupEvidence) {
+                Write-Warning "Selected install still shows setup/upgrade markers: $($selected.SetupEvidence)"
+                $hasStructuralWarnings = $true
+            }
+        }
+
+        $device = $loader.Device
+        $osdev = $loader.OsDevice
+        $path = $loader.Path
+        $sysrt = if ($loader.SystemRoot) { $loader.SystemRoot } else { '\Windows' }
 
         $expectedPath = if ($script:VMGen -eq 2) { '\Windows\System32\winload.efi' } else { '\Windows\System32\winload.exe' }
         $expectedFile = Join-Path $script:WinDriveLetter ($expectedPath.TrimStart('\'))
@@ -8460,12 +9601,23 @@ Use this when stale proxy/PAC settings prevent WinRM/RDP reachability after migr
             OsDevice       = $osdev
             Path           = $path
             SystemRoot     = $sysrt
+            LoaderCount     = $loaders.Count
+            BootDefault     = $inventory.DefaultId
+            IsSetupEntry    = $loader.IsSetupEntry
             ExpectedPath   = $expectedPath
             ExpectedExists = $fileOk
         } | Format-List
 
+        if ($script:SelectedWindowsInstall -and $loader.PartitionDrive -and $loader.PartitionDrive -ne $script:SelectedWindowsInstall.Drive) {
+            Write-Warning "Preferred BCD loader points to $($loader.PartitionDrive), but the selected Windows install is $($script:SelectedWindowsInstall.Drive)."
+            $hasStructuralWarnings = $true
+        }
+
         if (-not $pathOk -or -not $fileOk) {
             Write-Warning "BCD entry may be inconsistent (path mismatch or winload file missing). Consider -FixBoot if boot fails."
+        }
+        elseif ($hasStructuralWarnings) {
+            Write-Warning "Preferred BCD loader path looks consistent, but the BCD store still has structural issues. Consider -FixBoot if you want to collapse stale or setup entries."
         }
         else {
             Write-Host "BCD loader path and winload target look consistent." -ForegroundColor Green
@@ -8910,6 +10062,9 @@ No destructive file or registry cleanup is performed.
         # 4. Detect generation (MBR = Gen1, GPT = Gen2)
         # ------------------------------------------------------------------
         $script:VMGen = Get-DiskGeneration -Disk $targetDisk
+        $script:WindowsInstallCandidates = @()
+        $script:SelectedWindowsInstall = $null
+        $script:BcdInventory = $null
         Write-Host "Detected Partition Style: $(if ($script:VMGen -eq 1) { 'MBR (BIOS) - Gen1' } else { 'GPT (UEFI) - Gen2' })"
 
         # ------------------------------------------------------------------
@@ -8995,6 +10150,22 @@ No destructive file or registry cleanup is performed.
             }
         }
 
+        $bootStorePath = Get-BcdStorePath -Generation $script:VMGen -BootDrive $bootDrive
+        $bcdInventory = Get-BcdInventory -StorePath $bootStorePath
+        $installCandidates = Get-WindowsInstallCandidates -DiskNumber $DiskNumber -Generation $script:VMGen -BcdLoaders $bcdInventory.Loaders -BcdDefaultId $bcdInventory.DefaultId
+        if ($installCandidates.Count -gt 0) {
+            $selectedInstall = @($installCandidates | Where-Object { $_.Selected } | Select-Object -First 1)
+            if (-not $selectedInstall) {
+                $selectedInstall = @($installCandidates | Select-Object -First 1)
+            }
+            if ($selectedInstall) {
+                $winDrive = $selectedInstall[0].AccessPath
+                $script:SelectedWindowsInstall = $selectedInstall[0]
+            }
+            $script:WindowsInstallCandidates = $installCandidates
+            $script:BcdInventory = $bcdInventory
+        }
+
         # Normalize to trailing backslash
         if ($winDrive -notmatch '\\$') { $winDrive = "$winDrive\" }
         if ($bootDrive -notmatch '\\$') { $bootDrive = "$bootDrive\" }
@@ -9007,6 +10178,27 @@ No destructive file or registry cleanup is performed.
         Write-Host "[OK] Windows drive : $script:WinDriveLetter"  -ForegroundColor Green
         Write-Host "[OK] Boot drive    : $script:BootDriveLetter" -ForegroundColor Green
         Write-Host "[OK] VM Generation : Gen$script:VMGen"        -ForegroundColor Green
+        if ($script:WindowsInstallCandidates.Count -gt 0) {
+            Write-Host "[INFO] Windows installs detected: $($script:WindowsInstallCandidates.Count)" -ForegroundColor Cyan
+            foreach ($candidate in $script:WindowsInstallCandidates) {
+                $marker = if ($candidate.Selected) { '[selected]' } else { '          ' }
+                $buildLabel = if ($candidate.CurrentBuildNumber) {
+                    if ($candidate.UBR) { "Build $($candidate.CurrentBuildNumber).$($candidate.UBR)" } else { "Build $($candidate.CurrentBuildNumber)" }
+                }
+                else {
+                    'Build unknown'
+                }
+                $productLabel = if ($candidate.ProductName) { $candidate.ProductName } else { 'Unknown Windows install' }
+                $stateLabel = if ($candidate.SetupInProgress) { 'setup-state' } else { 'normal-state' }
+                Write-Host "  $marker $($candidate.Drive) Part$($candidate.PartitionNumber) | $productLabel | $buildLabel | $stateLabel | score=$($candidate.Score)" -ForegroundColor $(if ($candidate.Selected) { 'Green' } else { 'DarkCyan' })
+                if ($candidate.MappedBcdEntries) {
+                    Write-Host "            BCD: $($candidate.MappedBcdEntries)" -ForegroundColor DarkGray
+                }
+                if ($candidate.SetupEvidence) {
+                    Write-Host "            Evidence: $($candidate.SetupEvidence)" -ForegroundColor DarkGray
+                }
+            }
+        }
         Write-Host ""
 
         return $true
@@ -9168,10 +10360,10 @@ PARAMETERS:
                            Azure Agent, security settings, crash artefacts - with fix suggestions
 
 --- BOOT & BCD ----------------------------------------------------------------
-  -DisableStartupRepair  Stop VM from looping into WinRE on failed boot
+    -DisableStartupRepair  Suppress BCD-driven startup repair only (does not remove WinRE files/registration)
   -EnableBootLog         Enable ntbtlog.txt boot logging
   -EnableSerialConsole   Enable EMS/Serial Console (Azure Serial Console access via SAC)
-  -EnableStartupRepair   Re-enable automatic startup repair / WinRE on boot failure
+    -EnableStartupRepair   Re-enable startup repair in BCD and also attempt offline WinRE registration
   -EnableTestSigning     Enable BCD test signing (allow unsigned drivers)
   -DisableTestSigning    Disable BCD test signing
   -FixBoot               Rebuild BCD from scratch
