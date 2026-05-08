@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.4.1
+        Version: 0.4.2
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -1401,13 +1401,30 @@ $($htmlRows -join "`n")
         return $trimmed
     }
 
+    function ConvertTo-ServiceOrDriverRegistryName {
+        param(
+            [Parameter(Mandatory = $true)][string]$Name,
+            [string]$ParameterName = 'ServiceName'
+        )
+
+        $registryName = Assert-ValidServiceOrDriverName -Name $Name -ParameterName $ParameterName
+        if ($registryName.EndsWith('.sys', [System.StringComparison]::OrdinalIgnoreCase)) {
+            $registryName = $registryName.Substring(0, $registryName.Length - 4)
+            if ([string]::IsNullOrWhiteSpace($registryName)) {
+                throw "Invalid ${ParameterName}: value cannot be only '.sys'."
+            }
+        }
+
+        return $registryName
+    }
+
     # Helper: Disable service or driver
     function Disable-ServiceOrDriver {
         param(
             [Parameter(Mandatory = $true)][string]$ServiceName
         )
 
-        $ServiceName = Assert-ValidServiceOrDriverName -Name $ServiceName -ParameterName 'DisableDriverOrService'
+        $ServiceName = ConvertTo-ServiceOrDriverRegistryName -Name $ServiceName -ParameterName 'DisableDriverOrService'
 
         Invoke-WithHive 'SYSTEM' {
             $SystemRoot = Get-SystemRootPath
@@ -1566,6 +1583,10 @@ $($htmlRows -join "`n")
         if (-not (Test-Path -Path "$script:WinDriveLetter\Temp")) {
             New-Item-Logged -Path "$script:WinDriveLetter\Temp" -ItemType Directory -Force | Out-Null
         }
+    }
+
+    function Get-ThirdPartyDriverStartBackupPath {
+        return (Join-Path $PSScriptRoot 'Repair-AzVMDisk_ThirdPartyDriverStartBackup.json')
     }
 
     function FixDiskCorruption {
@@ -3561,7 +3582,45 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                     Write-Host "No non-Microsoft Boot/System drivers found to disable." -ForegroundColor Green
                 }
                 else {
+                    $backupPath = Get-ThirdPartyDriverStartBackupPath
+                    $backupByService = @{}
+                    if (Test-Path -LiteralPath $backupPath) {
+                        try {
+                            $rawBackup = Get-Content -LiteralPath $backupPath -Raw -ErrorAction Stop
+                            if (-not [string]::IsNullOrWhiteSpace($rawBackup)) {
+                                foreach ($entry in @($rawBackup | ConvertFrom-Json)) {
+                                    if ($entry.Service -and $null -ne $entry.PreviousStart) {
+                                        $backupByService[[string]$entry.Service] = [PSCustomObject]@{
+                                            Service       = [string]$entry.Service
+                                            ImagePath     = [string]$entry.ImagePath
+                                            PreviousStart = [int]$entry.PreviousStart
+                                            DisabledAt    = [string]$entry.DisabledAt
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        catch {
+                            Write-Warning "Could not read existing third-party driver Start backup at $backupPath. It will be replaced. $_"
+                            $backupByService = @{}
+                        }
+                    }
+
+                    $timestamp = (Get-Date).ToString('o')
+                    foreach ($d in $disabled) {
+                        $backupByService[$d.Service] = [PSCustomObject]@{
+                            Service       = $d.Service
+                            ImagePath     = $d.ImagePath
+                            PreviousStart = [int]$d.PreviousStart
+                            DisabledAt    = $timestamp
+                        }
+                    }
+                    $backupRows = @($backupByService.GetEnumerator() | Sort-Object Name | ForEach-Object { $_.Value })
+                    $backupJson = ConvertTo-Json -InputObject @($backupRows) -Depth 4
+                    Set-Content -LiteralPath $backupPath -Value $backupJson -Encoding UTF8 -Force
+
                     Write-Host "`nDisabled $($disabled.Count) third-party driver(s)." -ForegroundColor Green
+                    Write-Host "Saved previous driver Start values to $backupPath" -ForegroundColor Green
                     Write-Host "`n--- TO RE-ENABLE (run -EnableThirdPartyDrivers or run on the VM after recovery) ---" -ForegroundColor Cyan
                     foreach ($d in $disabled) {
                         $livePath = "HKLM:\SYSTEM\CurrentControlSet\Services\$($d.Service)"
@@ -3765,8 +3824,69 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
             & {
                 $SystemRoot = Get-SystemRootPath
                 $ServicesRoot = "$SystemRoot\Services"
+                $backupPath = Get-ThirdPartyDriverStartBackupPath
 
                 $reEnabled = @()
+                if (Test-Path -LiteralPath $backupPath) {
+                    try {
+                        $rawBackup = Get-Content -LiteralPath $backupPath -Raw -ErrorAction Stop
+                        $backupEntries = @($rawBackup | ConvertFrom-Json)
+                    }
+                    catch {
+                        Write-Warning "Could not read third-party driver Start backup at $backupPath. No drivers were re-enabled. $_"
+                        return
+                    }
+
+                    foreach ($entry in $backupEntries) {
+                        if (-not $entry.Service -or $null -eq $entry.PreviousStart) { continue }
+                        $svcName = Assert-ValidServiceOrDriverName -Name ([string]$entry.Service) -ParameterName 'ThirdPartyDriverBackup.Service'
+                        $startValue = [int]$entry.PreviousStart
+                        $svcPath = Join-Path $ServicesRoot $svcName
+
+                        if (-not (Test-Path -LiteralPath $svcPath)) {
+                            Write-Warning "Skipping $svcName - service path $svcPath not found."
+                            continue
+                        }
+
+                        $props = Get-ItemProperty -Path $svcPath -ErrorAction SilentlyContinue
+                        if ($props.Type -notin @(1, 2)) {
+                            Write-Warning "Skipping $svcName - registry entry is not a kernel/filesystem driver."
+                            continue
+                        }
+
+                        $imagePathRaw = $props.ImagePath
+                        if ($imagePathRaw) {
+                            $imagePath = Resolve-GuestImagePath $imagePathRaw
+                            if (-not (Test-Path $imagePath)) {
+                                Write-Warning "Skipping $svcName - binary is missing ($imagePath). Restore the driver file before re-enabling."
+                                continue
+                            }
+                        }
+
+                        $currentValue = $props.Start
+                        if ($null -ne $currentValue -and [int]$currentValue -eq $startValue) {
+                            Write-Host "  $svcName Start = $currentValue (already restored)." -ForegroundColor DarkGray
+                        }
+                        else {
+                            Write-Host "  Restoring: $svcName Start $currentValue -> $startValue" -ForegroundColor Yellow
+                            Set-ItemProperty-Logged -Path $svcPath -Name Start -Value $startValue -Type DWord -Force
+                        }
+                        $reEnabled += [PSCustomObject]@{ Service = $svcName; Start = $startValue }
+                    }
+
+                    if ($reEnabled.Count -eq 0) {
+                        Write-Host "No third-party driver Start values were restored from $backupPath." -ForegroundColor Yellow
+                    }
+                    else {
+                        Write-Host "`nRestored $($reEnabled.Count) driver Start value(s) from $backupPath." -ForegroundColor Green
+                        foreach ($d in $reEnabled) {
+                            Write-Host "  $($d.Service) -> Start=$($d.Start)" -ForegroundColor Green
+                        }
+                    }
+                    return
+                }
+
+                Write-Warning "No third-party driver Start backup found at $backupPath. Falling back to legacy restore behavior (Start=1)."
                 Get-ChildItem $ServicesRoot -ErrorAction SilentlyContinue | ForEach-Object {
                     $svcPath = $_.PSPath
                     $props = Get-ItemProperty -Path $svcPath -ErrorAction SilentlyContinue
