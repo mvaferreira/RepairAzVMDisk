@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.4.2
+        Version: 0.4.3
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -1587,6 +1587,29 @@ $($htmlRows -join "`n")
 
     function Get-ThirdPartyDriverStartBackupPath {
         return (Join-Path $PSScriptRoot 'Repair-AzVMDisk_ThirdPartyDriverStartBackup.json')
+    }
+
+    function ConvertFrom-ThirdPartyDriverStartBackupJson {
+        param(
+            [Parameter(Mandatory = $true)][string]$Json
+        )
+
+        $entries = [System.Collections.Generic.List[object]]::new()
+        if ([string]::IsNullOrWhiteSpace($Json)) { return @() }
+
+        $parsed = ConvertFrom-Json -InputObject $Json
+        if ($null -eq $parsed) { return @() }
+
+        if ($parsed -is [System.Array]) {
+            foreach ($item in $parsed) {
+                if ($null -ne $item) { $entries.Add($item) }
+            }
+        }
+        else {
+            $entries.Add($parsed)
+        }
+
+        return @($entries)
     }
 
     function FixDiskCorruption {
@@ -3588,12 +3611,15 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                         try {
                             $rawBackup = Get-Content -LiteralPath $backupPath -Raw -ErrorAction Stop
                             if (-not [string]::IsNullOrWhiteSpace($rawBackup)) {
-                                foreach ($entry in @($rawBackup | ConvertFrom-Json)) {
+                                foreach ($entry in (ConvertFrom-ThirdPartyDriverStartBackupJson -Json $rawBackup)) {
                                     if ($entry.Service -and $null -ne $entry.PreviousStart) {
+                                        try { $previousStart = [int]$entry.PreviousStart }
+                                        catch { continue }
+                                        if ($previousStart -lt 0 -or $previousStart -gt 4) { continue }
                                         $backupByService[[string]$entry.Service] = [PSCustomObject]@{
                                             Service       = [string]$entry.Service
                                             ImagePath     = [string]$entry.ImagePath
-                                            PreviousStart = [int]$entry.PreviousStart
+                                            PreviousStart = $previousStart
                                             DisabledAt    = [string]$entry.DisabledAt
                                         }
                                     }
@@ -3830,7 +3856,7 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                 if (Test-Path -LiteralPath $backupPath) {
                     try {
                         $rawBackup = Get-Content -LiteralPath $backupPath -Raw -ErrorAction Stop
-                        $backupEntries = @($rawBackup | ConvertFrom-Json)
+                        $backupEntries = ConvertFrom-ThirdPartyDriverStartBackupJson -Json $rawBackup
                     }
                     catch {
                         Write-Warning "Could not read third-party driver Start backup at $backupPath. No drivers were re-enabled. $_"
@@ -3840,7 +3866,15 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                     foreach ($entry in $backupEntries) {
                         if (-not $entry.Service -or $null -eq $entry.PreviousStart) { continue }
                         $svcName = Assert-ValidServiceOrDriverName -Name ([string]$entry.Service) -ParameterName 'ThirdPartyDriverBackup.Service'
-                        $startValue = [int]$entry.PreviousStart
+                        try { $startValue = [int]$entry.PreviousStart }
+                        catch {
+                            Write-Warning "Skipping $svcName - backup has non-numeric Start value '$($entry.PreviousStart)'. Expected 0 through 4."
+                            continue
+                        }
+                        if ($startValue -lt 0 -or $startValue -gt 4) {
+                            Write-Warning "Skipping $svcName - backup has invalid Start value '$($entry.PreviousStart)'. Expected 0 through 4."
+                            continue
+                        }
                         $svcPath = Join-Path $ServicesRoot $svcName
 
                         if (-not (Test-Path -LiteralPath $svcPath)) {
