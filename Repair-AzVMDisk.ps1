@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.4.4
+        Version: 0.4.5
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -173,8 +173,8 @@ dynamicparam {
 
     # Helper: register a dynamic parameter
     $addParam = {
-        param([string]$Name, [type]$Type, [string]$SetName, $Default, [System.Attribute[]]$ExtraAttribs)
-        $pa = [System.Management.Automation.ParameterAttribute]@{ ParameterSetName = $SetName }
+        param([string]$Name, [type]$Type, [string]$SetName, $Default, [System.Attribute[]]$ExtraAttribs, [bool]$Mandatory = $false)
+        $pa = [System.Management.Automation.ParameterAttribute]@{ ParameterSetName = $SetName; Mandatory = $Mandatory }
         $col = [System.Collections.ObjectModel.Collection[System.Attribute]]::new()
         $col.Add($pa)
         if ($ExtraAttribs) { foreach ($a in $ExtraAttribs) { $col.Add($a) } }
@@ -204,7 +204,7 @@ dynamicparam {
     if ($PSBoundParameters.ContainsKey('EnableDriverOrService')) {
         $vs = [System.Management.Automation.ValidateSetAttribute]::new(
             'Boot', 'System', 'Automatic', 'Manual', 'Disabled')
-        & $addParam 'DriverStartType' ([string]) 'Repair' 'Manual' @($vs)
+        & $addParam 'DriverStartType' ([string]) 'Repair' $null @($vs) $true
     }
     # -Detailed, -All, -SessionId, -ExportTo: sub-options of -ShowLastSession
     if ($PSBoundParameters.ContainsKey('ShowLastSession')) {
@@ -1483,6 +1483,31 @@ $($htmlRows -join "`n")
                 Write-Warning "  2. Manually remove '$ServiceName' from the UpperFilters/LowerFilters"
                 Write-Warning "     registry value in the listed class key(s) before booting the VM."
             }
+        }
+    }
+
+    function ConvertTo-ServiceStartValue {
+        param([Parameter(Mandatory = $true)][ValidateSet('Boot', 'System', 'Automatic', 'Manual', 'Disabled')][string]$DriverStartType)
+
+        switch ($DriverStartType) {
+            'Boot' { return 0 }
+            'System' { return 1 }
+            'Automatic' { return 2 }
+            'Manual' { return 3 }
+            'Disabled' { return 4 }
+        }
+    }
+
+    function ConvertTo-DriverStartTypeName {
+        param([Parameter(Mandatory = $true)][int]$StartValue)
+
+        switch ($StartValue) {
+            0 { return 'Boot' }
+            1 { return 'System' }
+            2 { return 'Automatic' }
+            3 { return 'Manual' }
+            4 { return 'Disabled' }
+            default { throw "Unsupported service Start value '$StartValue'. Expected 0 through 4." }
         }
     }
 
@@ -6074,7 +6099,7 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                     if (Test-Path $sp) {
                         $start = (Get-ItemProperty $sp -ErrorAction SilentlyContinue).Start
                         if ($start -eq 4) {
-                            & $emit 'Services' (& $toSev $sevCriticalSvcDisabled) "$($s.N) is DISABLED (Start=4) - $($s.Desc) [ re-enable: Set Start=$($s.ExpStart) ]" "-EnableDriverOrService $($s.N)"
+                            & $emit 'Services' (& $toSev $sevCriticalSvcDisabled) "$($s.N) is DISABLED (Start=4) - $($s.Desc) [ re-enable: Set Start=$($s.ExpStart) ]" "-EnableDriverOrService $($s.N) -DriverStartType $(ConvertTo-DriverStartTypeName -StartValue $s.ExpStart)"
                         }
                     }
                 }
@@ -6130,14 +6155,14 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                     $icPath = "$svcRoot\$($ic.Name)"
                     $icExists = Test-Path $icPath
                     if (-not $icExists) {
-                        & $emit 'HyperV' (& $toSev $sevIntegrationSvcMissing) "$($ic.Name) service key missing - $($ic.Desc)" "-EnableDriverOrService $($ic.Name)"
+                        & $emit 'HyperV' (& $toSev $sevIntegrationSvcMissing) "$($ic.Name) service key missing - $($ic.Desc)" "-EnableDriverOrService $($ic.Name) -DriverStartType Manual"
                         $intBad++
                         continue
                     }
                     $icProps = Get-ItemProperty $icPath -ErrorAction SilentlyContinue
                     $icStart = $icProps.Start
                     if ($icStart -eq 4) {
-                        & $emit 'HyperV' (& $toSev $sevIntegrationSvcDisabled) "$($ic.Name) is DISABLED (Start=4) - $($ic.Desc)" "-EnableDriverOrService $($ic.Name)"
+                        & $emit 'HyperV' (& $toSev $sevIntegrationSvcDisabled) "$($ic.Name) is DISABLED (Start=4) - $($ic.Desc)" "-EnableDriverOrService $($ic.Name) -DriverStartType Manual"
                         $intBad++
                         continue
                     }
@@ -6170,7 +6195,7 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                 $netlogonSt = (Get-ItemProperty "$svcRoot\Netlogon" -ErrorAction SilentlyContinue).Start
                 $isDomainJoined = $domainVal -and $domainVal -notmatch '^(WORKGROUP|LOCALDOMAIN)?$'
                 if ($isDomainJoined -and $netlogonSt -eq 4) {
-                    & $emit 'Networking' (& $toSev $sevNetlogonDisabled) "Domain-joined (domain='$domainVal') but Netlogon is DISABLED (Start=4) - domain auth and RDP will fail" "-EnableDriverOrService Netlogon"
+                    & $emit 'Networking' (& $toSev $sevNetlogonDisabled) "Domain-joined (domain='$domainVal') but Netlogon is DISABLED (Start=4) - domain auth and RDP will fail" "-EnableDriverOrService Netlogon -DriverStartType Manual"
                 }
 
                 # -- RDP ------------------------------------------------------------
@@ -6349,7 +6374,7 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                 # nsi (Network Store Interface) - core TCP/IP dependency; if disabled, zero networking
                 $nsiStart = (Get-ItemProperty "$svcRoot\nsi" -ErrorAction SilentlyContinue).Start
                 if ($nsiStart -eq 4) {
-                    & $emit 'Networking' (& $toSev $sevNsiDisabled) "nsi (Network Store Interface) is DISABLED - TCP/IP stack is non-functional; all networking will fail" "-EnableDriverOrService nsi"
+                    & $emit 'Networking' (& $toSev $sevNsiDisabled) "nsi (Network Store Interface) is DISABLED - TCP/IP stack is non-functional; all networking will fail" "-EnableDriverOrService nsi -DriverStartType Automatic"
                 }
 
                 # Additional networking services
@@ -10425,7 +10450,7 @@ No destructive file or registry cleanup is performed.
             [switch]$IssuesOnly,
             [string[]]$DisableDriverOrService = @(),
             [string[]]$EnableDriverOrService = @(),
-            [ValidateSet('Boot', 'System', 'Automatic', 'Manual', 'Disabled')][string]$DriverStartType = 'Manual',
+            [ValidateSet('Boot', 'System', 'Automatic', 'Manual', 'Disabled')][string]$DriverStartType,
             [switch]$DisableCredentialGuard,
             [switch]$EnableCredentialGuard,
             [switch]$DisableAppLocker,
@@ -10554,7 +10579,7 @@ PARAMETERS:
   -EnableDriverVerifier [driver1.sys,...]  Enable Driver Verifier with standard flags; omit value to verify all drivers
   -EnsureSyntheticDriversEnabled  Re-enable core Azure synthetic drivers (vmbus/storvsc/netvsc)
   -EnableDriverOrService  <name[,name,...]>  Re-enable one or more named services or drivers
-  -DriverStartType <type>           Start type for -EnableDriverOrService: Boot, System, Automatic, Manual (default), Disabled
+    -DriverStartType <type>           Required with -EnableDriverOrService: Boot, System, Automatic, Manual, Disabled
   -DisableThirdPartyDrivers    Disable all non-Microsoft Boot/System kernel drivers
   -EnableThirdPartyDrivers     Re-enable previously disabled third-party kernel drivers
   -GetServicesReport           List drivers from the offline ControlSet grouped by start type,
@@ -10743,8 +10768,11 @@ AVAILABLE DISKS:
             if ($GetServicesReport) { GetServicesReport -IncludeServices:$IncludeServices -IssuesOnly:$IssuesOnly }
             foreach ($d in $DisableDriverOrService) { if (-not [string]::IsNullOrWhiteSpace($d)) { Disable-ServiceOrDriver -ServiceName $d.Trim() } }
             if ($EnableDriverOrService.Count -gt 0) {
-                $startMap = @{ Boot = 0; System = 1; Automatic = 2; Manual = 3; Disabled = 4 }
-                $startInt = $startMap[$DriverStartType]
+                if (-not $PSBoundParameters.ContainsKey('DriverStartType')) {
+                    Write-Error "-DriverStartType is required when using -EnableDriverOrService. Specify Boot, System, Automatic, Manual, or Disabled."
+                    return
+                }
+                $startInt = ConvertTo-ServiceStartValue -DriverStartType $DriverStartType
                 foreach ($d in $EnableDriverOrService) { if (-not [string]::IsNullOrWhiteSpace($d)) { Enable-ServiceOrDriver -ServiceName $d.Trim() -StartValue $startInt } }
             }
             if ($DisableCredentialGuard) { DisableCredentialGuard }
@@ -10851,7 +10879,7 @@ AVAILABLE DISKS:
     $IncludeServices = [bool]$PSBoundParameters.ContainsKey('IncludeServices')
     $IssuesOnly = [bool]$PSBoundParameters.ContainsKey('IssuesOnly')
     $KeepDefaultFilters = [bool]$PSBoundParameters.ContainsKey('KeepDefaultFilters')
-    $DriverStartType = if ($PSBoundParameters.ContainsKey('DriverStartType')) { $PSBoundParameters['DriverStartType'] }  else { 'Manual' }
+    $DriverStartType = if ($PSBoundParameters.ContainsKey('DriverStartType')) { $PSBoundParameters['DriverStartType'] }  else { $null }
     $Detailed = [bool]$PSBoundParameters.ContainsKey('Detailed')
     $All = [bool]$PSBoundParameters.ContainsKey('All')
     $SessionId = if ($PSBoundParameters.ContainsKey('SessionId')) { $PSBoundParameters['SessionId'] }        else { '' }
