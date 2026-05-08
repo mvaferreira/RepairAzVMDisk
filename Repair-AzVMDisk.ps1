@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.4.3
+        Version: 0.4.4
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -1493,7 +1493,7 @@ $($htmlRows -join "`n")
             [Parameter(Mandatory = $true)]$StartValue
         )
 
-        $ServiceName = Assert-ValidServiceOrDriverName -Name $ServiceName -ParameterName 'EnableDriverOrService'
+        $ServiceName = ConvertTo-ServiceOrDriverRegistryName -Name $ServiceName -ParameterName 'EnableDriverOrService'
 
         Invoke-WithHive 'SYSTEM' {
             $SystemRoot = Get-SystemRootPath
