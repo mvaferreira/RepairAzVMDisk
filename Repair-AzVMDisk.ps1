@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.4.7
+        Version: 0.4.8
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -5764,7 +5764,6 @@ complete recovery.
         # Windows Update
         $sevUpdateWuDisabled = 0   # WU services (wuauserv/UsoSvc/WaaSMedicSvc) disabled
         $sevCbsPendingWarn = 1   # CBS RebootPending/PackagesPending/exclusive SessionsPending
-        $sevCbsPendingInfo = 0   # CBS SessionsPending without exclusive lock (stale, usually benign)
 
         # ACPI
         $sevACPISettings = 0   # Hyper-V ACPI entries (MSFT1000/MSFT1002) missing
@@ -5806,9 +5805,6 @@ complete recovery.
         # Gen2 / UEFI / Trusted Launch (only evaluated when $script:VMGen -eq 2)
         $sevBootmgfwMissing = 2   # bootmgfw.efi missing from EFI System Partition
         $sevBootx64Missing = 1   # EFI\Boot\bootx64.efi fallback loader missing
-        $sevSecureBootPayloadSourceMissing = 1   # Windows-staged Secure Boot source payload missing
-        $sevSecureBootPayloadMismatch = 0   # ESP Secure Boot boot/policy file differs from Windows-staged source (advisory; can be normal)
-        $sevSecureBootPayloadEmpty = 1   # ESP Secure Boot boot/policy file exists but is 0 bytes
         $sevBcdWinloadMismatch = 2   # BCD points to winload.exe on a Gen2 (UEFI) disk
         $sevBcdNoIntegrityChecks = 2   # nointegritychecks ON - fatal with Secure Boot
         $sevSecureBootConflict = 2   # testsigning/nointegritychecks ON while guest had Secure Boot
@@ -6148,54 +6144,6 @@ complete recovery.
         if ($script:VMGen -eq 2) {
             $efiBootmgfw = Join-Path $script:BootDriveLetter 'EFI\Microsoft\Boot\bootmgfw.efi'
             $efiBootx64 = Join-Path $script:BootDriveLetter 'EFI\Boot\bootx64.efi'
-            $sourceBootmgfw = Join-Path $script:WinDriveLetter 'Windows\Boot\EFI\bootmgfw.efi'
-            $sourceSkuPolicy = Join-Path $script:WinDriveLetter 'Windows\System32\SecureBootUpdates\SKUSiPolicy.p7b'
-            $efiSkuPolicy = Join-Path $script:BootDriveLetter 'EFI\Microsoft\Boot\SKUSiPolicy.p7b'
-
-            $compareSecureBootPayload = {
-                param(
-                    [Parameter(Mandatory = $true)][string]$Label,
-                    [Parameter(Mandatory = $true)][string]$SourcePath,
-                    [Parameter(Mandatory = $true)][string]$TargetPath,
-                    [Parameter(Mandatory = $true)][string]$TargetRole
-                )
-
-                if (-not (Test-Path -LiteralPath $SourcePath)) {
-                    & $emit 'UEFI' (& $toSev $sevSecureBootPayloadSourceMissing) "$Label source payload missing from Windows partition ($SourcePath) - the matching cumulative update may not be staged; -FixSecureBootCodeIntegrity cannot refresh this target until the source exists" "-RepairComponentStore -RepairSource <matching ISO/WIM/MSU>"
-                    return
-                }
-
-                $sourceItem = Get-Item -LiteralPath $SourcePath -Force -ErrorAction SilentlyContinue
-                if (-not $sourceItem -or $sourceItem.Length -eq 0) {
-                    & $emit 'UEFI' (& $toSev $sevSecureBootPayloadSourceMissing) "$Label source payload is 0 bytes on Windows partition ($SourcePath) - repair the component store before refreshing the EFI System Partition" "-RepairComponentStore -RepairSource <matching ISO/WIM/MSU>"
-                    return
-                }
-
-                if (-not (Test-Path -LiteralPath $TargetPath)) {
-                    & $emit 'UEFI' (& $toSev $sevSecureBootPayloadMismatch) "$Label not present on EFI System Partition $TargetRole ($TargetPath) - advisory only; some healthy systems do not mirror every Windows-staged Secure Boot payload to ESP until the mitigation is applied. If investigating winload.efi / Code Integrity error 0xc0430001, run -FixSecureBootCodeIntegrity" "-FixSecureBootCodeIntegrity"
-                    return
-                }
-
-                $targetItem = Get-Item -LiteralPath $TargetPath -Force -ErrorAction SilentlyContinue
-                if (-not $targetItem -or $targetItem.Length -eq 0) {
-                    & $emit 'UEFI' (& $toSev $sevSecureBootPayloadEmpty) "$Label is 0 bytes on EFI System Partition $TargetRole ($TargetPath) - suspicious payload state; if investigating winload.efi / Code Integrity error 0xc0430001, run -FixSecureBootCodeIntegrity" "-FixSecureBootCodeIntegrity"
-                    return
-                }
-
-                $sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $SourcePath -ErrorAction SilentlyContinue).Hash
-                $targetHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $TargetPath -ErrorAction SilentlyContinue).Hash
-                if (-not $sourceHash -or -not $targetHash) {
-                    & $emit 'UEFI' 'WARN' "Could not hash $Label for source/ESP comparison ($SourcePath -> $TargetPath)" "-AnalyzeCriticalBootFiles"
-                    return
-                }
-
-                if ($sourceItem.Length -ne $targetItem.Length -or $sourceHash -ne $targetHash) {
-                    & $emit 'UEFI' (& $toSev $sevSecureBootPayloadMismatch) "$Label on EFI System Partition $TargetRole differs from Windows-staged source (source size=$($sourceItem.Length), target size=$($targetItem.Length)) - advisory only; this can be normal on a healthy VM. If investigating winload.efi / Code Integrity error 0xc0430001, run -FixSecureBootCodeIntegrity" "-FixSecureBootCodeIntegrity"
-                }
-                else {
-                    & $emit 'UEFI' 'OK' "$Label matches Windows-staged source for $TargetRole"
-                }
-            }
 
             if (-not (Test-Path $efiBootmgfw)) {
                 & $emit 'BCD' (& $toSev $sevBootmgfwMissing) "bootmgfw.efi missing from EFI System Partition ($efiBootmgfw) - UEFI firmware cannot start Windows Boot Manager" $bcdFix
@@ -6224,10 +6172,6 @@ complete recovery.
                     & $emit 'Security' (& $toSev $sevBinarySignatureBad) "bootx64.efi is NOT Microsoft-signed (status=$($efiX64Sig.Status), subject='$($efiX64Sig.Subject)') - possible tampering" $bcdFix
                 }
             }
-
-            & $compareSecureBootPayload 'bootmgfw.efi' $sourceBootmgfw $efiBootmgfw '(EFI\Microsoft\Boot)'
-            & $compareSecureBootPayload 'bootx64.efi fallback loader' $sourceBootmgfw $efiBootx64 '(EFI\Boot)'
-            & $compareSecureBootPayload 'SKUSiPolicy.p7b' $sourceSkuPolicy $efiSkuPolicy '(EFI\Microsoft\Boot)'
         }
 
         # Gen1 BIOS: verify boot partition has the Active flag set
@@ -7259,9 +7203,11 @@ complete recovery.
                 # CBS / Component Based Servicing pending state
                 $cbsBase = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing'
                 $cbsIssues = [System.Collections.Generic.List[string]]::new()
+                $cbsPendingKeyFound = $false
                 foreach ($cbsKey in @('RebootPending', 'PackagesPending', 'SessionsPending')) {
                     $cbsKeyPath = "$cbsBase\$cbsKey"
                     if (-not (Test-Path $cbsKeyPath)) { continue }
+                    $cbsPendingKeyFound = $true
 
                     # Collect detail: subkey names + any values on the key itself
                     $subkeys = @(Get-ChildItem $cbsKeyPath -ErrorAction SilentlyContinue | Select-Object -ExpandProperty PSChildName)
@@ -7288,27 +7234,21 @@ complete recovery.
                             if ($exclusive.Count -gt 0) {
                                 "EXCLUSIVE session lock(s) present - a CBS operation was interrupted mid-flight; session ID(s): $($exclusive -join ', ')"
                             }
-                            elseif ($subkeys.Count -gt 0) {
-                                "$($subkeys.Count) session entry(s) - likely a previous CBS transaction that did not complete cleanly; session ID(s): $($subkeys -join ', ')"
-                            }
                             else {
-                                'key exists (no subkeys) - stale CBS session marker'
+                                # Non-exclusive SessionsPending entries are common stale CBS history on healthy systems.
+                                # Suppress them from -SysCheck so they do not inflate INFO/WARN counts.
+                                $null
                             }
                         }
                     }
-                    $cbsIssues.Add("$cbsKey ($detail)")
+                    if ($detail) { $cbsIssues.Add("$cbsKey ($detail)") }
                 }
                 if ($cbsIssues.Count -gt 0) {
                     foreach ($issue in $cbsIssues) {
-                        # SessionsPending without Exclusive locks is normal on healthy systems - emit INFO only
-                        $isSessionInfo = ($issue -match '^SessionsPending' -and $issue -notmatch 'EXCLUSIVE')
-                        $level = if ($isSessionInfo) { (& $toSev $sevCbsPendingInfo) } else { (& $toSev $sevCbsPendingWarn) }
-                        $suffix = if ($isSessionInfo) { ' (stale entries, no exclusive lock - normal on healthy systems)' } else { " - may cause 'Configuring Windows Updates' boot loop" }
-                        $fix = if ($isSessionInfo) { $null } else { '-FixPendingUpdates' }
-                        & $emit 'WindowsUpdate' $level "CBS pending state: $issue$suffix" $fix
+                        & $emit 'WindowsUpdate' (& $toSev $sevCbsPendingWarn) "CBS pending state: $issue - may cause 'Configuring Windows Updates' boot loop" '-FixPendingUpdates'
                     }
                 }
-                else {
+                elseif (-not $cbsPendingKeyFound) {
                     & $emit 'WindowsUpdate' 'OK' 'No CBS pending state keys detected'
                 }
 
@@ -8631,8 +8571,6 @@ to .disabled extension. Does NOT remove them; they can be re-enabled by renaming
                 @{ Name = 'bootmgfw source'; Path = (Join-Path $script:WinDriveLetter 'Windows\Boot\EFI\bootmgfw.efi'); Category = 'Boot Loader Source' }
                 @{ Name = 'bootmgfw.efi'; Path = (Join-Path $script:BootDriveLetter 'EFI\Microsoft\Boot\bootmgfw.efi'); Category = 'Boot Loader' }
                 @{ Name = 'bootx64.efi'; Path = (Join-Path $script:BootDriveLetter 'EFI\Boot\bootx64.efi'); Category = 'Boot Loader' }
-                @{ Name = 'SKUSiPolicy source'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\SecureBootUpdates\SKUSiPolicy.p7b'); Category = 'Secure Boot Policy' }
-                @{ Name = 'SKUSiPolicy.p7b'; Path = (Join-Path $script:BootDriveLetter 'EFI\Microsoft\Boot\SKUSiPolicy.p7b'); Category = 'Secure Boot Policy' }
             )
         }
         # Azure/Hyper-V critical drivers - missing any of these will BSOD or cripple the VM
@@ -8679,6 +8617,72 @@ to .disabled extension. Does NOT remove them; they can be re-enabled by renaming
         if ($notMsSigned.Count -gt 0) {
             Write-Warning "Non-Microsoft-signed binary/ies: $($notMsSigned.Artifact -join ', ') - possible tampering or third-party replacement."
         }
+
+        if ($script:VMGen -eq 2) {
+            Write-Host "`nSecure Boot payload comparison (advisory):" -ForegroundColor Cyan
+
+            $secureBootPayloadPairs = @(
+                @{ Label = 'bootmgfw.efi'; Source = (Join-Path $script:WinDriveLetter 'Windows\Boot\EFI\bootmgfw.efi'); Target = (Join-Path $script:BootDriveLetter 'EFI\Microsoft\Boot\bootmgfw.efi'); TargetRole = 'EFI\Microsoft\Boot' }
+                @{ Label = 'bootx64.efi fallback loader'; Source = (Join-Path $script:WinDriveLetter 'Windows\Boot\EFI\bootmgfw.efi'); Target = (Join-Path $script:BootDriveLetter 'EFI\Boot\bootx64.efi'); TargetRole = 'EFI\Boot' }
+                @{ Label = 'SKUSiPolicy.p7b'; Source = (Join-Path $script:WinDriveLetter 'Windows\System32\SecureBootUpdates\SKUSiPolicy.p7b'); Target = (Join-Path $script:BootDriveLetter 'EFI\Microsoft\Boot\SKUSiPolicy.p7b'); TargetRole = 'EFI\Microsoft\Boot' }
+            )
+
+            $payloadRows = foreach ($pair in $secureBootPayloadPairs) {
+                $sourceItem = Get-Item -LiteralPath $pair.Source -Force -ErrorAction SilentlyContinue
+                $targetItem = Get-Item -LiteralPath $pair.Target -Force -ErrorAction SilentlyContinue
+                $status = 'OK'
+                $detail = ''
+
+                if (-not $sourceItem) {
+                    $detail = 'Windows-staged source not present; no ESP comparison available.'
+                }
+                elseif ($sourceItem.Length -eq 0) {
+                    $status = 'WARN'
+                    $detail = 'Windows-staged source is 0 bytes; repair component store before using it as a source.'
+                }
+                elseif (-not $targetItem) {
+                    $detail = 'Not present on ESP; can be normal until Secure Boot mitigation is applied.'
+                }
+                elseif ($targetItem.Length -eq 0) {
+                    $status = 'WARN'
+                    $detail = 'ESP target is 0 bytes; suspicious payload state.'
+                }
+                else {
+                    $sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $pair.Source -ErrorAction SilentlyContinue).Hash
+                    $targetHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $pair.Target -ErrorAction SilentlyContinue).Hash
+                    if (-not $sourceHash -or -not $targetHash) {
+                        $status = 'WARN'
+                        $detail = 'Could not hash source or ESP target.'
+                    }
+                    elseif ($sourceItem.Length -eq $targetItem.Length -and $sourceHash -eq $targetHash) {
+                        $detail = 'ESP target matches Windows-staged source.'
+                    }
+                    else {
+                        $detail = 'ESP target differs from Windows-staged source; advisory only and can be normal on a healthy VM.'
+                    }
+                }
+
+                [PSCustomObject]@{
+                    Status     = $status
+                    Artifact   = $pair.Label
+                    SourceSize = if ($sourceItem) { "{0:N0}" -f $sourceItem.Length } else { '' }
+                    TargetSize = if ($targetItem) { "{0:N0}" -f $targetItem.Length } else { '' }
+                    Target     = $pair.TargetRole
+                    Detail     = $detail
+                }
+            }
+
+            $payloadRows | Format-Table Status, Artifact, SourceSize, TargetSize, Target, Detail -AutoSize
+            $payloadWarnings = @($payloadRows | Where-Object { $_.Status -eq 'WARN' })
+            if ($payloadWarnings.Count -gt 0) {
+                Write-Warning "Suspicious Secure Boot payload state(s): $($payloadWarnings.Artifact -join ', ')."
+                Write-Host "If the VM fails with winload.efi / Code Integrity error 0xc0430001, run -FixSecureBootCodeIntegrity." -ForegroundColor Yellow
+            }
+            else {
+                Write-Host "Secure Boot payload comparison found no suspicious zero-byte or unreadable payloads." -ForegroundColor Green
+            }
+        }
+
         if ($missing.Count -eq 0 -and $zeroLen.Count -eq 0 -and $notMsSigned.Count -eq 0) {
             Write-Host "All checked critical boot/system files are present, non-empty, and Microsoft-signed." -ForegroundColor Green
         }
