@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.4.5
+        Version: 0.4.6
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -55,6 +55,20 @@
         PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixBoot -FixRDP
 
     .EXAMPLE
+        # Full Gen2 / UEFI boot repair on disk 3
+        # -RecreateBootPartition exits without deleting/recreating if the EFI System Partition already exists.
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -RecreateBootPartition
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixBoot
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixSecureBootCodeIntegrity
+
+    .EXAMPLE
+        # Full Gen1 / BIOS-MBR boot repair on disk 3
+        # -RecreateBootPartition exits without deleting/recreating if a valid Active boot partition already exists.
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -RecreateBootPartition
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixBoot
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixBootSector
+
+    .EXAMPLE
         # Run chkdsk on a specific partition (disk must stay online for the drive letter to be available)
         PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixNTFS -DriveLetter H: -LeaveDiskOnline
 
@@ -80,6 +94,7 @@ param (
     [Parameter(ParameterSetName = 'Repair')][int]$DiskNumber = -1,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixNTFS,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixBoot,
+    [Parameter(ParameterSetName = 'Repair')][switch]$FixSecureBootCodeIntegrity,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixBootSector,
     [Parameter(ParameterSetName = 'Repair')][switch]$RecreateBootPartition,
     [Parameter(ParameterSetName = 'Repair')][switch]$RepairComponentStore,
@@ -118,6 +133,7 @@ param (
     [Parameter(ParameterSetName = 'Repair')][string[]]$EnableDriverOrService = @(),
     [Parameter(ParameterSetName = 'Repair')][switch]$DisableCredentialGuard,
     [Parameter(ParameterSetName = 'Repair')][switch]$EnableCredentialGuard,
+    [Parameter(ParameterSetName = 'Repair')][switch]$DisableMemoryIntegrity,
     [Parameter(ParameterSetName = 'Repair')][switch]$DisableAppLocker,
     [Parameter(ParameterSetName = 'Repair')][switch]$GetAppLockerReport,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixSanPolicy,
@@ -2069,6 +2085,194 @@ The script will copy it to the guest before running bcdboot, then proceed with -
             if (-not $script:_userFacingError) { Write-Error "RebuildBCD failed: $_" }
             throw
         }
+    }
+
+    function Get-EfiFallbackBootFileName {
+        $guestArch = ''
+        try {
+            Invoke-WithHive 'SYSTEM' {
+                $sysRoot = Get-SystemRootPath
+                $envPath = Join-Path $sysRoot 'Control\Session Manager\Environment'
+                $env = Get-ItemProperty -Path $envPath -ErrorAction SilentlyContinue
+                if ($env -and $env.PROCESSOR_ARCHITECTURE) {
+                    $script:_RepairGuestProcessorArchitecture = [string]$env.PROCESSOR_ARCHITECTURE
+                }
+            }
+            $guestArch = $script:_RepairGuestProcessorArchitecture
+        }
+        catch {}
+        finally {
+            Remove-Variable -Name _RepairGuestProcessorArchitecture -Scope Script -ErrorAction SilentlyContinue
+        }
+
+        switch -Regex ($guestArch) {
+            'ARM64|AA64' { return 'bootaa64.efi' }
+            'x86|IA32'  { return 'bootia32.efi' }
+            default     { return 'bootx64.efi' }
+        }
+    }
+
+    function Invoke-OfflineSfcScanFile {
+        param(
+            [Parameter(Mandatory = $true)][string]$RelativePath,
+            [Parameter(Mandatory = $true)][string]$Label,
+            [switch]$Optional
+        )
+
+        $targetPath = Join-Path $script:WinDriveLetter $RelativePath
+        if ($Optional -and -not (Test-Path -LiteralPath $targetPath)) {
+            Write-Host "  Skipping optional $Label (not present): $targetPath" -ForegroundColor DarkGray
+            return
+        }
+
+        $offBoot = $script:WinDriveLetter
+        $offWin = Join-Path $script:WinDriveLetter 'Windows'
+        Write-Host "  Repairing $Label with offline SFC: $targetPath" -ForegroundColor Cyan
+        try {
+            $output = Invoke-Logged -Description "SFC scanfile $Label" -Details @{ File = $targetPath; OffBootDir = $offBoot; OffWinDir = $offWin } -ScriptBlock {
+                & sfc.exe "/SCANFILE=$targetPath" "/OFFBOOTDIR=$offBoot" "/OFFWINDIR=$offWin" 2>&1 | Out-String -Width 9999
+            }
+            if ($output -and ([string]$output).Trim()) {
+                ([string]$output).Trim() -split "`r?`n" | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+            }
+        }
+        catch {
+            Write-Warning "  Targeted SFC failed for $Label ($targetPath): $_"
+        }
+
+        if (-not (Test-Path -LiteralPath $targetPath)) {
+            $level = if ($Optional) { 'DarkGray' } else { 'Yellow' }
+            Write-Host "  $Label still missing after targeted SFC: $targetPath" -ForegroundColor $level
+            return
+        }
+
+        $item = Get-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue
+        if ($item -and $item.Length -eq 0) {
+            Write-Warning "  $Label is still 0 bytes after targeted SFC: $targetPath"
+            return
+        }
+
+        if ($targetPath -match '\.(efi|exe|dll|sys)$') {
+            $sig = Test-MicrosoftSignature -FilePath $targetPath
+            if (-not $sig.IsMicrosoft) {
+                Write-Warning "  $Label is not Microsoft-signed after targeted SFC (status=$($sig.Status), subject='$($sig.Subject)'): $targetPath"
+            }
+        }
+    }
+
+    function RepairSecureBootCodeIntegrity {
+        if ($script:VMGen -ne 2) {
+            Write-Error "-FixSecureBootCodeIntegrity applies only to Generation 2 / UEFI disks. Gen1 disks do not have an EFI System Partition."
+            return
+        }
+
+        $sourceBootManager = Join-Path $script:WinDriveLetter 'Windows\Boot\EFI\bootmgfw.efi'
+        $sourceSkuPolicy = Join-Path $script:WinDriveLetter 'Windows\System32\SecureBootUpdates\SKUSiPolicy.p7b'
+        $microsoftBootDir = Join-Path $script:BootDriveLetter 'EFI\Microsoft\Boot'
+        $fallbackBootDir = Join-Path $script:BootDriveLetter 'EFI\Boot'
+        $destBootManager = Join-Path $microsoftBootDir 'bootmgfw.efi'
+        $fallbackName = Get-EfiFallbackBootFileName
+        $destFallbackBoot = Join-Path $fallbackBootDir $fallbackName
+        $destSkuPolicy = Join-Path $microsoftBootDir 'SKUSiPolicy.p7b'
+
+        if (-not (Confirm-CriticalOperation -Operation 'Fix Secure Boot / Code Integrity boot files (-FixSecureBootCodeIntegrity)' -Details @"
+Refreshes the Gen2 EFI System Partition from the offline Windows installation:
+  Source boot manager : $sourceBootManager
+  Target boot manager : $destBootManager
+  Target fallback     : $destFallbackBoot
+  Source SKU policy   : $sourceSkuPolicy
+  Target SKU policy   : $destSkuPolicy
+
+This targets the winload.efi / 0xc0430001 recovery screen seen when Secure Boot
+rollback protections or CVE-2023-24932 boot-manager revocations require newer
+boot manager and SKUSiPolicy.p7b files on the EFI System Partition.
+
+Before the EFI copy, it also runs targeted offline SFC repairs for winload.efi,
+ci.dll, kernel/HAL, and related OS-loader dependencies on the Windows partition.
+"@)) { return }
+
+        $loaderRepairTargets = @(
+            @{ RelativePath = 'Windows\Boot\EFI\bootmgfw.efi'; Label = 'Windows-staged boot manager'; Optional = $false }
+            @{ RelativePath = 'Windows\System32\winload.efi'; Label = 'Windows OS loader (winload.efi)'; Optional = $false }
+            @{ RelativePath = 'Windows\System32\winresume.efi'; Label = 'Windows resume loader (winresume.efi)'; Optional = $true }
+            @{ RelativePath = 'Windows\System32\ci.dll'; Label = 'Code Integrity engine (ci.dll)'; Optional = $false }
+            @{ RelativePath = 'Windows\System32\ntoskrnl.exe'; Label = 'NT kernel (ntoskrnl.exe)'; Optional = $false }
+            @{ RelativePath = 'Windows\System32\hal.dll'; Label = 'Hardware Abstraction Layer (hal.dll)'; Optional = $false }
+            @{ RelativePath = 'Windows\System32\kdcom.dll'; Label = 'kernel debug transport (kdcom.dll)'; Optional = $false }
+            @{ RelativePath = 'Windows\System32\pshed.dll'; Label = 'platform hardware error driver (pshed.dll)'; Optional = $false }
+            @{ RelativePath = 'Windows\System32\drivers\clfs.sys'; Label = 'Common Log File System driver (clfs.sys)'; Optional = $false }
+            @{ RelativePath = 'Windows\System32\hvloader.dll'; Label = 'Hyper-V loader (hvloader.dll)'; Optional = $true }
+            @{ RelativePath = 'Windows\System32\hvix64.exe'; Label = 'Hyper-V hypervisor image (hvix64.exe)'; Optional = $true }
+            @{ RelativePath = 'Windows\System32\CodeIntegrity\SiPolicy.p7b'; Label = 'Code Integrity policy (SiPolicy.p7b)'; Optional = $true }
+            @{ RelativePath = 'Windows\System32\SecureBootUpdates\SKUSiPolicy.p7b'; Label = 'Secure Boot SKU policy source (SKUSiPolicy.p7b)'; Optional = $false }
+        )
+
+        Write-Host "`nRepairing Windows loader / Code Integrity source files with targeted offline SFC..." -ForegroundColor Yellow
+        foreach ($target in $loaderRepairTargets) {
+            Invoke-OfflineSfcScanFile -RelativePath $target.RelativePath -Label $target.Label -Optional:([bool]$target.Optional)
+        }
+
+        $missingSources = @()
+        if (-not (Test-Path -LiteralPath $sourceBootManager)) { $missingSources += $sourceBootManager }
+        if (-not (Test-Path -LiteralPath $sourceSkuPolicy)) { $missingSources += $sourceSkuPolicy }
+        if ($missingSources.Count -gt 0) {
+            Write-Host "`n[ERROR] Required Secure Boot recovery source file(s) were not found on the offline Windows partition:" -ForegroundColor Red
+            $missingSources | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
+            Write-Host "`nThese files are staged by Windows cumulative updates that contain the CVE-2023-24932 Secure Boot mitigations." -ForegroundColor Yellow
+            Write-Host "Install/apply the matching cumulative update, or repair the component store from matching media, then rerun -FixSecureBootCodeIntegrity." -ForegroundColor Yellow
+            $script:_userFacingError = $true
+            throw "Missing Secure Boot recovery source file(s): $($missingSources -join ', ')"
+        }
+
+        foreach ($dir in @($microsoftBootDir, $fallbackBootDir)) {
+            if (-not (Test-Path -LiteralPath $dir)) {
+                New-Item-Logged -Path $dir -ItemType Directory -Force
+            }
+        }
+
+        function Copy-SecureBootArtifact {
+            param(
+                [Parameter(Mandatory = $true)][string]$Source,
+                [Parameter(Mandatory = $true)][string]$Destination,
+                [Parameter(Mandatory = $true)][string]$Label
+            )
+
+            if (Test-Path -LiteralPath $Destination) {
+                $backupPath = New-UniqueBackupPath -BasePath $Destination -BakSuffix '.secureboot.bak'
+                Write-Host "  Backing up ${Label}: $Destination -> $backupPath" -ForegroundColor DarkGray
+                Invoke-Logged -Description "Backup $Label" -Details @{ Source = $Destination; BackupPath = $backupPath } -ScriptBlock {
+                    Copy-Item -LiteralPath $Destination -Destination $backupPath -Force -ErrorAction Stop
+                }
+            }
+
+            Write-Host "  Copying ${Label}: $Source -> $Destination" -ForegroundColor Cyan
+            Invoke-Logged -Description "Copy $Label" -Details @{ Source = $Source; Destination = $Destination } -ScriptBlock {
+                Copy-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+            }
+
+            if (-not (Test-Path -LiteralPath $Destination)) {
+                throw "Copy verification failed for $Destination"
+            }
+            $sourceSize = (Get-Item -LiteralPath $Source -Force).Length
+            $destSize = (Get-Item -LiteralPath $Destination -Force).Length
+            if ($sourceSize -ne $destSize) {
+                throw "Copy verification failed for $Destination (source size $sourceSize, destination size $destSize)"
+            }
+        }
+
+        Copy-SecureBootArtifact -Source $sourceBootManager -Destination $destBootManager -Label 'EFI Microsoft boot manager'
+        Copy-SecureBootArtifact -Source $sourceBootManager -Destination $destFallbackBoot -Label 'EFI fallback boot manager'
+        Copy-SecureBootArtifact -Source $sourceSkuPolicy -Destination $destSkuPolicy -Label 'Secure Boot SKU policy'
+
+        Write-ActionLog -Event 'SecureBootCodeIntegrityRepaired' -Details @{
+            SourceBootManager = $sourceBootManager
+            DestBootManager   = $destBootManager
+            DestFallbackBoot  = $destFallbackBoot
+            SourceSkuPolicy   = $sourceSkuPolicy
+            DestSkuPolicy     = $destSkuPolicy
+        }
+        Write-Host "Secure Boot / Code Integrity boot files refreshed." -ForegroundColor Green
+        Write-Host "If Secure Boot was disabled as a workaround, shut down the VM, re-enable Secure Boot, then test boot." -ForegroundColor Yellow
     }
 
     function RecreateBootPartition {
@@ -4120,6 +4324,55 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
         }
     }
 
+    function DisableMemoryIntegrity {
+        if (-not (Confirm-CriticalOperation -Operation 'Disable Memory Integrity / HVCI (-DisableMemoryIntegrity)' -Details @"
+Disables offline Hypervisor-Enforced Code Integrity settings that can cause a
+Code Integrity boot failure after incompatible driver, VBS, or Device Guard changes.
+
+This sets the active ControlSet value:
+  Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity\Enabled = 0
+
+It also clears related policy/lock values where present. If HVCI was enabled
+with UEFI lock, Secure Boot may still need to be disabled once so Windows can
+complete recovery.
+"@)) { return }
+
+        Write-Host "Disabling Memory Integrity / Hypervisor-Enforced Code Integrity..." -ForegroundColor Yellow
+        Invoke-WithHive 'SYSTEM', 'SOFTWARE' {
+            $systemRoot = Get-SystemRootPath
+            $hvciPath = "$systemRoot\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity"
+            $deviceGuardPath = "$systemRoot\Control\DeviceGuard"
+            $policyPath = 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\Windows\DeviceGuard'
+
+            $beforeEnabled = (Get-ItemProperty -Path $hvciPath -ErrorAction SilentlyContinue).Enabled
+            $beforeLocked = (Get-ItemProperty -Path $hvciPath -ErrorAction SilentlyContinue).Locked
+            if ($beforeLocked -eq 1) {
+                Write-Warning "Memory Integrity appears to be configured with a lock. Registry changes may require Secure Boot to be disabled once for recovery."
+            }
+
+            Set-ItemProperty-Logged -Path $hvciPath -Name Enabled -Value 0 -Type DWord -Force
+            Set-ItemProperty-Logged -Path $hvciPath -Name Locked  -Value 0 -Type DWord -Force
+
+            if (Test-Path $deviceGuardPath) {
+                Set-ItemProperty-Logged -Path $deviceGuardPath -Name Mandatory -Value 0 -Type DWord -Force
+            }
+
+            if (Test-Path $policyPath) {
+                Set-ItemProperty-Logged -Path $policyPath -Name HypervisorEnforcedCodeIntegrity -Value 0 -Type DWord -Force
+                Set-ItemProperty-Logged -Path $policyPath -Name HVCIMATRequired -Value 0 -Type DWord -Force
+            }
+
+            Write-Host "Memory Integrity / HVCI registry settings cleared." -ForegroundColor Green
+            Write-Host "`n--- REVERT COMMANDS (run on the VM after recovery if you want to re-enable HVCI) ---" -ForegroundColor Cyan
+            $hvciLive = 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity'
+            Write-Host "Set-ItemProperty -Path '$hvciLive' -Name Enabled -Value $(if ($null -ne $beforeEnabled) { $beforeEnabled } else { '1 # (was not set)' }) -Type DWord -Force" -ForegroundColor White
+            if ($null -ne $beforeLocked) {
+                Write-Host "Set-ItemProperty -Path '$hvciLive' -Name Locked -Value $beforeLocked -Type DWord -Force" -ForegroundColor White
+            }
+            Write-Host "--------------------------------------------------------------------------------`n" -ForegroundColor Cyan
+        }
+    }
+
     function EnableCredentialGuard {
         Write-Host "Re-enabling Credential Guard and LSA protection..." -ForegroundColor Yellow
 
@@ -5553,6 +5806,8 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
         # Gen2 / UEFI / Trusted Launch (only evaluated when $script:VMGen -eq 2)
         $sevBootmgfwMissing = 2   # bootmgfw.efi missing from EFI System Partition
         $sevBootx64Missing = 1   # EFI\Boot\bootx64.efi fallback loader missing
+        $sevSecureBootPayloadSourceMissing = 1   # Windows-staged Secure Boot source payload missing
+        $sevSecureBootPayloadMismatch = 2   # ESP Secure Boot boot/policy file differs from Windows-staged source
         $sevBcdWinloadMismatch = 2   # BCD points to winload.exe on a Gen2 (UEFI) disk
         $sevBcdNoIntegrityChecks = 2   # nointegritychecks ON - fatal with Secure Boot
         $sevSecureBootConflict = 2   # testsigning/nointegritychecks ON while guest had Secure Boot
@@ -5892,6 +6147,55 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
         if ($script:VMGen -eq 2) {
             $efiBootmgfw = Join-Path $script:BootDriveLetter 'EFI\Microsoft\Boot\bootmgfw.efi'
             $efiBootx64 = Join-Path $script:BootDriveLetter 'EFI\Boot\bootx64.efi'
+            $sourceBootmgfw = Join-Path $script:WinDriveLetter 'Windows\Boot\EFI\bootmgfw.efi'
+            $sourceSkuPolicy = Join-Path $script:WinDriveLetter 'Windows\System32\SecureBootUpdates\SKUSiPolicy.p7b'
+            $efiSkuPolicy = Join-Path $script:BootDriveLetter 'EFI\Microsoft\Boot\SKUSiPolicy.p7b'
+
+            $compareSecureBootPayload = {
+                param(
+                    [Parameter(Mandatory = $true)][string]$Label,
+                    [Parameter(Mandatory = $true)][string]$SourcePath,
+                    [Parameter(Mandatory = $true)][string]$TargetPath,
+                    [Parameter(Mandatory = $true)][string]$TargetRole
+                )
+
+                if (-not (Test-Path -LiteralPath $SourcePath)) {
+                    & $emit 'UEFI' (& $toSev $sevSecureBootPayloadSourceMissing) "$Label source payload missing from Windows partition ($SourcePath) - the matching cumulative update may not be staged; -FixSecureBootCodeIntegrity cannot refresh this target until the source exists" "-RepairComponentStore -RepairSource <matching ISO/WIM/MSU>"
+                    return
+                }
+
+                $sourceItem = Get-Item -LiteralPath $SourcePath -Force -ErrorAction SilentlyContinue
+                if (-not $sourceItem -or $sourceItem.Length -eq 0) {
+                    & $emit 'UEFI' (& $toSev $sevSecureBootPayloadSourceMissing) "$Label source payload is 0 bytes on Windows partition ($SourcePath) - repair the component store before refreshing the EFI System Partition" "-RepairComponentStore -RepairSource <matching ISO/WIM/MSU>"
+                    return
+                }
+
+                if (-not (Test-Path -LiteralPath $TargetPath)) {
+                    & $emit 'UEFI' (& $toSev $sevSecureBootPayloadMismatch) "$Label missing from EFI System Partition $TargetRole ($TargetPath) - Secure Boot / Code Integrity may reject the boot chain" "-FixSecureBootCodeIntegrity"
+                    return
+                }
+
+                $targetItem = Get-Item -LiteralPath $TargetPath -Force -ErrorAction SilentlyContinue
+                if (-not $targetItem -or $targetItem.Length -eq 0) {
+                    & $emit 'UEFI' (& $toSev $sevSecureBootPayloadMismatch) "$Label is 0 bytes on EFI System Partition $TargetRole ($TargetPath) - Secure Boot / Code Integrity may reject the boot chain" "-FixSecureBootCodeIntegrity"
+                    return
+                }
+
+                $sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $SourcePath -ErrorAction SilentlyContinue).Hash
+                $targetHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $TargetPath -ErrorAction SilentlyContinue).Hash
+                if (-not $sourceHash -or -not $targetHash) {
+                    & $emit 'UEFI' 'WARN' "Could not hash $Label for source/ESP comparison ($SourcePath -> $TargetPath)" "-AnalyzeCriticalBootFiles"
+                    return
+                }
+
+                if ($sourceItem.Length -ne $targetItem.Length -or $sourceHash -ne $targetHash) {
+                    & $emit 'UEFI' (& $toSev $sevSecureBootPayloadMismatch) "$Label on EFI System Partition $TargetRole does not match Windows-staged source (source size=$($sourceItem.Length), target size=$($targetItem.Length)) - likely stale or mismatched Secure Boot payload" "-FixSecureBootCodeIntegrity"
+                }
+                else {
+                    & $emit 'UEFI' 'OK' "$Label matches Windows-staged source for $TargetRole"
+                }
+            }
+
             if (-not (Test-Path $efiBootmgfw)) {
                 & $emit 'BCD' (& $toSev $sevBootmgfwMissing) "bootmgfw.efi missing from EFI System Partition ($efiBootmgfw) - UEFI firmware cannot start Windows Boot Manager" $bcdFix
             }
@@ -5919,6 +6223,10 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                     & $emit 'Security' (& $toSev $sevBinarySignatureBad) "bootx64.efi is NOT Microsoft-signed (status=$($efiX64Sig.Status), subject='$($efiX64Sig.Subject)') - possible tampering" $bcdFix
                 }
             }
+
+            & $compareSecureBootPayload 'bootmgfw.efi' $sourceBootmgfw $efiBootmgfw '(EFI\Microsoft\Boot)'
+            & $compareSecureBootPayload 'bootx64.efi fallback loader' $sourceBootmgfw $efiBootx64 '(EFI\Boot)'
+            & $compareSecureBootPayload 'SKUSiPolicy.p7b' $sourceSkuPolicy $efiSkuPolicy '(EFI\Microsoft\Boot)'
         }
 
         # Gen1 BIOS: verify boot partition has the Active flag set
@@ -8319,8 +8627,11 @@ to .disabled extension. Does NOT remove them; they can be re-enabled by renaming
         # Gen2 UEFI: firmware boot manager and fallback loader
         if ($script:VMGen -eq 2) {
             $checks += @(
+                @{ Name = 'bootmgfw source'; Path = (Join-Path $script:WinDriveLetter 'Windows\Boot\EFI\bootmgfw.efi'); Category = 'Boot Loader Source' }
                 @{ Name = 'bootmgfw.efi'; Path = (Join-Path $script:BootDriveLetter 'EFI\Microsoft\Boot\bootmgfw.efi'); Category = 'Boot Loader' }
                 @{ Name = 'bootx64.efi'; Path = (Join-Path $script:BootDriveLetter 'EFI\Boot\bootx64.efi'); Category = 'Boot Loader' }
+                @{ Name = 'SKUSiPolicy source'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\SecureBootUpdates\SKUSiPolicy.p7b'); Category = 'Secure Boot Policy' }
+                @{ Name = 'SKUSiPolicy.p7b'; Path = (Join-Path $script:BootDriveLetter 'EFI\Microsoft\Boot\SKUSiPolicy.p7b'); Category = 'Secure Boot Policy' }
             )
         }
         # Azure/Hyper-V critical drivers - missing any of these will BSOD or cripple the VM
@@ -8370,6 +8681,42 @@ to .disabled extension. Does NOT remove them; they can be re-enabled by renaming
         if ($missing.Count -eq 0 -and $zeroLen.Count -eq 0 -and $notMsSigned.Count -eq 0) {
             Write-Host "All checked critical boot/system files are present, non-empty, and Microsoft-signed." -ForegroundColor Green
         }
+    }
+
+    function New-ProtectedSystemFileAcl {
+        $acl = [System.Security.AccessControl.FileSecurity]::new()
+        $acl.SetAccessRuleProtection($true, $false)
+
+        $trustedInstallerSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+        $acl.SetOwner($trustedInstallerSid)
+
+        $accessType = [System.Security.AccessControl.AccessControlType]::Allow
+        $inheritanceFlags = [System.Security.AccessControl.InheritanceFlags]::None
+        $propagationFlags = [System.Security.AccessControl.PropagationFlags]::None
+        $readExecute = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute
+
+        $rules = @(
+            @{ Sid = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'; Rights = [System.Security.AccessControl.FileSystemRights]::FullControl }, # NT SERVICE\TrustedInstaller
+            @{ Sid = 'S-1-5-32-544'; Rights = $readExecute }, # BUILTIN\Administrators
+            @{ Sid = 'S-1-5-18'; Rights = $readExecute }, # NT AUTHORITY\SYSTEM
+            @{ Sid = 'S-1-5-32-545'; Rights = $readExecute }, # BUILTIN\Users
+            @{ Sid = 'S-1-15-2-1'; Rights = $readExecute }, # ALL APPLICATION PACKAGES
+            @{ Sid = 'S-1-15-2-2'; Rights = $readExecute } # ALL RESTRICTED APPLICATION PACKAGES
+        )
+
+        foreach ($ruleInfo in $rules) {
+            $identity = [System.Security.Principal.SecurityIdentifier]::new($ruleInfo.Sid)
+            $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+                $identity,
+                $ruleInfo.Rights,
+                $inheritanceFlags,
+                $propagationFlags,
+                $accessType
+            )
+            $acl.AddAccessRule($rule)
+        }
+
+        return $acl
     }
 
     function RepairBrokenSystemFile {
@@ -8422,13 +8769,30 @@ to .disabled extension. Does NOT remove them; they can be re-enabled by renaming
             if (-not $isBroken) {
                 $ver = (Get-Item -LiteralPath $targetPath -ErrorAction SilentlyContinue).VersionInfo
                 Write-Host "  $targetPath already exists ($("{0:N0}" -f $targetSize) bytes, version: $($ver.FileVersion))" -ForegroundColor DarkGray
-                Write-Host "  File does not appear broken (present and non-zero). Skipping." -ForegroundColor DarkGray
-                Write-Host "  To force replacement, rename or delete the file first." -ForegroundColor DarkGray
-                continue
+                                if (-not (Confirm-CriticalOperation -Operation "Force replace existing system file ($fileName)" -Details @"
+The target file exists and is not zero bytes:
+    $targetPath
+
+Current size   : $targetSize bytes
+Current version: $($ver.FileVersion)
+
+The script will search WinSxS and DriverStore for a replacement candidate,
+back up the existing target to a .replaced.bak file, copy the selected candidate
+to the target path, and apply a protected Windows system-file ACL/owner baseline
+instead of preserving ACLs that may have been modified during troubleshooting.
+"@)) {
+                                        Write-Host "  Skipped. Existing file was left unchanged." -ForegroundColor DarkGray
+                                        continue
+                                }
             }
 
-            $stateDesc = if (-not $targetExists) { 'MISSING' } else { '0 bytes (corrupt)' }
+                        $stateDesc = if (-not $targetExists) { 'MISSING' } elseif ($targetSize -eq 0) { '0 bytes (corrupt)' } else { 'present/non-zero (forced replacement)' }
             Write-Host "  Target: $targetPath [$stateDesc]" -ForegroundColor Yellow
+            $targetAclBeforeRepair = $null
+            if ($targetExists) {
+                try { $targetAclBeforeRepair = Get-Acl -LiteralPath $targetPath -ErrorAction Stop }
+                catch { Write-Warning "  Could not capture existing target ACL before replacement: $_" }
+            }
 
             # -- 2. Search WinSxS and DriverStore for replacement candidates ------
             $candidates = [System.Collections.Generic.List[PSCustomObject]]::new()
@@ -8517,8 +8881,9 @@ to .disabled extension. Does NOT remove them; they can be re-enabled by renaming
 
             # -- 4. Backup the broken file (if it exists) ------------------------
             if ($targetExists) {
-                $bakPath = New-UniqueBackupPath -BasePath $targetPath -BakSuffix '.broken.bak'
-                Write-Host "  Backing up broken file: $targetPath -> $bakPath" -ForegroundColor DarkGray
+                $backupSuffix = if ($targetSize -eq 0) { '.broken.bak' } else { '.replaced.bak' }
+                $bakPath = New-UniqueBackupPath -BasePath $targetPath -BakSuffix $backupSuffix
+                Write-Host "  Backing up existing file: $targetPath -> $bakPath" -ForegroundColor DarkGray
                 try {
                     Rename-Item -LiteralPath $targetPath -NewName (Split-Path $bakPath -Leaf) -Force -ErrorAction Stop
                 }
@@ -8536,6 +8901,28 @@ to .disabled extension. Does NOT remove them; they can be re-enabled by renaming
             # -- 5. Copy the replacement -----------------------------------------
             try {
                 Copy-Item -LiteralPath $best.Path -Destination $targetPath -Force -ErrorAction Stop
+                try {
+                    $protectedAcl = New-ProtectedSystemFileAcl
+                    Set-Acl -LiteralPath $targetPath -AclObject $protectedAcl -ErrorAction Stop
+                    Write-Host "  [OK] Applied protected Windows system-file ACL/owner baseline." -ForegroundColor Green
+                    Write-ActionLog -Event 'SystemFileAclRestored' -Details @{
+                        FileName   = $fileName
+                        TargetPath = $targetPath
+                        SourcePath = $best.Path
+                        AclSource  = 'protected system-file baseline'
+                        Owner      = 'NT SERVICE\TrustedInstaller'
+                    }
+                }
+                catch {
+                    Write-Warning "  Replaced file content, but could not apply protected system-file ACL/owner: $_"
+                    Write-Warning "  After recovery, verify permissions with: icacls `"$targetPath`""
+                    Write-ActionLog -Event 'SystemFileAclRestoreFailed' -Details @{
+                        FileName   = $fileName
+                        TargetPath = $targetPath
+                        SourcePath = $best.Path
+                        Error      = $_.ToString()
+                    }
+                }
                 $newSize = (Get-Item -LiteralPath $targetPath).Length
                 Write-Host "  [OK] Replaced: $targetPath ($("{0:N0}" -f $newSize) bytes)" -ForegroundColor Green
 
@@ -10411,6 +10798,7 @@ No destructive file or registry cleanup is performed.
             [int]$DiskNumber = -1,
             [switch]$FixNTFS,
             [switch]$FixBoot,
+            [switch]$FixSecureBootCodeIntegrity,
             [switch]$FixBootSector,
             [switch]$RecreateBootPartition,
             [switch]$RepairComponentStore,
@@ -10453,6 +10841,7 @@ No destructive file or registry cleanup is performed.
             [ValidateSet('Boot', 'System', 'Automatic', 'Manual', 'Disabled')][string]$DriverStartType,
             [switch]$DisableCredentialGuard,
             [switch]$EnableCredentialGuard,
+            [switch]$DisableMemoryIntegrity,
             [switch]$DisableAppLocker,
             [switch]$GetAppLockerReport,
             [switch]$FixSanPolicy,
@@ -10555,6 +10944,7 @@ PARAMETERS:
   -EnableTestSigning     Enable BCD test signing (allow unsigned drivers)
   -DisableTestSigning    Disable BCD test signing
   -FixBoot               Rebuild BCD from scratch
+    -FixSecureBootCodeIntegrity  Refresh Gen2 EFI boot manager + SKUSiPolicy.p7b for winload.efi / 0xc0430001
   -FixBootSector         Repair MBR/VBR boot sector (Gen1/BIOS only; bootrec)
   -RecreateBootPartition Recreate missing boot partition (System Reserved for Gen1, EFI SP for Gen2) and run bcdboot
   -RemoveSafeModeFlag    Remove Safe Mode flag
@@ -10623,6 +11013,7 @@ PARAMETERS:
   -GetAppLockerReport          Show AppLocker enforcement state, AppIDSvc config, and parsed rules per collection
   -DisableCredentialGuard      Disable Credential Guard and LSA protection
   -EnableCredentialGuard       Re-enable Credential Guard and LSA protection
+    -DisableMemoryIntegrity      Disable Hypervisor-Enforced Code Integrity / Memory Integrity offline
   -FixWinlogon                 Reset Winlogon Shell/Userinit to Windows defaults (fixes black screen)
   -FixProfileLoad              Fix corrupted user profiles (.bak duplicates, temporary profile flags)
 
@@ -10728,6 +11119,7 @@ AVAILABLE DISKS:
         try {
             if ($FixNTFS) { FixDiskCorruption -DriveLetter $DriveLetter }
             if ($FixBoot) { RebuildBCD }
+            if ($FixSecureBootCodeIntegrity) { RepairSecureBootCodeIntegrity }
             if ($FixBootSector) { FixBootSector }
             if ($RecreateBootPartition) { RecreateBootPartition }
             if ($RepairComponentStore) { RunDismHealth -RepairSource $RepairSource }
@@ -10777,6 +11169,7 @@ AVAILABLE DISKS:
             }
             if ($DisableCredentialGuard) { DisableCredentialGuard }
             if ($EnableCredentialGuard) { EnableCredentialGuard }
+            if ($DisableMemoryIntegrity) { DisableMemoryIntegrity }
             if ($DisableAppLocker) { DisableAppLocker }
             if ($GetAppLockerReport) { GetAppLockerReport }
             if ($FixSanPolicy) { FixSanPolicy }

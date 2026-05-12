@@ -87,6 +87,18 @@ You can also target a Hyper-V VM by name instead of disk number:
 # Recreate the entire boot partition (Gen1 or Gen2/UEFI)
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -RecreateBootPartition
 
+# Full Gen2 / UEFI boot repair
+# -RecreateBootPartition exits without deleting/recreating if the EFI System Partition already exists.
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -RecreateBootPartition
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixBoot
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixSecureBootCodeIntegrity
+
+# Full Gen1 / BIOS-MBR boot repair
+# -RecreateBootPartition exits without deleting/recreating if a valid Active boot partition already exists.
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -RecreateBootPartition
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixBoot
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixBootSector
+
 # Try Last Known Good Configuration
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -TryLGKC
 
