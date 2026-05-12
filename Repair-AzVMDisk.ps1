@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.4.6
+        Version: 0.4.7
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -5807,7 +5807,8 @@ complete recovery.
         $sevBootmgfwMissing = 2   # bootmgfw.efi missing from EFI System Partition
         $sevBootx64Missing = 1   # EFI\Boot\bootx64.efi fallback loader missing
         $sevSecureBootPayloadSourceMissing = 1   # Windows-staged Secure Boot source payload missing
-        $sevSecureBootPayloadMismatch = 2   # ESP Secure Boot boot/policy file differs from Windows-staged source
+        $sevSecureBootPayloadMismatch = 0   # ESP Secure Boot boot/policy file differs from Windows-staged source (advisory; can be normal)
+        $sevSecureBootPayloadEmpty = 1   # ESP Secure Boot boot/policy file exists but is 0 bytes
         $sevBcdWinloadMismatch = 2   # BCD points to winload.exe on a Gen2 (UEFI) disk
         $sevBcdNoIntegrityChecks = 2   # nointegritychecks ON - fatal with Secure Boot
         $sevSecureBootConflict = 2   # testsigning/nointegritychecks ON while guest had Secure Boot
@@ -6171,13 +6172,13 @@ complete recovery.
                 }
 
                 if (-not (Test-Path -LiteralPath $TargetPath)) {
-                    & $emit 'UEFI' (& $toSev $sevSecureBootPayloadMismatch) "$Label missing from EFI System Partition $TargetRole ($TargetPath) - Secure Boot / Code Integrity may reject the boot chain" "-FixSecureBootCodeIntegrity"
+                    & $emit 'UEFI' (& $toSev $sevSecureBootPayloadMismatch) "$Label not present on EFI System Partition $TargetRole ($TargetPath) - advisory only; some healthy systems do not mirror every Windows-staged Secure Boot payload to ESP until the mitigation is applied. If investigating winload.efi / Code Integrity error 0xc0430001, run -FixSecureBootCodeIntegrity" "-FixSecureBootCodeIntegrity"
                     return
                 }
 
                 $targetItem = Get-Item -LiteralPath $TargetPath -Force -ErrorAction SilentlyContinue
                 if (-not $targetItem -or $targetItem.Length -eq 0) {
-                    & $emit 'UEFI' (& $toSev $sevSecureBootPayloadMismatch) "$Label is 0 bytes on EFI System Partition $TargetRole ($TargetPath) - Secure Boot / Code Integrity may reject the boot chain" "-FixSecureBootCodeIntegrity"
+                    & $emit 'UEFI' (& $toSev $sevSecureBootPayloadEmpty) "$Label is 0 bytes on EFI System Partition $TargetRole ($TargetPath) - suspicious payload state; if investigating winload.efi / Code Integrity error 0xc0430001, run -FixSecureBootCodeIntegrity" "-FixSecureBootCodeIntegrity"
                     return
                 }
 
@@ -6189,7 +6190,7 @@ complete recovery.
                 }
 
                 if ($sourceItem.Length -ne $targetItem.Length -or $sourceHash -ne $targetHash) {
-                    & $emit 'UEFI' (& $toSev $sevSecureBootPayloadMismatch) "$Label on EFI System Partition $TargetRole does not match Windows-staged source (source size=$($sourceItem.Length), target size=$($targetItem.Length)) - likely stale or mismatched Secure Boot payload" "-FixSecureBootCodeIntegrity"
+                    & $emit 'UEFI' (& $toSev $sevSecureBootPayloadMismatch) "$Label on EFI System Partition $TargetRole differs from Windows-staged source (source size=$($sourceItem.Length), target size=$($targetItem.Length)) - advisory only; this can be normal on a healthy VM. If investigating winload.efi / Code Integrity error 0xc0430001, run -FixSecureBootCodeIntegrity" "-FixSecureBootCodeIntegrity"
                 }
                 else {
                     & $emit 'UEFI' 'OK' "$Label matches Windows-staged source for $TargetRole"
