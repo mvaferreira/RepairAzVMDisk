@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.4.8
+        Version: 0.4.9
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -602,6 +602,23 @@ end {
         $payload | ConvertTo-Json -Depth 10 -Compress | Out-File -FilePath $script:ActionLogPath -Encoding UTF8 -Append
     }
 
+    function Convert-ActionLogValueToText {
+        param(
+            $Value,
+            [switch]$Missing
+        )
+
+        if ($Missing) { return '(not set)' }
+        if ($null -eq $Value) { return '(null)' }
+        if ($Value -is [byte[]]) {
+            return "0x$(($Value | ForEach-Object { $_.ToString('X2') }) -join '')"
+        }
+        if ($Value -is [System.Array]) {
+            return (($Value | ForEach-Object { [string]$_ }) -join ', ')
+        }
+        return [string]$Value
+    }
+
     # Execute a scriptblock and log start/end, success/failure and outputs
     function Invoke-Logged {
         param(
@@ -690,7 +707,17 @@ end {
                     }
                     # Operation-specific fields stored in the nested Details sub-object
                     if ($e.Details.Details) {
-                        $e.Details.Details.PSObject.Properties | Where-Object { $null -ne $_.Value -and $_.Value -ne '' } | ForEach-Object {
+                        $nestedDetails = $e.Details.Details
+                        if ($nestedDetails.Operation -eq 'Set-ItemProperty') {
+                            $beforeText = if ($nestedDetails.PSObject.Properties.Name -contains 'BeforeDisplay') { $nestedDetails.BeforeDisplay } else { Convert-ActionLogValueToText -Value $nestedDetails.Before -Missing:($nestedDetails.HadValueBefore -eq $false) }
+                            $afterText = if ($nestedDetails.PSObject.Properties.Name -contains 'AfterDisplay') { $nestedDetails.AfterDisplay } else { Convert-ActionLogValueToText -Value $nestedDetails.After }
+                            Write-Host "    Registry Path : $($nestedDetails.Path)" -ForegroundColor DarkCyan
+                            Write-Host "    Registry Name : $($nestedDetails.Name)" -ForegroundColor DarkCyan
+                            Write-Host "    Before        : $beforeText" -ForegroundColor Yellow
+                            Write-Host "    After         : $afterText" -ForegroundColor Green
+                        }
+                        $skipDetailNames = @('Before', 'After', 'BeforeDisplay', 'AfterDisplay', 'HadValueBefore')
+                        $nestedDetails.PSObject.Properties | Where-Object { $skipDetailNames -notcontains $_.Name -and $null -ne $_.Value -and $_.Value -ne '' } | ForEach-Object {
                             Write-Host "    $($_.Name): $($_.Value)" -ForegroundColor DarkCyan
                         }
                     }
@@ -714,7 +741,21 @@ end {
                         $duration = '{0:N3}s' -f ([datetime]$e.Details.End - [datetime]$e.Details.Start).TotalSeconds
                     }
                     $detailFields = if ($e.Details.Details) {
-                        ($e.Details.Details.PSObject.Properties | Where-Object { $null -ne $_.Value -and $_.Value -ne '' } | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join '; '
+                        $nestedDetails = $e.Details.Details
+                        if ($nestedDetails.Operation -eq 'Set-ItemProperty') {
+                            $beforeText = if ($nestedDetails.PSObject.Properties.Name -contains 'BeforeDisplay') { $nestedDetails.BeforeDisplay } else { Convert-ActionLogValueToText -Value $nestedDetails.Before -Missing:($nestedDetails.HadValueBefore -eq $false) }
+                            $afterText = if ($nestedDetails.PSObject.Properties.Name -contains 'AfterDisplay') { $nestedDetails.AfterDisplay } else { Convert-ActionLogValueToText -Value $nestedDetails.After }
+                            @(
+                                "Operation=$($nestedDetails.Operation)"
+                                "Path=$($nestedDetails.Path)"
+                                "Name=$($nestedDetails.Name)"
+                                "Before=$beforeText"
+                                "After=$afterText"
+                            ) -join '; '
+                        }
+                        else {
+                            ($nestedDetails.PSObject.Properties | Where-Object { $null -ne $_.Value -and $_.Value -ne '' } | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join '; '
+                        }
                     }
                     else { '' }
                     [PSCustomObject]@{
@@ -746,10 +787,23 @@ end {
                     }
                     $detailHtml = ''
                     if ($e.Details.Details) {
+                        $nestedDetails = $e.Details.Details
+                        if ($nestedDetails.Operation -eq 'Set-ItemProperty') {
+                            $beforeText = if ($nestedDetails.PSObject.Properties.Name -contains 'BeforeDisplay') { $nestedDetails.BeforeDisplay } else { Convert-ActionLogValueToText -Value $nestedDetails.Before -Missing:($nestedDetails.HadValueBefore -eq $false) }
+                            $afterText = if ($nestedDetails.PSObject.Properties.Name -contains 'AfterDisplay') { $nestedDetails.AfterDisplay } else { Convert-ActionLogValueToText -Value $nestedDetails.After }
+                            $detailHtml = '<table style="border-collapse:collapse;margin:2px 0;font-size:0.85em">' +
+                            '<tr><th style="background:#f0f0f0;color:#333;border:1px solid #ddd;padding:3px 6px">Registry Path</th><td style="border:1px solid #ddd;padding:3px 6px">' + [System.Web.HttpUtility]::HtmlEncode([string]$nestedDetails.Path) + '</td></tr>' +
+                            '<tr><th style="background:#f0f0f0;color:#333;border:1px solid #ddd;padding:3px 6px">Registry Name</th><td style="border:1px solid #ddd;padding:3px 6px">' + [System.Web.HttpUtility]::HtmlEncode([string]$nestedDetails.Name) + '</td></tr>' +
+                            '<tr><th style="background:#fff7d6;color:#333;border:1px solid #ddd;padding:3px 6px">Before</th><td style="border:1px solid #ddd;padding:3px 6px">' + [System.Web.HttpUtility]::HtmlEncode([string]$beforeText) + '</td></tr>' +
+                            '<tr><th style="background:#e6ffed;color:#333;border:1px solid #ddd;padding:3px 6px">After</th><td style="border:1px solid #ddd;padding:3px 6px">' + [System.Web.HttpUtility]::HtmlEncode([string]$afterText) + '</td></tr>' +
+                            '</table>'
+                        }
+                        else {
                         $detailHtml = '<ul style="margin:2px 0;padding-left:16px;font-size:0.85em;color:#555">' +
-                        (($e.Details.Details.PSObject.Properties | Where-Object { $null -ne $_.Value -and $_.Value -ne '' } | ForEach-Object {
+                        (($nestedDetails.PSObject.Properties | Where-Object { $null -ne $_.Value -and $_.Value -ne '' } | ForEach-Object {
                                 "<li><b>$([System.Web.HttpUtility]::HtmlEncode($_.Name)):</b> $([System.Web.HttpUtility]::HtmlEncode([string]$_.Value))</li>"
                             }) -join '') + '</ul>'
+                        }
                     }
                     $outputHtml = ''
                     if ($e.Details.Output -and ([string]$e.Details.Output).Trim()) {
@@ -827,11 +881,22 @@ $($htmlRows -join "`n")
             [switch]$Force
         )
         $before = $null
-        try { $before = (Get-ItemProperty -Path $Path -ErrorAction SilentlyContinue).$Name } catch { $before = $null }
-        $displayValue = if ($Value -is [byte[]]) { "0x$(($Value | ForEach-Object { $_.ToString('X2') }) -join '')" } else { $Value }
-        $displayBefore = if ($null -eq $before) { '(not set)' } elseif ($before -is [byte[]]) { "0x$(($before | ForEach-Object { $_.ToString('X2') }) -join '')" } else { $before }
+        $beforeExists = $false
+        try {
+            $beforeProps = Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
+            if ($beforeProps -and ($beforeProps.PSObject.Properties.Name -contains $Name)) {
+                $beforeExists = $true
+                $before = $beforeProps.$Name
+            }
+        }
+        catch {
+            $before = $null
+            $beforeExists = $false
+        }
+        $displayValue = Convert-ActionLogValueToText -Value $Value
+        $displayBefore = Convert-ActionLogValueToText -Value $before -Missing:(-not $beforeExists)
         Write-Host "  [exec] Set-ItemProperty '$Path' -Name '$Name' -Value $displayValue ($PropertyType)  [was: $displayBefore]" -ForegroundColor DarkGray
-        $details = @{ Operation = 'Set-ItemProperty'; Path = $Path; Name = $Name; Before = $before; After = $Value }
+        $details = @{ Operation = 'Set-ItemProperty'; Path = $Path; Name = $Name; HadValueBefore = $beforeExists; Before = $before; After = $Value; BeforeDisplay = $displayBefore; AfterDisplay = $displayValue }
         Invoke-Logged -Description 'Set-ItemProperty' -Details $details -ScriptBlock { if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }; New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $PropertyType -Force | Out-Null }
     }
 

@@ -189,10 +189,10 @@ You can also target a Hyper-V VM by name instead of disk number:
 
 ```powershell
 # Disable a specific problematic driver or service
-.\Repair-AzVMDisk.ps1 -DiskNumber 3 -DisableDriverOrService "CrowdStrike","driver2"
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -DisableDriverOrService "driver1","service2"
 
 # Re-enable a previously disabled driver or service
-.\Repair-AzVMDisk.ps1 -DiskNumber 3 -EnableDriverOrService "CrowdStrike" -DriverStartType System
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -EnableDriverOrService "driver1" -DriverStartType System
 
 # Disable all third-party (non-Microsoft) drivers
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -DisableThirdPartyDrivers
