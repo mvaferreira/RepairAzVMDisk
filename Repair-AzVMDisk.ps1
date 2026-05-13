@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.4.9
+        Version: 0.4.10
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -2248,9 +2248,9 @@ Refreshes the Gen2 EFI System Partition from the offline Windows installation:
   Source SKU policy   : $sourceSkuPolicy
   Target SKU policy   : $destSkuPolicy
 
-This targets the winload.efi / 0xc0430001 recovery screen seen when Secure Boot
-rollback protections or CVE-2023-24932 boot-manager revocations require newer
-boot manager and SKUSiPolicy.p7b files on the EFI System Partition.
+This targets Gen2 winload.efi / Code Integrity recovery failures such as
+0xc0430001 when the EFI System Partition has stale or missing boot manager
+and SKUSiPolicy.p7b files compared with the offline Windows installation.
 
 Before the EFI copy, it also runs targeted offline SFC repairs for winload.efi,
 ci.dll, kernel/HAL, and related OS-loader dependencies on the Windows partition.
@@ -2283,8 +2283,8 @@ ci.dll, kernel/HAL, and related OS-loader dependencies on the Windows partition.
         if ($missingSources.Count -gt 0) {
             Write-Host "`n[ERROR] Required Secure Boot recovery source file(s) were not found on the offline Windows partition:" -ForegroundColor Red
             $missingSources | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
-            Write-Host "`nThese files are staged by Windows cumulative updates that contain the CVE-2023-24932 Secure Boot mitigations." -ForegroundColor Yellow
-            Write-Host "Install/apply the matching cumulative update, or repair the component store from matching media, then rerun -FixSecureBootCodeIntegrity." -ForegroundColor Yellow
+            Write-Host "`nThese files are required source artifacts from the offline Windows installation used to refresh the EFI boot manager and Code Integrity policy." -ForegroundColor Yellow
+            Write-Host "Apply the appropriate Windows update, or repair the component store from matching media, then rerun -FixSecureBootCodeIntegrity." -ForegroundColor Yellow
             $script:_userFacingError = $true
             throw "Missing Secure Boot recovery source file(s): $($missingSources -join ', ')"
         }
