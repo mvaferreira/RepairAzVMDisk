@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.4.12
+        Version: 0.4.13
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -1717,7 +1717,6 @@ $($htmlRows -join "`n")
             [PSCustomObject]@{ Name = 'partmgr';  Binary = 'partmgr.sys';  Start = 0; AllowedStarts = [int[]]@(0, 1); Required = $true;  CanRecreate = $true;  ErrorControl = 3; Group = 'Boot Bus Extender'; CheckStartOverride = $false; Description = 'partition manager' }
             [PSCustomObject]@{ Name = 'volmgr';   Binary = 'volmgr.sys';   Start = 0; AllowedStarts = [int[]]@(0);    Required = $true;  CanRecreate = $true;  ErrorControl = 3; Group = 'System Bus Extender'; CheckStartOverride = $false; Description = 'volume manager' }
             [PSCustomObject]@{ Name = 'mountmgr'; Binary = 'mountmgr.sys'; Start = 0; AllowedStarts = [int[]]@(0);       Required = $true;  CanRecreate = $false; ErrorControl = 1; Group = 'System Bus Extender'; CheckStartOverride = $false; Description = 'mount point manager' }
-            [PSCustomObject]@{ Name = 'Ntfs';     Binary = 'ntfs.sys';     Start = 1; AllowedStarts = [int[]]@(0, 1);    Required = $true;  CanRecreate = $false; ErrorControl = 3; Group = 'File System';        CheckStartOverride = $false; Description = 'NTFS filesystem driver' }
             [PSCustomObject]@{ Name = 'volsnap';  Binary = 'volsnap.sys';  Start = 1; AllowedStarts = [int[]]@(0, 1, 3); Required = $true;  CanRecreate = $false; ErrorControl = 3; Group = 'Filter';             CheckStartOverride = $false; Description = 'volume shadow copy filter' }
             [PSCustomObject]@{ Name = 'fvevol';   Binary = 'fvevol.sys';   Start = 0; AllowedStarts = [int[]]@(0, 1, 3); Required = $true;  CanRecreate = $false; ErrorControl = 3; Group = 'Filter';             CheckStartOverride = $false; Description = 'BitLocker volume filter' }
         )
