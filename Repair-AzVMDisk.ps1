@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.4.11
+        Version: 0.4.12
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -1703,18 +1703,87 @@ $($htmlRows -join "`n")
 
     function Get-BootStorageDriverSpec {
         @(
-            [PSCustomObject]@{ Name = 'pci';      Start = 0; AllowedStarts = [int[]]@(0);    Required = $true;  CheckStartOverride = $false; Description = 'PCI boot bus' }
-            [PSCustomObject]@{ Name = 'intelide'; Start = 0; AllowedStarts = [int[]]@(0);    Required = $false; CheckStartOverride = $true;  Description = 'legacy IDE controller' }
-            [PSCustomObject]@{ Name = 'pciide';   Start = 0; AllowedStarts = [int[]]@(0);    Required = $false; CheckStartOverride = $true;  Description = 'PCI IDE controller' }
-            [PSCustomObject]@{ Name = 'atapi';    Start = 0; AllowedStarts = [int[]]@(0);    Required = $false; CheckStartOverride = $true;  Description = 'IDE channel driver' }
-            [PSCustomObject]@{ Name = 'storahci'; Start = 0; AllowedStarts = [int[]]@(0);    Required = $false; CheckStartOverride = $true;  Description = 'AHCI storage miniport' }
-            [PSCustomObject]@{ Name = 'storport'; Start = 0; AllowedStarts = [int[]]@(0);    Required = $true;  CheckStartOverride = $false; Description = 'storage port driver' }
-            [PSCustomObject]@{ Name = 'disk';     Start = 0; AllowedStarts = [int[]]@(0);    Required = $true;  CheckStartOverride = $false; Description = 'disk class driver' }
-            [PSCustomObject]@{ Name = 'partmgr';  Start = 0; AllowedStarts = [int[]]@(0, 1); Required = $true;  CheckStartOverride = $false; Description = 'partition manager' }
-            [PSCustomObject]@{ Name = 'volmgr';   Start = 0; AllowedStarts = [int[]]@(0);    Required = $true;  CheckStartOverride = $false; Description = 'volume manager' }
-            [PSCustomObject]@{ Name = 'vmbus';    Start = 0; AllowedStarts = [int[]]@(0);    Required = $false; CheckStartOverride = $true;  Description = 'Hyper-V VMBus' }
-            [PSCustomObject]@{ Name = 'storvsc';  Start = 0; AllowedStarts = [int[]]@(0);    Required = $false; CheckStartOverride = $true;  Description = 'Hyper-V storage' }
+            [PSCustomObject]@{ Name = 'acpi';     Binary = 'acpi.sys';     Start = 0; AllowedStarts = [int[]]@(0);       Required = $true;  CanRecreate = $false; ErrorControl = 3; Group = 'Boot Bus Extender'; CheckStartOverride = $false; Description = 'ACPI platform bus' }
+            [PSCustomObject]@{ Name = 'pci';      Binary = 'pci.sys';      Start = 0; AllowedStarts = [int[]]@(0);    Required = $true;  CanRecreate = $true;  ErrorControl = 3; Group = 'Boot Bus Extender'; CheckStartOverride = $false; Description = 'PCI boot bus' }
+            [PSCustomObject]@{ Name = 'vdrvroot'; Binary = 'vdrvroot.sys'; Start = 0; AllowedStarts = [int[]]@(0, 1, 3); Required = $true;  CanRecreate = $false; ErrorControl = 1; Group = 'System Bus Extender'; CheckStartOverride = $false; Description = 'virtual drive root enumerator' }
+            [PSCustomObject]@{ Name = 'intelide'; Binary = 'intelide.sys'; Start = 0; AllowedStarts = [int[]]@(0);    Required = $false; CanRecreate = $false; ErrorControl = 3; Group = 'System Bus Extender'; CheckStartOverride = $true;  Description = 'legacy IDE controller' }
+            [PSCustomObject]@{ Name = 'pciide';   Binary = 'pciide.sys';   Start = 0; AllowedStarts = [int[]]@(0);    Required = $false; CanRecreate = $false; ErrorControl = 3; Group = 'System Bus Extender'; CheckStartOverride = $true;  Description = 'PCI IDE controller' }
+            [PSCustomObject]@{ Name = 'atapi';    Binary = 'atapi.sys';    Start = 0; AllowedStarts = [int[]]@(0);    Required = $false; CanRecreate = $false; ErrorControl = 3; Group = 'SCSI Miniport';       CheckStartOverride = $true;  Description = 'IDE channel driver' }
+            [PSCustomObject]@{ Name = 'storahci'; Binary = 'storahci.sys'; Start = 0; AllowedStarts = [int[]]@(0);    Required = $false; CanRecreate = $false; ErrorControl = 3; Group = 'SCSI Miniport';       CheckStartOverride = $true;  Description = 'AHCI storage miniport' }
+            [PSCustomObject]@{ Name = 'vmbus';    Binary = 'vmbus.sys';    Start = 0; AllowedStarts = [int[]]@(0);       Required = $true;  CanRecreate = $false; ErrorControl = 3; Group = 'Boot Bus Extender'; CheckStartOverride = $true;  Description = 'Hyper-V VMBus' }
+            [PSCustomObject]@{ Name = 'storvsc';  Binary = 'storvsc.sys';  Start = 0; AllowedStarts = [int[]]@(0);       Required = $true;  CanRecreate = $false; ErrorControl = 3; Group = 'SCSI Miniport';       CheckStartOverride = $true;  Description = 'Hyper-V storage' }
+            [PSCustomObject]@{ Name = 'storport'; Binary = 'storport.sys'; Start = 0; AllowedStarts = [int[]]@(0);    Required = $false; CanRecreate = $false; ErrorControl = 3; Group = 'SCSI Miniport';       CheckStartOverride = $false; Description = 'storage port driver' }
+            [PSCustomObject]@{ Name = 'disk';     Binary = 'disk.sys';     Start = 0; AllowedStarts = [int[]]@(0);    Required = $true;  CanRecreate = $true;  ErrorControl = 3; Group = 'SCSI Class';          CheckStartOverride = $false; Description = 'disk class driver' }
+            [PSCustomObject]@{ Name = 'partmgr';  Binary = 'partmgr.sys';  Start = 0; AllowedStarts = [int[]]@(0, 1); Required = $true;  CanRecreate = $true;  ErrorControl = 3; Group = 'Boot Bus Extender'; CheckStartOverride = $false; Description = 'partition manager' }
+            [PSCustomObject]@{ Name = 'volmgr';   Binary = 'volmgr.sys';   Start = 0; AllowedStarts = [int[]]@(0);    Required = $true;  CanRecreate = $true;  ErrorControl = 3; Group = 'System Bus Extender'; CheckStartOverride = $false; Description = 'volume manager' }
+            [PSCustomObject]@{ Name = 'mountmgr'; Binary = 'mountmgr.sys'; Start = 0; AllowedStarts = [int[]]@(0);       Required = $true;  CanRecreate = $false; ErrorControl = 1; Group = 'System Bus Extender'; CheckStartOverride = $false; Description = 'mount point manager' }
+            [PSCustomObject]@{ Name = 'Ntfs';     Binary = 'ntfs.sys';     Start = 1; AllowedStarts = [int[]]@(0, 1);    Required = $true;  CanRecreate = $false; ErrorControl = 3; Group = 'File System';        CheckStartOverride = $false; Description = 'NTFS filesystem driver' }
+            [PSCustomObject]@{ Name = 'volsnap';  Binary = 'volsnap.sys';  Start = 1; AllowedStarts = [int[]]@(0, 1, 3); Required = $true;  CanRecreate = $false; ErrorControl = 3; Group = 'Filter';             CheckStartOverride = $false; Description = 'volume shadow copy filter' }
+            [PSCustomObject]@{ Name = 'fvevol';   Binary = 'fvevol.sys';   Start = 0; AllowedStarts = [int[]]@(0, 1, 3); Required = $true;  CanRecreate = $false; ErrorControl = 3; Group = 'Filter';             CheckStartOverride = $false; Description = 'BitLocker volume filter' }
         )
+    }
+
+    function Test-BootStorageDriverBinaryReady {
+        param(
+            [Parameter(Mandatory = $true)]$Spec
+        )
+
+        $binaryPath = if ($Spec.Binary) { Resolve-GuestImagePath "system32\drivers\$($Spec.Binary)" } else { '' }
+        if (-not $binaryPath -or -not (Test-Path -LiteralPath $binaryPath)) { return $false }
+        $item = Get-Item -LiteralPath $binaryPath -Force -ErrorAction SilentlyContinue
+        if (-not $item -or $item.Length -eq 0) { return $false }
+
+        $signature = Test-MicrosoftSignature -FilePath $binaryPath
+        return [bool]$signature.IsMicrosoft
+    }
+
+    function New-BootStorageServiceKey {
+        param(
+            [Parameter(Mandatory = $true)][string]$ControlSetName,
+            [Parameter(Mandatory = $true)]$Spec
+        )
+
+        $svcPath = "HKLM:\BROKENSYSTEM\$ControlSetName\Services\$($Spec.Name)"
+        if (Test-Path $svcPath) { return $false }
+        if (-not $Spec.CanRecreate) { return $false }
+
+        $binaryPath = if ($Spec.Binary) { Resolve-GuestImagePath "system32\drivers\$($Spec.Binary)" } else { '' }
+        if (-not $binaryPath -or -not (Test-Path -LiteralPath $binaryPath)) {
+            Write-Warning "  Cannot recreate $ControlSetName\Services\$($Spec.Name): driver binary not found at $binaryPath"
+            return $false
+        }
+        $binaryItem = Get-Item -LiteralPath $binaryPath -Force -ErrorAction SilentlyContinue
+        if (-not $binaryItem -or $binaryItem.Length -eq 0) {
+            Write-Warning "  Cannot recreate $ControlSetName\Services\$($Spec.Name): driver binary is missing or 0 bytes at $binaryPath"
+            return $false
+        }
+
+        $signature = Test-MicrosoftSignature -FilePath $binaryPath
+        if (-not $signature.IsMicrosoft) {
+            Write-Warning "  Cannot recreate $ControlSetName\Services\$($Spec.Name): driver binary is not Microsoft-signed/verifiable ($($signature.Status))"
+            return $false
+        }
+
+        Write-Host "    Creating missing $($Spec.Name) service key from inbox driver template ($($Spec.Binary))" -ForegroundColor Yellow
+        New-Item-Logged -Path $svcPath -Force | Out-Null
+        Set-ItemProperty-Logged -Path $svcPath -Name Type -Value 1 -Type DWord -Force | Out-Null
+        Set-ItemProperty-Logged -Path $svcPath -Name Start -Value $Spec.Start -Type DWord -Force | Out-Null
+        Set-ItemProperty-Logged -Path $svcPath -Name ErrorControl -Value $Spec.ErrorControl -Type DWord -Force | Out-Null
+        Set-ItemProperty-Logged -Path $svcPath -Name ImagePath -Value "system32\drivers\$($Spec.Binary)" -Type ExpandString -Force | Out-Null
+        if ($Spec.Group) {
+            Set-ItemProperty-Logged -Path $svcPath -Name Group -Value $Spec.Group -Type String -Force | Out-Null
+        }
+
+        Write-ActionLog -Event 'BootStorageServiceKeyCreated' -Details @{
+            ControlSet   = $ControlSetName
+            Service      = $Spec.Name
+            Binary       = $Spec.Binary
+            BinaryPath   = $binaryPath
+            Start        = $Spec.Start
+            ErrorControl = $Spec.ErrorControl
+            Group        = $Spec.Group
+        }
+        return $true
     }
 
     function Get-BootStorageDriverFindings {
@@ -1729,11 +1798,29 @@ $($htmlRows -join "`n")
                 $svcPath = "$svcRoot\$($spec.Name)"
                 if (-not (Test-Path $svcPath)) {
                     if ($spec.Required) {
+                        $canRecreate = [bool]$spec.CanRecreate -and (Test-BootStorageDriverBinaryReady -Spec $spec)
+                        $severity = if ($spec.Name -ieq 'storport') { 1 } else { 2 }
+                        $message = if ($spec.Name -ieq 'storport') {
+                            "$($spec.Name) service key is missing - this can affect some migrated storage stacks, but may be normal on this Windows image"
+                        }
+                        else {
+                            "$($spec.Name) service key is missing - $($spec.Description) cannot participate in boot storage enumeration"
+                        }
+                        $fix = if ($canRecreate) {
+                            '-FixBootStorageDrivers'
+                        }
+                        elseif ($spec.CanRecreate) {
+                            "-RepairSystemFile $($spec.Binary), then rerun -FixBootStorageDrivers to recreate the service key"
+                        }
+                        else {
+                            'Restore the service key from a matching Windows image or repair the offline registry; this script checks this key but does not recreate it'
+                        }
                         $findings.Add([PSCustomObject]@{
                             ControlSet = $csName
                             Driver     = $spec.Name
-                            Message    = "$($spec.Name) service key is missing - $($spec.Description) cannot participate in boot storage enumeration"
-                            Fix        = '-RepairSystemFile <driver.sys> or restore the service key from a matching Windows image'
+                            Severity   = $severity
+                            Message    = $message
+                            Fix        = $fix
                         })
                     }
                     continue
@@ -1744,6 +1831,7 @@ $($htmlRows -join "`n")
                     $findings.Add([PSCustomObject]@{
                         ControlSet = $csName
                         Driver     = $spec.Name
+                        Severity   = 2
                         Message    = "$($spec.Name) has no Start value - boot storage load order is incomplete"
                         Fix        = '-FixBootStorageDrivers'
                     })
@@ -1753,12 +1841,14 @@ $($htmlRows -join "`n")
                     $findings.Add([PSCustomObject]@{
                         ControlSet = $csName
                         Driver     = $spec.Name
+                        Severity   = 2
                         Message    = "$($spec.Name) Start=$($props.Start) (expected $expectedText) - $($spec.Description) may not load early enough after migration"
                         Fix        = '-FixBootStorageDrivers'
                     })
                 }
 
                 if ($spec.CheckStartOverride) {
+                    if (-not $spec.Required) { continue }
                     $overridePath = "$svcPath\StartOverride"
                     if (Test-Path $overridePath) {
                         $overrideProps = Get-ItemProperty $overridePath -ErrorAction SilentlyContinue
@@ -1768,7 +1858,8 @@ $($htmlRows -join "`n")
                                 $findings.Add([PSCustomObject]@{
                                     ControlSet = $csName
                                     Driver     = $spec.Name
-                                    Message    = "$($spec.Name) StartOverride\$($prop.Name)=$($prop.Value) (expected 0) - override may prevent boot storage enumeration after migration"
+                                    Severity   = 1
+                                    Message    = "$($spec.Name) StartOverride\$($prop.Name)=$($prop.Value) - override can matter for migrated disks if this driver is needed during boot"
                                     Fix        = '-FixBootStorageDrivers'
                                 })
                             }
@@ -6600,7 +6691,8 @@ complete recovery.
                 # satisfy the loader-provided boot device path.
                 $bootStorageFindings = @(Get-BootStorageDriverFindings -ControlSetNames @($csName))
                 foreach ($bs in $bootStorageFindings) {
-                    & $emit 'BootStorage' (& $toSev $sevBootStorageReadiness) "$($bs.ControlSet): $($bs.Message)" $bs.Fix
+                    $bsSeverity = if ($null -ne $bs.Severity) { [int]$bs.Severity } else { $sevBootStorageReadiness }
+                    & $emit 'BootStorage' (& $toSev $bsSeverity) "$($bs.ControlSet): $($bs.Message)" $bs.Fix
                 }
 
                 # -- Azure/Hyper-V synthetic drivers ---------------------------------
@@ -9277,7 +9369,7 @@ Checks the offline SYSTEM hive for migration boot-storage settings that can bloc
 Only unexpected values are changed:
   - boot bus/storage service Start values are set to 0 when the service key exists
   - StartOverride entries for boot storage drivers are set to 0 when present and non-zero
-Missing service keys are reported but not created.
+    - missing required inbox boot-storage service keys are recreated only when the Microsoft driver binary exists on disk
 "@)) { return }
 
         Invoke-WithHive 'SYSTEM' {
@@ -9288,6 +9380,7 @@ Missing service keys are reported but not created.
             }
 
             $changes = 0
+            $created = [System.Collections.Generic.List[string]]::new()
             $missing = [System.Collections.Generic.List[string]]::new()
 
             foreach ($csName in $controlSets) {
@@ -9296,7 +9389,16 @@ Missing service keys are reported but not created.
                 foreach ($spec in (Get-BootStorageDriverSpec)) {
                     $svcPath = "$svcRoot\$($spec.Name)"
                     if (-not (Test-Path $svcPath)) {
-                        if ($spec.Required) { $missing.Add("$csName\Services\$($spec.Name)") }
+                        if ($spec.Required) {
+                            $createdKey = New-BootStorageServiceKey -ControlSetName $csName -Spec $spec
+                            if ($createdKey) {
+                                $created.Add("$csName\Services\$($spec.Name)")
+                                $changes++
+                            }
+                            else {
+                                $missing.Add("$csName\Services\$($spec.Name)")
+                            }
+                        }
                         continue
                     }
 
@@ -9325,7 +9427,10 @@ Missing service keys are reported but not created.
             }
 
             if ($missing.Count -gt 0) {
-                Write-Warning "Required boot-storage service keys are missing: $($missing -join ', ')"
+                Write-Warning "Required boot-storage service keys are still missing or were not safe to recreate: $($missing -join ', ')"
+            }
+            if ($created.Count -gt 0) {
+                Write-Host "Created missing boot-storage service key(s): $($created -join ', ')" -ForegroundColor Green
             }
             if ($changes -eq 0) {
                 Write-Host 'No unexpected boot storage driver settings were found. No registry values changed.' -ForegroundColor Green
@@ -9334,7 +9439,7 @@ Missing service keys are reported but not created.
                 Write-Host "Boot storage driver readiness repair complete. Registry values changed: $changes" -ForegroundColor Green
             }
 
-            Write-ActionLog -Event 'FixBootStorageDrivers' -Details @{ ControlSets = ($controlSets -join ', '); Changes = $changes; MissingRequiredKeys = ($missing -join ', ') }
+            Write-ActionLog -Event 'FixBootStorageDrivers' -Details @{ ControlSets = ($controlSets -join ', '); Changes = $changes; CreatedServiceKeys = ($created -join ', '); MissingRequiredKeys = ($missing -join ', ') }
         }
     }
 
@@ -11272,7 +11377,7 @@ PARAMETERS:
   -FixBoot               Rebuild BCD from scratch
     -FixSecureBootCodeIntegrity  Refresh Gen2 EFI boot manager + SKUSiPolicy.p7b for winload.efi / 0xc0430001
   -FixBootSector         Repair MBR/VBR boot sector (Gen1/BIOS only; bootrec)
-    -FixBootStorageDrivers Repair boot storage driver Start/StartOverride settings used during migration boot
+    -FixBootStorageDrivers Repair boot storage Start/StartOverride settings and recreate safe missing inbox service keys
   -RecreateBootPartition Recreate missing boot partition (System Reserved for Gen1, EFI SP for Gen2) and run bcdboot
   -RemoveSafeModeFlag    Remove Safe Mode flag
   -TryLGKC               Switch boot to Last Known Good Control Set
