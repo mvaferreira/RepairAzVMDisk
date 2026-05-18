@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.4.10
+        Version: 0.4.11
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -96,6 +96,7 @@ param (
     [Parameter(ParameterSetName = 'Repair')][switch]$FixBoot,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixSecureBootCodeIntegrity,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixBootSector,
+    [Parameter(ParameterSetName = 'Repair')][switch]$FixBootStorageDrivers,
     [Parameter(ParameterSetName = 'Repair')][switch]$RecreateBootPartition,
     [Parameter(ParameterSetName = 'Repair')][switch]$RepairComponentStore,
     [Parameter(ParameterSetName = 'Repair')][switch]$AnalyzeComponentStore,
@@ -1529,8 +1530,8 @@ $($htmlRows -join "`n")
             $classRoot = "HKLM:\BROKENSYSTEM\$csName\Control\Class"
             $critClasses = @(
                 @{ GUID = '{4d36e967-e325-11ce-bfc1-08002be10318}'; Name = 'DiskDrive' }
-                @{ GUID = '{4d36e96a-e325-11ce-bfc1-08002be10318}'; Name = 'SCSIAdapter' }
-                @{ GUID = '{4d36e97b-e325-11ce-bfc1-08002be10318}'; Name = 'SCSIController' }
+                @{ GUID = '{4d36e96a-e325-11ce-bfc1-08002be10318}'; Name = 'HDC' }
+                @{ GUID = '{4d36e97b-e325-11ce-bfc1-08002be10318}'; Name = 'SCSIAdapter' }
                 @{ GUID = '{71a27cdd-812a-11d0-bec7-08002be2092f}'; Name = 'Volume' }
                 @{ GUID = '{4d36e972-e325-11ce-bfc1-08002be10318}'; Name = 'Net' }
             )
@@ -1682,6 +1683,143 @@ $($htmlRows -join "`n")
         $current = (Get-ItemProperty 'HKLM:\BROKENSYSTEM\Select' -ErrorAction SilentlyContinue).Current
         if ($current) { return 'HKLM:\BROKENSYSTEM\ControlSet{0:d3}' -f $current }
         return 'HKLM:\BROKENSYSTEM\ControlSet001'
+    }
+
+    function Get-OfflineControlSetNames {
+        $names = [System.Collections.Generic.List[string]]::new()
+        $select = Get-ItemProperty 'HKLM:\BROKENSYSTEM\Select' -ErrorAction SilentlyContinue
+        foreach ($value in @($select.Current, $select.Default, $select.LastKnownGood)) {
+            if ($null -eq $value) { continue }
+            $name = 'ControlSet{0:d3}' -f [int]$value
+            if (-not $names.Contains($name) -and (Test-Path "HKLM:\BROKENSYSTEM\$name")) {
+                $names.Add($name)
+            }
+        }
+        if ($names.Count -eq 0 -and (Test-Path 'HKLM:\BROKENSYSTEM\ControlSet001')) {
+            $names.Add('ControlSet001')
+        }
+        return @($names)
+    }
+
+    function Get-BootStorageDriverSpec {
+        @(
+            [PSCustomObject]@{ Name = 'pci';      Start = 0; AllowedStarts = [int[]]@(0);    Required = $true;  CheckStartOverride = $false; Description = 'PCI boot bus' }
+            [PSCustomObject]@{ Name = 'intelide'; Start = 0; AllowedStarts = [int[]]@(0);    Required = $false; CheckStartOverride = $true;  Description = 'legacy IDE controller' }
+            [PSCustomObject]@{ Name = 'pciide';   Start = 0; AllowedStarts = [int[]]@(0);    Required = $false; CheckStartOverride = $true;  Description = 'PCI IDE controller' }
+            [PSCustomObject]@{ Name = 'atapi';    Start = 0; AllowedStarts = [int[]]@(0);    Required = $false; CheckStartOverride = $true;  Description = 'IDE channel driver' }
+            [PSCustomObject]@{ Name = 'storahci'; Start = 0; AllowedStarts = [int[]]@(0);    Required = $false; CheckStartOverride = $true;  Description = 'AHCI storage miniport' }
+            [PSCustomObject]@{ Name = 'storport'; Start = 0; AllowedStarts = [int[]]@(0);    Required = $true;  CheckStartOverride = $false; Description = 'storage port driver' }
+            [PSCustomObject]@{ Name = 'disk';     Start = 0; AllowedStarts = [int[]]@(0);    Required = $true;  CheckStartOverride = $false; Description = 'disk class driver' }
+            [PSCustomObject]@{ Name = 'partmgr';  Start = 0; AllowedStarts = [int[]]@(0, 1); Required = $true;  CheckStartOverride = $false; Description = 'partition manager' }
+            [PSCustomObject]@{ Name = 'volmgr';   Start = 0; AllowedStarts = [int[]]@(0);    Required = $true;  CheckStartOverride = $false; Description = 'volume manager' }
+            [PSCustomObject]@{ Name = 'vmbus';    Start = 0; AllowedStarts = [int[]]@(0);    Required = $false; CheckStartOverride = $true;  Description = 'Hyper-V VMBus' }
+            [PSCustomObject]@{ Name = 'storvsc';  Start = 0; AllowedStarts = [int[]]@(0);    Required = $false; CheckStartOverride = $true;  Description = 'Hyper-V storage' }
+        )
+    }
+
+    function Get-BootStorageDriverFindings {
+        param(
+            [Parameter(Mandatory = $true)][string[]]$ControlSetNames
+        )
+
+        $findings = [System.Collections.Generic.List[object]]::new()
+        foreach ($csName in $ControlSetNames) {
+            $svcRoot = "HKLM:\BROKENSYSTEM\$csName\Services"
+            foreach ($spec in (Get-BootStorageDriverSpec)) {
+                $svcPath = "$svcRoot\$($spec.Name)"
+                if (-not (Test-Path $svcPath)) {
+                    if ($spec.Required) {
+                        $findings.Add([PSCustomObject]@{
+                            ControlSet = $csName
+                            Driver     = $spec.Name
+                            Message    = "$($spec.Name) service key is missing - $($spec.Description) cannot participate in boot storage enumeration"
+                            Fix        = '-RepairSystemFile <driver.sys> or restore the service key from a matching Windows image'
+                        })
+                    }
+                    continue
+                }
+
+                $props = Get-ItemProperty $svcPath -ErrorAction SilentlyContinue
+                if ($null -eq $props -or $null -eq $props.Start) {
+                    $findings.Add([PSCustomObject]@{
+                        ControlSet = $csName
+                        Driver     = $spec.Name
+                        Message    = "$($spec.Name) has no Start value - boot storage load order is incomplete"
+                        Fix        = '-FixBootStorageDrivers'
+                    })
+                }
+                elseif ([int]$props.Start -notin @($spec.AllowedStarts)) {
+                    $expectedText = (@($spec.AllowedStarts) | ForEach-Object { [string]$_ }) -join ' or '
+                    $findings.Add([PSCustomObject]@{
+                        ControlSet = $csName
+                        Driver     = $spec.Name
+                        Message    = "$($spec.Name) Start=$($props.Start) (expected $expectedText) - $($spec.Description) may not load early enough after migration"
+                        Fix        = '-FixBootStorageDrivers'
+                    })
+                }
+
+                if ($spec.CheckStartOverride) {
+                    $overridePath = "$svcPath\StartOverride"
+                    if (Test-Path $overridePath) {
+                        $overrideProps = Get-ItemProperty $overridePath -ErrorAction SilentlyContinue
+                        foreach ($prop in @($overrideProps.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' })) {
+                            if ($null -eq $prop.Value) { continue }
+                            if ([int]$prop.Value -ne 0) {
+                                $findings.Add([PSCustomObject]@{
+                                    ControlSet = $csName
+                                    Driver     = $spec.Name
+                                    Message    = "$($spec.Name) StartOverride\$($prop.Name)=$($prop.Value) (expected 0) - override may prevent boot storage enumeration after migration"
+                                    Fix        = '-FixBootStorageDrivers'
+                                })
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return @($findings)
+    }
+
+    function Get-BootCriticalDeviceInstanceFilterFindings {
+        param(
+            [Parameter(Mandatory = $true)][string[]]$ControlSetNames
+        )
+
+        $findings = [System.Collections.Generic.List[object]]::new()
+        $bootBusServices = [string[]]@('pci', 'vmbus')
+
+        foreach ($csName in $ControlSetNames) {
+            $enumRoot = "HKLM:\BROKENSYSTEM\$csName\Enum\ACPI"
+            if (-not (Test-Path $enumRoot)) { continue }
+
+            Get-ChildItem $enumRoot -ErrorAction SilentlyContinue | ForEach-Object {
+                $deviceId = $_.PSChildName
+                Get-ChildItem $_.PSPath -ErrorAction SilentlyContinue | ForEach-Object {
+                    $instanceId = $_.PSChildName
+                    $props = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+                    if ($null -eq $props -or $bootBusServices -inotcontains $props.Service) { return }
+
+                    foreach ($filterType in @('UpperFilters', 'LowerFilters')) {
+                        $active = @($props.$filterType | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
+                        if ($active.Count -eq 0) { continue }
+
+                        $findings.Add([PSCustomObject]@{
+                            ControlSet  = $csName
+                            Device      = "ACPI\$deviceId\$instanceId"
+                            Service     = $props.Service
+                            RegistryPath = "HKLM:\BROKENSYSTEM\$csName\Enum\ACPI\$deviceId\$instanceId"
+                            FilterType  = $filterType
+                            Filters     = [string[]]$active
+                            Message     = "ACPI\$deviceId\$instanceId ($($props.Service)) $filterType contains boot-critical device instance filter(s): $($active -join ', ')"
+                            Fix         = '-FixDeviceFilters'
+                        })
+                    }
+                }
+            }
+        }
+
+        return @($findings)
     }
 
     function Ensure-GuestTempDir {
@@ -4924,8 +5062,9 @@ complete recovery.
         #
         # Classes checked (from MS troubleshooting docs):
         #   {4d36e967} DiskDrive  - extra filters  -> stop error 0x7B
-        #   {4d36e96a} SCSI/RAID  - extra filters  -> stop error 0x7B
+        #   {4d36e96a} HDC/IDE    - extra filters  -> stop error 0x7B
         #   {4d36e97b} SCSIAdapter - extra filters -> stop error 0x7B
+        #   {4d36e97d} System      - extra filters  -> boot bus/PCI enumeration failures
         #   {71a27cdd} Volume     - extra filters  -> boot/access failures
         #   {4d36e972} Net        - extra filters  -> complete network loss
         #
@@ -4941,19 +5080,18 @@ complete recovery.
         #
         # GUIDs:
         #   Disk drive     : {4d36e967-e325-11ce-bfc1-08002be10318}
-        #   SCSI/RAID      : {4d36e96a-e325-11ce-bfc1-08002be10318}
-        #   SCSI Controller: {4d36e97b-e325-11ce-bfc1-08002be10318}
+        #   HDC / IDE      : {4d36e96a-e325-11ce-bfc1-08002be10318}
+        #   SCSI Adapter   : {4d36e97b-e325-11ce-bfc1-08002be10318}
+        #   System devices : {4d36e97d-e325-11ce-bfc1-08002be10318}
         #   Volume         : {71a27cdd-812a-11d0-bec7-08002be2092f}
         #   Net adapter    : {4d36e972-e325-11ce-bfc1-08002be10318}
 
-        Write-Host "Scanning device class UpperFilters/LowerFilters for unsafe entries..." -ForegroundColor Yellow
+        Write-Host "Scanning device class and boot-critical device instance UpperFilters/LowerFilters for unsafe entries..." -ForegroundColor Yellow
         if ($KeepDefaultFilters) {
             Write-Host "  Mode: strict (-KeepDefaultFilters) - only inbox safe-list entries will be kept; Microsoft-signed non-defaults will be removed." -ForegroundColor Cyan
         }
         Invoke-WithHive 'SYSTEM' {
-            $currentSet = (Get-ItemProperty "HKLM:\BROKENSYSTEM\Select" -ErrorAction SilentlyContinue).Current
-            $csName = if ($currentSet) { "ControlSet{0:d3}" -f $currentSet } else { "ControlSet001" }
-            $classRoot = "HKLM:\BROKENSYSTEM\$csName\Control\Class"
+            $controlSetNames = @(Get-OfflineControlSetNames)
 
             # Class definitions.
             # SafeFilters  : Known Windows inbox / Azure-expected filter names (case-insensitive). Always kept.
@@ -4975,18 +5113,26 @@ complete recovery.
                 },
                 [PSCustomObject]@{
                     GUID         = '{4d36e96a-e325-11ce-bfc1-08002be10318}'
-                    Name         = 'SCSIAdapter'
+                    Name         = 'HDC'
                     Risk         = 'CRITICAL'
-                    Description  = 'Extra filters on SCSI/RAID adapters cause stop error 0x7B (INACCESSIBLE_BOOT_DEVICE)'
+                    Description  = 'Extra filters on IDE ATA/ATAPI controllers cause stop error 0x7B (INACCESSIBLE_BOOT_DEVICE)'
                     # iasf / iastorf - Intel RST RAID filter (expected on some guest SKUs)
                     SafeFilters  = [string[]]@('iasf', 'iastorf')
                     AllowVendors = [string[]]@()
                 },
                 [PSCustomObject]@{
                     GUID         = '{4d36e97b-e325-11ce-bfc1-08002be10318}'
-                    Name         = 'SCSIController'
+                    Name         = 'SCSIAdapter'
                     Risk         = 'CRITICAL'
-                    Description  = 'Extra filters on SCSI controller adapters cause stop error 0x7B (INACCESSIBLE_BOOT_DEVICE)'
+                    Description  = 'Extra filters on SCSI adapters cause stop error 0x7B (INACCESSIBLE_BOOT_DEVICE)'
+                    SafeFilters  = [string[]]@()
+                    AllowVendors = [string[]]@()
+                },
+                [PSCustomObject]@{
+                    GUID         = '{4d36e97d-e325-11ce-bfc1-08002be10318}'
+                    Name         = 'System'
+                    Risk         = 'CRITICAL'
+                    Description  = 'Extra filters on System devices can block boot bus or PCI enumeration and cause stop error 0x7B (INACCESSIBLE_BOOT_DEVICE)'
                     SafeFilters  = [string[]]@()
                     AllowVendors = [string[]]@()
                 },
@@ -5026,7 +5172,11 @@ complete recovery.
 
             $anyChanges = $false
 
-            foreach ($classDef in $classChecks) {
+            foreach ($csName in $controlSetNames) {
+                $classRoot = "HKLM:\BROKENSYSTEM\$csName\Control\Class"
+                Write-Host "`n  Control set: $csName" -ForegroundColor DarkCyan
+
+                foreach ($classDef in $classChecks) {
                 $classPath = "$classRoot\$($classDef.GUID)"
                 if (-not (Test-Path $classPath)) {
                     Write-Host "  [$($classDef.Name) $($classDef.GUID)] Class key not found in offline hive - skipping." -ForegroundColor DarkGray
@@ -5158,14 +5308,35 @@ complete recovery.
                     }
                 }
             }
+            }
+
+            $instanceFilterFindings = @(Get-BootCriticalDeviceInstanceFilterFindings -ControlSetNames (Get-OfflineControlSetNames))
+            if ($instanceFilterFindings.Count -gt 0) {
+                Write-Host "`n  [Boot-critical device instances] UpperFilters/LowerFilters can prevent PCI/VMBus enumeration and cause stop error 0x7B" -ForegroundColor Cyan
+                foreach ($finding in $instanceFilterFindings) {
+                    Write-Host "    $($finding.ControlSet) $($finding.Device) $($finding.FilterType): $($finding.Filters -join ', ')" -ForegroundColor White
+                    Write-Host "      [REMOVE] $($finding.Filters -join ', ') - boot-critical device instance filter" -ForegroundColor Red
+                    Write-ActionLog -Event 'DeviceInstanceFilterRemoved' -Details @{
+                        ControlSet  = $finding.ControlSet
+                        Device      = $finding.Device
+                        Service     = $finding.Service
+                        FilterType  = $finding.FilterType
+                        Filters     = $finding.Filters
+                        Risk        = 'CRITICAL'
+                        Reason      = 'BootCriticalDeviceInstanceFilter'
+                    }
+                    Remove-ItemProperty-Logged -Path $finding.RegistryPath -Name $finding.FilterType -Force
+                    $anyChanges = $true
+                }
+            }
 
             if ($anyChanges) {
-                Write-Host "`nDevice class filter cleanup complete." -ForegroundColor Green
+                Write-Host "`nDevice filter cleanup complete." -ForegroundColor Green
                 Write-Warning ("If a legitimate product (backup agent, endpoint security, storage appliance) " +
                     "requires a removed filter, restore it from the action log and re-evaluate.")
             }
             else {
-                Write-Host "`nNo unsafe device class filters found. No changes made." -ForegroundColor Green
+                Write-Host "`nNo unsafe device class or boot-critical device instance filters found. No changes made." -ForegroundColor Green
             }
         }
     }
@@ -5768,6 +5939,7 @@ complete recovery.
 
         # Critical Services
         $sevCriticalSvcDisabled = 2   # A critical boot/system driver is disabled
+        $sevBootStorageReadiness = 2   # Boot storage Start/StartOverride settings may block migration boot
 
         # RDP
         $sevRdpDenied = 2   # fDenyTSConnections=1 (RDP explicitly disabled)
@@ -6422,6 +6594,15 @@ complete recovery.
                     }
                 }
 
+                # -- Migration boot storage readiness ------------------------------
+                # Report only unexpected settings. These values control whether the
+                # boot bus/storage stack can enumerate the OS disk early enough to
+                # satisfy the loader-provided boot device path.
+                $bootStorageFindings = @(Get-BootStorageDriverFindings -ControlSetNames @($csName))
+                foreach ($bs in $bootStorageFindings) {
+                    & $emit 'BootStorage' (& $toSev $sevBootStorageReadiness) "$($bs.ControlSet): $($bs.Message)" $bs.Fix
+                }
+
                 # -- Azure/Hyper-V synthetic drivers ---------------------------------
                 $synBad = 0
                 foreach ($sd in (Get-SyntheticDriverSpec)) {
@@ -6761,13 +6942,15 @@ complete recovery.
                     '{4d36e967-e325-11ce-bfc1-08002be10318}' = [string[]]@('partmgr', 'fvevol', 'iorate', 'storqosflt', 'wcifs', 'ehstorclass')
                     '{4d36e96a-e325-11ce-bfc1-08002be10318}' = [string[]]@('iasf', 'iastorf')
                     '{4d36e97b-e325-11ce-bfc1-08002be10318}' = [string[]]@()
+                    '{4d36e97d-e325-11ce-bfc1-08002be10318}' = [string[]]@()
                     '{71a27cdd-812a-11d0-bec7-08002be2092f}' = [string[]]@('volsnap', 'fvevol', 'rdyboost', 'spldr', 'volmgrx', 'iorate', 'storqosflt')
                     '{4d36e972-e325-11ce-bfc1-08002be10318}' = [string[]]@('wfplwf', 'ndiscap', 'ndisimplatformmpfilter', 'vmsproxyhnicfilter', 'vms3cap', 'mslldp', 'psched', 'bridge')
                 }
                 $filterClasses = @(
                     @{ GUID = '{4d36e967-e325-11ce-bfc1-08002be10318}'; Name = 'DiskDrive'; Sev = (& $toSev $sevDeviceFiltersCrit) }
-                    @{ GUID = '{4d36e96a-e325-11ce-bfc1-08002be10318}'; Name = 'SCSIAdapter'; Sev = (& $toSev $sevDeviceFiltersCrit) }
-                    @{ GUID = '{4d36e97b-e325-11ce-bfc1-08002be10318}'; Name = 'SCSIController'; Sev = (& $toSev $sevDeviceFiltersCrit) }
+                    @{ GUID = '{4d36e96a-e325-11ce-bfc1-08002be10318}'; Name = 'HDC'; Sev = (& $toSev $sevDeviceFiltersCrit) }
+                    @{ GUID = '{4d36e97b-e325-11ce-bfc1-08002be10318}'; Name = 'SCSIAdapter'; Sev = (& $toSev $sevDeviceFiltersCrit) }
+                    @{ GUID = '{4d36e97d-e325-11ce-bfc1-08002be10318}'; Name = 'System'; Sev = (& $toSev $sevDeviceFiltersCrit) }
                     @{ GUID = '{71a27cdd-812a-11d0-bec7-08002be2092f}'; Name = 'Volume'; Sev = (& $toSev $sevDeviceFiltersWarn) }
                     @{ GUID = '{4d36e972-e325-11ce-bfc1-08002be10318}'; Name = 'Net'; Sev = (& $toSev $sevDeviceFiltersWarn) }
                 )
@@ -6783,6 +6966,11 @@ complete recovery.
                             & $emit 'DeviceFilters' $fc.Sev "$($fc.Name) $ft contains non-standard entries: $($suspect -join ', ')" "-FixDeviceFilters"
                         }
                     }
+                }
+
+                $instanceFilterFindings = @(Get-BootCriticalDeviceInstanceFilterFindings -ControlSetNames @($csName))
+                foreach ($instanceFilter in $instanceFilterFindings) {
+                    & $emit 'DeviceFilters' (& $toSev $sevDeviceFiltersCrit) "$($instanceFilter.ControlSet): $($instanceFilter.Message)" $instanceFilter.Fix
                 }
 
                 # -- Orphaned NDIS bindings --------------------------------------------
@@ -9083,6 +9271,73 @@ Skips entries if service key or driver binary is missing.
         }
     }
 
+    function FixBootStorageDrivers {
+        if (-not (Confirm-CriticalOperation -Operation 'Repair boot storage driver readiness (-FixBootStorageDrivers)' -Details @"
+Checks the offline SYSTEM hive for migration boot-storage settings that can block disk enumeration.
+Only unexpected values are changed:
+  - boot bus/storage service Start values are set to 0 when the service key exists
+  - StartOverride entries for boot storage drivers are set to 0 when present and non-zero
+Missing service keys are reported but not created.
+"@)) { return }
+
+        Invoke-WithHive 'SYSTEM' {
+            $controlSets = Get-OfflineControlSetNames
+            if ($controlSets.Count -eq 0) {
+                Write-Warning 'No ControlSet keys were found in the offline SYSTEM hive.'
+                return
+            }
+
+            $changes = 0
+            $missing = [System.Collections.Generic.List[string]]::new()
+
+            foreach ($csName in $controlSets) {
+                Write-Host "  Checking $csName..." -ForegroundColor Cyan
+                $svcRoot = "HKLM:\BROKENSYSTEM\$csName\Services"
+                foreach ($spec in (Get-BootStorageDriverSpec)) {
+                    $svcPath = "$svcRoot\$($spec.Name)"
+                    if (-not (Test-Path $svcPath)) {
+                        if ($spec.Required) { $missing.Add("$csName\Services\$($spec.Name)") }
+                        continue
+                    }
+
+                    $props = Get-ItemProperty $svcPath -ErrorAction SilentlyContinue
+                    if ($null -eq $props.Start -or [int]$props.Start -notin @($spec.AllowedStarts)) {
+                        Write-Host "    $($spec.Name) Start: $($props.Start) -> $($spec.Start)" -ForegroundColor Yellow
+                        Set-ItemProperty-Logged -Path $svcPath -Name Start -Value $spec.Start -Type DWord -Force
+                        $changes++
+                    }
+
+                    if ($spec.CheckStartOverride) {
+                        $overridePath = "$svcPath\StartOverride"
+                        if (Test-Path $overridePath) {
+                            $overrideProps = Get-ItemProperty $overridePath -ErrorAction SilentlyContinue
+                            foreach ($prop in @($overrideProps.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' })) {
+                                if ($null -eq $prop.Value) { continue }
+                                if ([int]$prop.Value -ne 0) {
+                                    Write-Host "    $($spec.Name) StartOverride\$($prop.Name): $($prop.Value) -> 0" -ForegroundColor Yellow
+                                    Set-ItemProperty-Logged -Path $overridePath -Name $prop.Name -Value 0 -Type DWord -Force
+                                    $changes++
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if ($missing.Count -gt 0) {
+                Write-Warning "Required boot-storage service keys are missing: $($missing -join ', ')"
+            }
+            if ($changes -eq 0) {
+                Write-Host 'No unexpected boot storage driver settings were found. No registry values changed.' -ForegroundColor Green
+            }
+            else {
+                Write-Host "Boot storage driver readiness repair complete. Registry values changed: $changes" -ForegroundColor Green
+            }
+
+            Write-ActionLog -Event 'FixBootStorageDrivers' -Details @{ ControlSets = ($controlSets -join ', '); Changes = $changes; MissingRequiredKeys = ($missing -join ', ') }
+        }
+    }
+
     function ResetInterfacesToDHCP {
         if (-not (Confirm-CriticalOperation -Operation 'Reset interfaces to DHCP (-ResetInterfacesToDHCP)' -Details @"
 For all offline NIC interface keys under Tcpip\Parameters\Interfaces:
@@ -10870,6 +11125,7 @@ No destructive file or registry cleanup is performed.
             [switch]$FixBoot,
             [switch]$FixSecureBootCodeIntegrity,
             [switch]$FixBootSector,
+            [switch]$FixBootStorageDrivers,
             [switch]$RecreateBootPartition,
             [switch]$RepairComponentStore,
             [string]$RepairSource = '',
@@ -11016,6 +11272,7 @@ PARAMETERS:
   -FixBoot               Rebuild BCD from scratch
     -FixSecureBootCodeIntegrity  Refresh Gen2 EFI boot manager + SKUSiPolicy.p7b for winload.efi / 0xc0430001
   -FixBootSector         Repair MBR/VBR boot sector (Gen1/BIOS only; bootrec)
+    -FixBootStorageDrivers Repair boot storage driver Start/StartOverride settings used during migration boot
   -RecreateBootPartition Recreate missing boot partition (System Reserved for Gen1, EFI SP for Gen2) and run bcdboot
   -RemoveSafeModeFlag    Remove Safe Mode flag
   -TryLGKC               Switch boot to Last Known Good Control Set
@@ -11047,7 +11304,7 @@ PARAMETERS:
     -IncludeServices             (sub-option) also include Win32 services, not just kernel drivers
     -IssuesOnly                  (sub-option) show only rows that need attention: missing binary,
                                    non-Microsoft vendor, or ErrorControl Severe/Critical (>=2)
-  -FixDeviceFilters      Scan and remove unsafe UpperFilters/LowerFilters from device classes (disk/net/volume)
+    -FixDeviceFilters      Scan and remove unsafe UpperFilters/LowerFilters from device classes and boot-critical device instances
     -KeepDefaultFilters    (sub-option) strict mode: only inbox safe-list entries kept; removes Microsoft-signed
                              non-defaults like InDskFlt that are not standard on Azure VMs
   -CopyACPISettings      Copy legacy Hyper-V ACPI Enum entries to newer device IDs (VMBus->MSFT1000,
@@ -11191,6 +11448,7 @@ AVAILABLE DISKS:
             if ($FixBoot) { RebuildBCD }
             if ($FixSecureBootCodeIntegrity) { RepairSecureBootCodeIntegrity }
             if ($FixBootSector) { FixBootSector }
+            if ($FixBootStorageDrivers) { FixBootStorageDrivers }
             if ($RecreateBootPartition) { RecreateBootPartition }
             if ($RepairComponentStore) { RunDismHealth -RepairSource $RepairSource }
             if ($AnalyzeComponentStore) { AnalyzeComponentStore }
