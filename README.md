@@ -81,6 +81,10 @@ You can also target a Hyper-V VM by name instead of disk number:
 # Rebuild BCD (Boot Configuration Data)
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixBoot
 
+# Check and repair boot storage settings for migration/0x7B scenarios
+# This checks the active offline ControlSet for boot storage Start and StartOverride values.
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixBootStorageDrivers
+
 # Fix boot sector (MBR/VBR repair)
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixBootSector
 
@@ -101,6 +105,9 @@ You can also target a Hyper-V VM by name instead of disk number:
 
 # Try Last Known Good Configuration
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -TryLGKC
+
+# Try a different offline ControlSet when the current one is damaged
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -TryOtherBootConfig
 
 # Boot into Safe Mode on next start
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -TrySafeMode
@@ -181,6 +188,9 @@ You can also target a Hyper-V VM by name instead of disk number:
 # Create a temporary admin user for emergency access
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -AddTempUser
 
+# Create a temporary admin user via Setup CmdLine for domain-joined VMs
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -AddTempUser2
+
 # Fix user rights assignments
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixUserRights
 ```
@@ -188,13 +198,13 @@ You can also target a Hyper-V VM by name instead of disk number:
 ### Drivers & Services
 
 ```powershell
-# Disable a specific problematic driver or service
+# Disable a named driver or service when directed by diagnostics
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -DisableDriverOrService "driver1","service2"
 
 # Re-enable a previously disabled driver or service
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -EnableDriverOrService "driver1" -DriverStartType System
 
-# Disable all third-party (non-Microsoft) drivers
+# Disable all third-party (non-Microsoft) drivers for isolation testing
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -DisableThirdPartyDrivers
 
 # Re-enable previously disabled third-party drivers
@@ -202,6 +212,9 @@ You can also target a Hyper-V VM by name instead of disk number:
 
 # Get a report of all services and drivers (filter to issues only)
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -GetServicesReport -IssuesOnly
+
+# Include Win32 services in the services/drivers report
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -GetServicesReport -IncludeServices
 
 # Ensure Hyper-V synthetic drivers are enabled (storvsc, netvsc, etc.)
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -EnsureSyntheticDriversEnabled
@@ -220,7 +233,10 @@ You can also target a Hyper-V VM by name instead of disk number:
 # Enable Credential Guard
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -EnableCredentialGuard
 
-# Disable AppLocker (if it's blocking boot or login)
+# Disable Memory Integrity / HVCI offline for code integrity boot failures
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -DisableMemoryIntegrity
+
+# Disable AppLocker when policy may be interfering with boot or login
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -DisableAppLocker
 
 # Get AppLocker configuration report
@@ -245,6 +261,10 @@ You can also target a Hyper-V VM by name instead of disk number:
 
 # Fix orphaned network bindings
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixNetBindings
+
+# Disable or re-enable Base Filtering Engine
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -DisableBFE
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -EnableBFE
 
 # Reset the full network stack
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -ResetNetworkStack
@@ -291,8 +311,11 @@ You can also target a Hyper-V VM by name instead of disk number:
 ### Miscellaneous
 
 ```powershell
-# Fix device class filters (UpperFilters/LowerFilters)
+# Review and repair device class filters (UpperFilters/LowerFilters)
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixDeviceFilters
+
+# Strict device filter cleanup: keep only inbox safe-list entries
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixDeviceFilters -KeepDefaultFilters
 
 # Fix Session Manager boot execute entries
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixSessionManager
@@ -363,6 +386,9 @@ All actions are logged to a JSON-line audit file (`Repair-AzVMDisk_actions.log`)
 # View all sessions
 .\Repair-AzVMDisk.ps1 -ShowLastSession -All
 
+# View a specific session by ID
+.\Repair-AzVMDisk.ps1 -ShowLastSession -SessionId "00000000-0000-0000-0000-000000000000"
+
 # Export sessions to HTML
 .\Repair-AzVMDisk.ps1 -ShowLastSession -All -ExportTo C:\Temp\repair_log.html
 ```
@@ -371,12 +397,13 @@ All actions are logged to a JSON-line audit file (`Repair-AzVMDisk_actions.log`)
 
 | Scenario | Command |
 |---|---|
-| VM won't boot | `-SysCheck` then `-FixBoot` |
+| VM fails to boot | `-SysCheck` then the specific suggested fix |
+| Stop 0x7B / inaccessible boot device after migration | `-SysCheck` then `-FixBootStorageDrivers`; use `-FixBoot` if `-SysCheck` reports BCD findings |
 | RDP not working | `-FixRDP -DisableNLA` |
-| Blue screen from bad driver | `-DisableDriverOrService "drivername"` |
+| Blue screen / stop error investigation | `-SysCheck` then the specific suggested fix |
 | Locked out of VM | `-ResetLocalAdminPassword` or `-AddTempUser` |
 | Stuck on Windows Update | `-FixPendingUpdates` |
-| EDR/filter driver blocking boot | `-DisableDriverOrService "drivername"` |
+| Device filter findings | `-SysCheck` then `-FixDeviceFilters` when recommended |
 | Azure VM agent broken | `-FixAzureGuestAgent` or `-InstallAzureVMAgent` |
 | Corrupted system files | `-RunSFC` then `-RepairComponentStore` |
 
