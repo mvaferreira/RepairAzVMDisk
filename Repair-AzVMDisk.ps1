@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.4.14
+        Version: 0.4.15
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -62,6 +62,10 @@
         PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixSecureBootCodeIntegrity
 
     .EXAMPLE
+        # Repair Code Integrity policy payloads from a known-good Windows\System32\CodeIntegrity folder
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixSecureBootCodeIntegrity -CodeIntegrityPolicySourcePath C:\Temp\KnownGood\CodeIntegrity
+
+    .EXAMPLE
         # Full Gen1 / BIOS-MBR boot repair on disk 3
         # -RecreateBootPartition exits without deleting/recreating if a valid Active boot partition already exists.
         PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -RecreateBootPartition
@@ -95,6 +99,8 @@ param (
     [Parameter(ParameterSetName = 'Repair')][switch]$FixNTFS,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixBoot,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixSecureBootCodeIntegrity,
+    [Parameter(ParameterSetName = 'Repair')][string]$CodeIntegrityPolicySourcePath = '',
+    [Parameter(ParameterSetName = 'Repair')][switch]$Force,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixBootSector,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixBootStorageDrivers,
     [Parameter(ParameterSetName = 'Repair')][switch]$RecreateBootPartition,
@@ -238,6 +244,43 @@ end {
     ################################################################################
     # Helper functions
     ################################################################################
+
+    function Get-RepairScriptVersion {
+        $scriptPath = if ($PSCommandPath) { $PSCommandPath } elseif ($MyInvocation.MyCommand.Path) { $MyInvocation.MyCommand.Path } else { '' }
+        if ($scriptPath -and (Test-Path -LiteralPath $scriptPath)) {
+            try {
+                foreach ($line in (Get-Content -LiteralPath $scriptPath -TotalCount 80 -ErrorAction Stop)) {
+                    if ($line -match '^\s*Version:\s*(.+?)\s*$') {
+                        return $Matches[1].Trim()
+                    }
+                }
+            }
+            catch {}
+        }
+        return 'unknown'
+    }
+
+    function Show-RepairScriptVersionHeader {
+        if ($script:RepairScriptVersionHeaderShown) { return }
+        $script:RepairScriptVersionHeaderShown = $true
+
+        $scriptPath = if ($PSCommandPath) { $PSCommandPath } elseif ($MyInvocation.MyCommand.Path) { $MyInvocation.MyCommand.Path } else { '' }
+        $scriptName = if ($scriptPath) { Split-Path -Leaf $scriptPath } else { 'Repair-AzVMDisk.ps1' }
+        $version = Get-RepairScriptVersion
+        $scriptHash = ''
+        if ($scriptPath -and (Test-Path -LiteralPath $scriptPath)) {
+            try { $scriptHash = (Get-FileHash -LiteralPath $scriptPath -Algorithm SHA256 -ErrorAction Stop).Hash }
+            catch { $scriptHash = '' }
+        }
+
+        Write-Host "====================================================================" -ForegroundColor DarkCyan
+        Write-Host ("  {0}  |  Version {1}" -f $scriptName, $version) -ForegroundColor Cyan
+        if ($scriptPath) { Write-Host ("  Path    : {0}" -f $scriptPath) -ForegroundColor DarkGray }
+        if ($scriptHash) { Write-Host ("  SHA256  : {0}" -f $scriptHash) -ForegroundColor DarkGray }
+        Write-Host ("  Started : {0}" -f (Get-Date).ToString('o')) -ForegroundColor DarkGray
+        Write-Host "====================================================================" -ForegroundColor DarkCyan
+        Write-Host ""
+    }
 
     # Helper: builds a unique backup file path if the primary .bak exists
     function New-UniqueBackupPath {
@@ -651,6 +694,8 @@ end {
             [switch]$Detailed,              # show full details (paths, output, registry changes, etc.)
             [string]$ExportTo = ''          # optional path to export HTML (.html) or CSV (.csv)
         )
+
+        Show-RepairScriptVersionHeader
 
         if (-not (Test-Path $LogPath)) {
             Write-Warning "Log file not found: $LogPath"
@@ -1669,6 +1714,11 @@ $($htmlRows -join "`n")
         Write-Host "  having a VM snapshot before running this is always a good idea." -ForegroundColor DarkGray
         Write-Host ""
 
+        if ($script:RepairForceConfirm) {
+            Write-Host "  -Force specified; confirmation prompt bypassed." -ForegroundColor Yellow
+            return $true
+        }
+
         $answer = Read-Host "  Continue? [Y] Yes  [N] No (default: No)"
         if ($answer -ne 'Y' -and $answer -ne 'y') {
             Write-Host "  Skipped. No changes were made." -ForegroundColor DarkGray
@@ -2461,14 +2511,374 @@ The script will copy it to the guest before running bcdboot, then proceed with -
         }
     }
 
+    function Get-CodeIntegrityPolicyPayloadSpec {
+        @(
+            @{
+                FileName       = 'Driver.stl'
+                RelativePath   = 'Windows\System32\CodeIntegrity\Driver.stl'
+                Label          = 'Code Integrity driver revocation list (Driver.stl)'
+                ComponentRegex = 'microsoft-onecore-c.*riverrevocationlist'
+                ComponentDirectoryFilter = '*microsoft-onecore-c*riverrevocationlist*'
+            }
+            @{
+                FileName       = 'DriverSiPolicy.p7b'
+                RelativePath   = 'Windows\System32\CodeIntegrity\DriverSiPolicy.p7b'
+                Label          = 'Code Integrity driver signing policy (DriverSiPolicy.p7b)'
+                ComponentRegex = 'microsoft-windows-c.*egrity-driverpolicy'
+                ComponentDirectoryFilter = '*microsoft-windows-c*egrity-driverpolicy*'
+            }
+        )
+    }
+
+    function Get-WinSxSComponentVersionFromPath {
+        param([string]$Path)
+
+        foreach ($segment in @($Path -split '[\\/]')) {
+            if ($segment -match '_(\d+\.\d+\.\d+\.\d+)_') {
+                return $Matches[1]
+            }
+        }
+        return ''
+    }
+
+    function Get-CodeIntegrityFileHash {
+        param([string]$Path)
+
+        try {
+            return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path -ErrorAction Stop).Hash
+        }
+        catch {
+            return ''
+        }
+    }
+
+    function Add-CodeIntegrityCandidate {
+        param(
+            [Parameter(Mandatory = $true)]$Candidates,
+            [Parameter(Mandatory = $true)][hashtable]$Spec,
+            [Parameter(Mandatory = $true)][string]$Path,
+            [Parameter(Mandatory = $true)][string]$Source,
+            [Parameter(Mandatory = $true)][int]$Priority,
+            [string]$ReferenceVersion = ''
+        )
+
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        if (-not $item -or $item.Length -le 0) { return }
+        if ($item.DirectoryName -match '\\(f|r)$') { return }
+
+        $componentVersion = Get-WinSxSComponentVersionFromPath -Path $item.FullName
+        $fileHash = Get-CodeIntegrityFileHash -Path $item.FullName
+        if ([string]::IsNullOrWhiteSpace($fileHash)) { return }
+
+        $versionObject = $null
+        if ($componentVersion) {
+            try { $versionObject = [version]$componentVersion } catch { $versionObject = [version]'0.0.0.0' }
+        }
+        if (-not $versionObject) { $versionObject = [version]'0.0.0.0' }
+
+        $Candidates.Add([PSCustomObject]@{
+                FileName         = $Spec.FileName
+                Label            = $Spec.Label
+                Path             = $item.FullName
+                Source           = $Source
+                Priority         = $Priority
+                Size             = $item.Length
+                LastWrite        = $item.LastWriteTime
+                Hash             = $fileHash
+                ComponentVersion = $componentVersion
+                VersionObject    = $versionObject
+                MatchesReference = ($ReferenceVersion -and $componentVersion -eq $ReferenceVersion)
+            })
+    }
+
+    function Get-CodeIntegrityReferenceCandidate {
+        $windowsRoot = Join-Path $script:WinDriveLetter 'Windows'
+        $winsxsDir = Join-Path $windowsRoot 'WinSxS'
+        if (-not (Test-Path -LiteralPath $winsxsDir)) { return $null }
+
+        $candidates = [System.Collections.Generic.List[object]]::new()
+        Get-ChildItem -Path $winsxsDir -Directory -Filter '*microsoft-windows-codeintegrity_*' -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            $candidatePath = Join-Path $_.FullName 'ci.dll'
+            $candidateItem = Get-Item -LiteralPath $candidatePath -Force -ErrorAction SilentlyContinue
+            if (-not $candidateItem -or $candidateItem.Length -le 0) { return }
+            $versionText = Get-WinSxSComponentVersionFromPath -Path $candidateItem.FullName
+            $versionObject = [version]'0.0.0.0'
+            if ($versionText) { try { $versionObject = [version]$versionText } catch {} }
+            $candidates.Add([PSCustomObject]@{
+                Path             = $candidateItem.FullName
+                Size             = $candidateItem.Length
+                LastWrite        = $candidateItem.LastWriteTime
+                ComponentVersion = $versionText
+                VersionObject    = $versionObject
+            })
+        }
+
+        return @($candidates | Sort-Object @{ Expression = 'VersionObject'; Descending = $true }, @{ Expression = 'Size'; Descending = $true }, @{ Expression = 'LastWrite'; Descending = $true } | Select-Object -First 1)
+    }
+
+    function Test-HostBuildMatchesGuest {
+        $guestBuild = if ($script:SelectedWindowsInstall -and $script:SelectedWindowsInstall.CurrentBuildNumber) { [string]$script:SelectedWindowsInstall.CurrentBuildNumber } else { '' }
+        $guestUBR = if ($script:SelectedWindowsInstall -and $script:SelectedWindowsInstall.UBR) { [string]$script:SelectedWindowsInstall.UBR } else { '' }
+        $hostCv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+        $hostBuild = if ($hostCv -and $hostCv.CurrentBuildNumber) { [string]$hostCv.CurrentBuildNumber } else { [System.Environment]::OSVersion.Version.Build.ToString() }
+        $hostUBR = if ($hostCv -and $null -ne $hostCv.UBR) { [string]$hostCv.UBR } else { '' }
+
+        if ([string]::IsNullOrWhiteSpace($guestBuild)) {
+            $softwareHivePath = Join-Path $script:WinDriveLetter 'Windows\System32\Config\SOFTWARE'
+            if (Test-Path -LiteralPath $softwareHivePath) {
+                $tempKey = 'RVMTEMP_CI_{0}' -f ([guid]::NewGuid().ToString('N'))
+                $loaded = $false
+                try {
+                    $null = reg.exe load "HKLM\$tempKey" "$softwareHivePath" 2>&1 | Out-String
+                    if ($LASTEXITCODE -eq 0) {
+                        $loaded = $true
+                        $guestCv = Get-ItemProperty "HKLM:\$tempKey\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue
+                        if ($guestCv) {
+                            $guestBuild = if ($guestCv.CurrentBuildNumber) { [string]$guestCv.CurrentBuildNumber } else { '' }
+                            $guestUBR = if ($null -ne $guestCv.UBR) { [string]$guestCv.UBR } else { '' }
+                        }
+                    }
+                }
+                finally {
+                    if ($loaded) { reg.exe unload "HKLM\$tempKey" 2>&1 | Out-Null }
+                }
+            }
+        }
+
+        $guestLabel = if ($guestUBR) { "$guestBuild.$guestUBR" } else { $guestBuild }
+        $hostLabel = if ($hostUBR) { "$hostBuild.$hostUBR" } else { $hostBuild }
+
+        if ([string]::IsNullOrWhiteSpace($guestBuild)) {
+            return [PSCustomObject]@{ Matches = $false; Guest = 'unknown'; Host = $hostLabel; Reason = 'guest build unavailable' }
+        }
+
+        $matches = $false
+        if ($guestUBR -and $hostUBR) { $matches = ($guestBuild -eq $hostBuild -and $guestUBR -eq $hostUBR) }
+        else { $matches = ($guestBuild -eq $hostBuild) }
+
+        return [PSCustomObject]@{ Matches = $matches; Guest = $guestLabel; Host = $hostLabel; Reason = if ($matches) { 'match' } else { 'host and guest builds differ' } }
+    }
+
+    function Test-CodeIntegrityExplicitSourceAllowed {
+        param([string]$SourcePath)
+
+        if ([string]::IsNullOrWhiteSpace($SourcePath)) {
+            return [PSCustomObject]@{ Allowed = $true; IsHostSource = $false; Reason = '' }
+        }
+
+        $resolvedSource = ''
+        try {
+            if (Test-Path -LiteralPath $SourcePath) {
+                $resolvedSource = (Resolve-Path -LiteralPath $SourcePath -ErrorAction Stop).ProviderPath
+            }
+        }
+        catch {}
+
+        if ([string]::IsNullOrWhiteSpace($resolvedSource)) {
+            return [PSCustomObject]@{ Allowed = $true; IsHostSource = $false; Reason = '' }
+        }
+
+        $hostRoot = $env:SystemRoot.TrimEnd('\')
+        $isHostSource = $resolvedSource.StartsWith($hostRoot, [System.StringComparison]::OrdinalIgnoreCase)
+        if (-not $isHostSource) {
+            return [PSCustomObject]@{ Allowed = $true; IsHostSource = $false; Reason = '' }
+        }
+
+        $buildMatch = Test-HostBuildMatchesGuest
+        if ($buildMatch.Matches) {
+            return [PSCustomObject]@{ Allowed = $true; IsHostSource = $true; Reason = "host build matches guest ($($buildMatch.Host))" }
+        }
+
+        return [PSCustomObject]@{ Allowed = $false; IsHostSource = $true; Reason = "host build $($buildMatch.Host) is not compatible with guest build $($buildMatch.Guest): $($buildMatch.Reason)" }
+    }
+
+    function Get-CodeIntegrityPolicyCandidates {
+        param(
+            [Parameter(Mandatory = $true)][hashtable]$Spec,
+            [string]$ReferenceVersion = '',
+            [string]$SourcePath = '',
+            [switch]$IncludeHostFallback
+        )
+
+        $candidates = [System.Collections.Generic.List[object]]::new()
+
+        if (-not [string]::IsNullOrWhiteSpace($SourcePath)) {
+            $sourceAllowed = Test-CodeIntegrityExplicitSourceAllowed -SourcePath $SourcePath
+            if (-not $sourceAllowed.Allowed) {
+                Write-Warning "  Explicit source path '$SourcePath' was skipped for $($Spec.FileName): $($sourceAllowed.Reason). Use a same-build source folder instead."
+            }
+            else {
+                $sourceLabel = if ($sourceAllowed.IsHostSource) { "ExplicitHostSource ($($sourceAllowed.Reason))" } else { 'ExplicitSource' }
+                $sourceItem = Get-Item -LiteralPath $SourcePath -Force -ErrorAction SilentlyContinue
+                if ($sourceItem -and -not $sourceItem.PSIsContainer) {
+                    if ($sourceItem.Name -ieq $Spec.FileName) {
+                        Add-CodeIntegrityCandidate -Candidates $candidates -Spec $Spec -Path $sourceItem.FullName -Source $sourceLabel -Priority 0 -ReferenceVersion $ReferenceVersion
+                    }
+                }
+                else {
+                    $sourceRoot = $SourcePath.TrimEnd('\')
+                    $explicitPaths = @(
+                        (Join-Path $sourceRoot $Spec.FileName),
+                        (Join-Path $sourceRoot (Join-Path 'CodeIntegrity' $Spec.FileName)),
+                        (Join-Path $sourceRoot (Join-Path 'System32\CodeIntegrity' $Spec.FileName)),
+                        (Join-Path $sourceRoot (Join-Path 'Windows\System32\CodeIntegrity' $Spec.FileName))
+                    )
+                    foreach ($explicitPath in @($explicitPaths | Select-Object -Unique)) {
+                        Add-CodeIntegrityCandidate -Candidates $candidates -Spec $Spec -Path $explicitPath -Source $sourceLabel -Priority 0 -ReferenceVersion $ReferenceVersion
+                    }
+                }
+            }
+        }
+
+        $windowsRoot = Join-Path $script:WinDriveLetter 'Windows'
+        $winsxsDir = Join-Path $windowsRoot 'WinSxS'
+        if (Test-Path -LiteralPath $winsxsDir) {
+            Get-ChildItem -Path $winsxsDir -Directory -Filter $Spec.ComponentDirectoryFilter -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                Add-CodeIntegrityCandidate -Candidates $candidates -Spec $Spec -Path (Join-Path $_.FullName $Spec.FileName) -Source 'OfflineWinSxS' -Priority 1 -ReferenceVersion $ReferenceVersion
+            }
+        }
+
+        if ($IncludeHostFallback) {
+            $buildMatch = Test-HostBuildMatchesGuest
+            if ($buildMatch.Matches) {
+                $hostCodeIntegrityPath = Join-Path $env:SystemRoot (Join-Path 'System32\CodeIntegrity' $Spec.FileName)
+                Add-CodeIntegrityCandidate -Candidates $candidates -Spec $Spec -Path $hostCodeIntegrityPath -Source "HostSystem32CodeIntegrity ($($buildMatch.Host))" -Priority 2 -ReferenceVersion $ReferenceVersion
+
+                $hostWinsxsDir = Join-Path $env:SystemRoot 'WinSxS'
+                if (Test-Path -LiteralPath $hostWinsxsDir) {
+                    Get-ChildItem -Path $hostWinsxsDir -Directory -Filter $Spec.ComponentDirectoryFilter -ErrorAction SilentlyContinue |
+                    ForEach-Object {
+                        Add-CodeIntegrityCandidate -Candidates $candidates -Spec $Spec -Path (Join-Path $_.FullName $Spec.FileName) -Source "HostWinSxS ($($buildMatch.Host))" -Priority 3 -ReferenceVersion $ReferenceVersion
+                    }
+                }
+            }
+            else {
+                Write-Host "  Host fallback skipped for $($Spec.FileName): guest build $($buildMatch.Guest), host build $($buildMatch.Host) ($($buildMatch.Reason))." -ForegroundColor DarkGray
+            }
+        }
+
+        return @($candidates |
+            Sort-Object @{ Expression = 'Priority'; Ascending = $true },
+                        @{ Expression = { if ($ReferenceVersion -and $_.ComponentVersion -eq $ReferenceVersion) { 0 } else { 1 } } },
+                        @{ Expression = 'VersionObject'; Descending = $true },
+                        @{ Expression = 'Size'; Descending = $true },
+                        @{ Expression = 'LastWrite'; Descending = $true })
+    }
+
+    function Repair-CodeIntegrityPolicyPayloads {
+        param([string]$SourcePath = '')
+
+        $referenceCandidate = Get-CodeIntegrityReferenceCandidate
+        $referenceVersion = if ($referenceCandidate -and $referenceCandidate.ComponentVersion) { [string]$referenceCandidate.ComponentVersion } else { '' }
+        if ($referenceCandidate) {
+            Write-Host "`nCode Integrity component reference: $($referenceCandidate.ComponentVersion) ($($referenceCandidate.Path))" -ForegroundColor Cyan
+        }
+        else {
+            Write-Host "`nCode Integrity component reference could not be resolved from offline WinSxS; policy repair will use best available candidates." -ForegroundColor Yellow
+        }
+
+        foreach ($spec in (Get-CodeIntegrityPolicyPayloadSpec)) {
+            $targetPath = Join-Path $script:WinDriveLetter $spec.RelativePath
+            $targetItem = Get-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue
+            $targetHash = if ($targetItem -and $targetItem.Length -gt 0) { Get-CodeIntegrityFileHash -Path $targetPath } else { '' }
+            $candidates = @(Get-CodeIntegrityPolicyCandidates -Spec $spec -ReferenceVersion $referenceVersion -SourcePath $SourcePath -IncludeHostFallback)
+            $best = @($candidates | Select-Object -First 1)
+
+            Write-Host "`nChecking $($spec.Label):" -ForegroundColor Yellow
+            Write-Host "  Target: $targetPath" -ForegroundColor DarkGray
+            if ($targetItem) {
+                Write-Host "  Current: size=$($targetItem.Length), date=$($targetItem.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')), hash=$targetHash" -ForegroundColor DarkGray
+            }
+            else {
+                Write-Host "  Current: missing" -ForegroundColor DarkGray
+            }
+
+            if (-not $best) {
+                Write-Warning "  No usable replacement candidate found for $($spec.FileName) in the explicit source, offline WinSxS, or same-build host fallback."
+                Write-Warning "  Copy this file from a working VM with the same OS build/LCU into a folder and rerun with -CodeIntegrityPolicySourcePath <folder>."
+                continue
+            }
+
+            Write-Host "  Candidate: $($best.Path)" -ForegroundColor Cyan
+            Write-Host "    Source=$($best.Source), component=$($best.ComponentVersion), size=$($best.Size), date=$($best.LastWrite.ToString('yyyy-MM-dd HH:mm:ss')), hash=$($best.Hash)" -ForegroundColor DarkGray
+
+            if ($targetHash -and $targetHash -eq $best.Hash) {
+                Write-Host "  [OK] $($spec.FileName) already matches the selected Code Integrity payload candidate." -ForegroundColor Green
+                continue
+            }
+
+            if ($referenceVersion -and $best.ComponentVersion -and $best.ComponentVersion -ne $referenceVersion -and $best.Source -ne 'ExplicitSource') {
+                Write-Warning "  Selected $($spec.FileName) component version $($best.ComponentVersion) does not match Code Integrity reference $referenceVersion. Using best available candidate."
+            }
+            if ($best.Source -like 'Host*') {
+                Write-Warning "  Using same-build rescue host fallback for $($spec.FileName). Prefer offline WinSxS or an explicit known-good source when available."
+            }
+            if ($best.Source -eq 'ExplicitSource') {
+                Write-Warning "  Using explicit source for $($spec.FileName). Verify it came from a working VM with the same OS build/LCU."
+            }
+
+            if ($targetItem) {
+                $backupPath = New-UniqueBackupPath -BasePath $targetPath -BakSuffix '.codeintegrity.bak'
+                Write-Host "  Backing up current $($spec.FileName): $targetPath -> $backupPath" -ForegroundColor DarkGray
+                Invoke-Logged -Description "Backup $($spec.FileName)" -Details @{ Source = $targetPath; BackupPath = $backupPath } -ScriptBlock {
+                    Copy-Item -LiteralPath $targetPath -Destination $backupPath -Force -ErrorAction Stop
+                }
+            }
+
+            $targetDir = Split-Path -Parent $targetPath
+            if (-not (Test-Path -LiteralPath $targetDir)) {
+                New-Item-Logged -Path $targetDir -ItemType Directory -Force
+            }
+
+            Invoke-Logged -Description "Replace $($spec.FileName)" -Details @{ Source = $best.Path; Destination = $targetPath; SourceType = $best.Source; ComponentVersion = $best.ComponentVersion } -ScriptBlock {
+                Copy-Item -LiteralPath $best.Path -Destination $targetPath -Force -ErrorAction Stop
+            }
+
+            try {
+                $protectedAcl = New-ProtectedSystemFileAcl
+                Set-Acl -LiteralPath $targetPath -AclObject $protectedAcl -ErrorAction Stop
+                Write-Host "  [OK] Applied protected Windows system-file ACL/owner baseline." -ForegroundColor Green
+            }
+            catch {
+                Write-Warning "  Replaced $($spec.FileName), but could not apply protected system-file ACL/owner: $_"
+            }
+
+            $newItem = Get-Item -LiteralPath $targetPath -Force -ErrorAction Stop
+            $newHash = Get-CodeIntegrityFileHash -Path $targetPath
+            if ($newItem.Length -ne $best.Size -or $newHash -ne $best.Hash) {
+                throw "Copy verification failed for $targetPath (expected hash $($best.Hash), got $newHash)."
+            }
+
+            Write-ActionLog -Event 'CodeIntegrityPolicyPayloadRepaired' -Details @{
+                FileName         = $spec.FileName
+                TargetPath       = $targetPath
+                SourcePath       = $best.Path
+                Source           = $best.Source
+                ComponentVersion = $best.ComponentVersion
+                PreviousHash     = $targetHash
+                NewHash          = $newHash
+            }
+            Write-Host "  [OK] Replaced $($spec.FileName) with matching Code Integrity payload candidate." -ForegroundColor Green
+        }
+    }
+
     function RepairSecureBootCodeIntegrity {
+        param([string]$CodeIntegrityPolicySourcePath = '')
+
         if ($script:VMGen -ne 2) {
             Write-Error "-FixSecureBootCodeIntegrity applies only to Generation 2 / UEFI disks. Gen1 disks do not have an EFI System Partition."
+            return
+        }
+        if (-not [string]::IsNullOrWhiteSpace($CodeIntegrityPolicySourcePath) -and -not (Test-Path -LiteralPath $CodeIntegrityPolicySourcePath)) {
+            Write-Error "Code Integrity policy source path does not exist: $CodeIntegrityPolicySourcePath"
             return
         }
 
         $sourceBootManager = Join-Path $script:WinDriveLetter 'Windows\Boot\EFI\bootmgfw.efi'
         $sourceSkuPolicy = Join-Path $script:WinDriveLetter 'Windows\System32\SecureBootUpdates\SKUSiPolicy.p7b'
+        $ciPolicySourceLabel = if ([string]::IsNullOrWhiteSpace($CodeIntegrityPolicySourcePath)) { 'offline WinSxS first, then same-build rescue host fallback' } else { $CodeIntegrityPolicySourcePath }
         $microsoftBootDir = Join-Path $script:BootDriveLetter 'EFI\Microsoft\Boot'
         $fallbackBootDir = Join-Path $script:BootDriveLetter 'EFI\Boot'
         $destBootManager = Join-Path $microsoftBootDir 'bootmgfw.efi'
@@ -2483,13 +2893,16 @@ Refreshes the Gen2 EFI System Partition from the offline Windows installation:
   Target fallback     : $destFallbackBoot
   Source SKU policy   : $sourceSkuPolicy
   Target SKU policy   : $destSkuPolicy
+    CI payload source   : $ciPolicySourceLabel
 
 This targets Gen2 winload.efi / Code Integrity recovery failures such as
 0xc0430001 when the EFI System Partition has stale or missing boot manager
-and SKUSiPolicy.p7b files compared with the offline Windows installation.
+and SKUSiPolicy.p7b files, or when OS CodeIntegrity policy payloads such as
+Driver.stl and DriverSiPolicy.p7b are stale compared with the component store.
 
 Before the EFI copy, it also runs targeted offline SFC repairs for winload.efi,
-ci.dll, kernel/HAL, and related OS-loader dependencies on the Windows partition.
+ci.dll, Driver.stl, DriverSiPolicy.p7b, kernel/HAL, and related OS-loader
+dependencies on the Windows partition.
 "@)) { return }
 
         $loaderRepairTargets = @(
@@ -2505,6 +2918,8 @@ ci.dll, kernel/HAL, and related OS-loader dependencies on the Windows partition.
             @{ RelativePath = 'Windows\System32\hvloader.dll'; Label = 'Hyper-V loader (hvloader.dll)'; Optional = $true }
             @{ RelativePath = 'Windows\System32\hvix64.exe'; Label = 'Hyper-V hypervisor image (hvix64.exe)'; Optional = $true }
             @{ RelativePath = 'Windows\System32\CodeIntegrity\SiPolicy.p7b'; Label = 'Code Integrity policy (SiPolicy.p7b)'; Optional = $true }
+            @{ RelativePath = 'Windows\System32\CodeIntegrity\Driver.stl'; Label = 'Code Integrity driver revocation list (Driver.stl)'; Optional = $false }
+            @{ RelativePath = 'Windows\System32\CodeIntegrity\DriverSiPolicy.p7b'; Label = 'Code Integrity driver signing policy (DriverSiPolicy.p7b)'; Optional = $false }
             @{ RelativePath = 'Windows\System32\SecureBootUpdates\SKUSiPolicy.p7b'; Label = 'Secure Boot SKU policy source (SKUSiPolicy.p7b)'; Optional = $false }
         )
 
@@ -2512,6 +2927,9 @@ ci.dll, kernel/HAL, and related OS-loader dependencies on the Windows partition.
         foreach ($target in $loaderRepairTargets) {
             Invoke-OfflineSfcScanFile -RelativePath $target.RelativePath -Label $target.Label -Optional:([bool]$target.Optional)
         }
+
+        Write-Host "`nValidating Code Integrity driver policy payloads against available source candidates..." -ForegroundColor Yellow
+        Repair-CodeIntegrityPolicyPayloads -SourcePath $CodeIntegrityPolicySourcePath
 
         $missingSources = @()
         if (-not (Test-Path -LiteralPath $sourceBootManager)) { $missingSources += $sourceBootManager }
@@ -2571,6 +2989,7 @@ ci.dll, kernel/HAL, and related OS-loader dependencies on the Windows partition.
             DestFallbackBoot  = $destFallbackBoot
             SourceSkuPolicy   = $sourceSkuPolicy
             DestSkuPolicy     = $destSkuPolicy
+            CiPolicySource    = $ciPolicySourceLabel
         }
         Write-Host "Secure Boot / Code Integrity boot files refreshed." -ForegroundColor Green
         Write-Host "If Secure Boot was disabled as a workaround, shut down the VM, re-enable Secure Boot, then test boot." -ForegroundColor Yellow
@@ -6539,10 +6958,12 @@ complete recovery.
             }
             else {
                 # Binary exists and is non-zero  -  verify Microsoft signature
-                $sigCheck = Test-MicrosoftSignature -FilePath $bf.Path
-                if (-not $sigCheck.IsMicrosoft) {
-                    & $emit 'Security' (& $toSev $sevBinarySignatureBad) "$($bf.Name) is NOT Microsoft-signed (status=$($sigCheck.Status), subject='$($sigCheck.Subject)') - possible tampering or corruption" $bf.Fix
-                    $sigIssues++
+                if (-not ([bool]$bf.SkipSignature)) {
+                    $sigCheck = Test-MicrosoftSignature -FilePath $bf.Path
+                    if (-not $sigCheck.IsMicrosoft) {
+                        & $emit 'Security' (& $toSev $sevBinarySignatureBad) "$($bf.Name) is NOT Microsoft-signed (status=$($sigCheck.Status), subject='$($sigCheck.Subject)') - possible tampering or corruption" $bf.Fix
+                        $sigIssues++
+                    }
                 }
             }
         }
@@ -8861,6 +9282,8 @@ to .disabled extension. Does NOT remove them; they can be re-enabled by renaming
             @{ Name = 'ntoskrnl.exe'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\ntoskrnl.exe'); Category = 'Kernel & HAL' }
             @{ Name = 'hal.dll'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\hal.dll'); Category = 'Kernel & HAL' }
             @{ Name = 'ci.dll'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\ci.dll'); Category = 'Kernel & HAL' }
+            @{ Name = 'Driver.stl'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\CodeIntegrity\Driver.stl'); Category = 'Code Integrity Policy'; Optional = $true }
+            @{ Name = 'DriverSiPolicy.p7b'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\CodeIntegrity\DriverSiPolicy.p7b'); Category = 'Code Integrity Policy'; Optional = $true }
             @{ Name = 'ntdll.dll'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\ntdll.dll'); Category = 'Core DLL' }
             @{ Name = 'kernel32.dll'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\kernel32.dll'); Category = 'Core DLL' }
             @{ Name = 'smss.exe'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\smss.exe'); Category = 'Session Init' }
@@ -8902,7 +9325,7 @@ to .disabled extension. Does NOT remove them; they can be re-enabled by renaming
             $size = if ($exists) { (Get-Item -LiteralPath $c.Path -Force -ErrorAction SilentlyContinue).Length } else { 0 }
             # Signature check for existing non-zero binaries (skip BCD store  -  it's not a PE)
             $sigStatus = ''
-            if ($exists -and $size -gt 0 -and $c.Name -ne 'BCD store') {
+            if ($exists -and $size -gt 0 -and $c.Name -ne 'BCD store' -and -not ([bool]$c.SkipSignature)) {
                 $sig = Test-MicrosoftSignature -FilePath $c.Path
                 $sigStatus = if ($sig.IsMicrosoft) { 'Microsoft' } elseif ($sig.IsSigned) { "Signed: $($sig.Subject)" } else { $sig.Status }
             }
@@ -8913,11 +9336,12 @@ to .disabled extension. Does NOT remove them; they can be re-enabled by renaming
                 Size      = if ($exists) { "{0:N0}" -f $size } else { '' }
                 Signature = $sigStatus
                 Path      = $c.Path
+                Optional  = [bool]$c.Optional
             }
         }
 
         $rows | Format-Table Category, Artifact, Exists, Size, Signature, Path -AutoSize
-        $missing = @($rows | Where-Object { -not $_.Exists })
+        $missing = @($rows | Where-Object { -not $_.Exists -and -not $_.Optional })
         $zeroLen = @($rows | Where-Object { $_.Exists -and $_.Size -eq '0' })
         $notMsSigned = @($rows | Where-Object { $_.Signature -and $_.Signature -ne 'Microsoft' -and $_.Artifact -ne 'BCD store' })
         if ($missing.Count -gt 0) {
@@ -10057,25 +10481,25 @@ Use this when stale proxy/PAC settings prevent WinRM/RDP reachability after migr
 
             # 4a. Core kernel-phase executables
             $kernelInitFiles = @(
-                @{ Label = 'ntdll.dll (NT Layer DLL)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\ntdll.dll') }
-                @{ Label = 'smss.exe (Session Manager)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\smss.exe') }
-                @{ Label = 'csrss.exe (Client/Server Runtime)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\csrss.exe') }
-                @{ Label = 'wininit.exe (Windows Init Process)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\wininit.exe') }
-                @{ Label = 'services.exe (Service Control Manager)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\services.exe') }
+                @{ Label = 'ntoskrnl.exe (Kernel)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\ntoskrnl.exe'); Fix = '-RepairSystemFile ntoskrnl.exe' }
+                @{ Label = 'hal.dll (HAL)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\hal.dll'); Fix = '-RepairSystemFile hal.dll' }
+                @{ Label = 'ci.dll (Code Integrity)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\ci.dll'); Fix = '-RepairSystemFile ci.dll' }
+                @{ Label = 'kdcom.dll'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\kdcom.dll'); Fix = '-RepairSystemFile kdcom.dll' }
+                @{ Label = 'pshed.dll'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\pshed.dll'); Fix = '-RepairSystemFile pshed.dll' }
                 @{ Label = 'lsass.exe (Local Security Authority)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\lsass.exe') }
                 @{ Label = 'svchost.exe (Service Host)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\svchost.exe') }
-                @{ Label = 'kernel32.dll (Win32 Kernel)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\kernel32.dll') }
                 @{ Label = 'KernelBase.dll (Kernel Base)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\KernelBase.dll') }
                 @{ Label = 'advapi32.dll (Advanced API)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\advapi32.dll') }
-                @{ Label = 'rpcrt4.dll (RPC Runtime)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\rpcrt4.dll') }
             )
             foreach ($kif in $kernelInitFiles) {
-                $r = Test-BootFile -Path $kif.Path -Label $kif.Label
+                $r = Test-BootFile -Path $kif.Path -Label $kif.Label -SkipSignature:([bool]$kif.SkipSignature)
                 Write-ChainItem -Label $kif.Label -Status $r.Health -Detail $r.Detail
                 $totalChecks++
-                if ($r.Health -ne 'OK') { $issues.Add([PSCustomObject]@{ Phase = 4; Severity = $r.Health; Message = "$($kif.Label): $($r.Detail)"; Fix = "-RepairSystemFile $(Split-Path -Leaf $kif.Path)" }) }
+                if ($r.Health -ne 'OK') {
+                    $fix = if ($kif.Fix) { $kif.Fix } else { "-RepairSystemFile $(Split-Path -Leaf $kif.Path)" }
+                    $issues.Add([PSCustomObject]@{ Phase = 4; Severity = $r.Health; Message = "$($kif.Label): $($r.Detail)"; Fix = $fix })
+                }
             }
-
             # 4b. Session Manager registry configuration
             Write-Host ""
             Write-Host "  $symCHAIN  $symARROW  Session Manager Configuration (BootExecute / SetupExecute)" -ForegroundColor White
@@ -11200,6 +11624,8 @@ No destructive file or registry cleanup is performed.
             [switch]$FixNTFS,
             [switch]$FixBoot,
             [switch]$FixSecureBootCodeIntegrity,
+            [string]$CodeIntegrityPolicySourcePath = '',
+            [switch]$Force,
             [switch]$FixBootSector,
             [switch]$FixBootStorageDrivers,
             [switch]$RecreateBootPartition,
@@ -11293,8 +11719,11 @@ No destructive file or registry cleanup is performed.
             [string]$DriveLetter = ''
         )
 
+        Show-RepairScriptVersionHeader
+
         # Identify the local OS disk (C: drive) to prevent accidental modification of the Hyper-V host
         $script:LocalOsDiskNumber = (Get-Partition -DriveLetter 'C' -ErrorAction SilentlyContinue).DiskNumber
+        $script:RepairForceConfirm = [bool]$Force
 
         # Show usage/disk list when called with no actionable parameters
         if ($DiskNumber -lt 0 -and [string]::IsNullOrWhiteSpace($VMName)) {
@@ -11310,6 +11739,7 @@ USAGE:
 PARAMETERS:
   -DiskNumber <int>      Disk number visible in Disk Management
   -VMName <string>       Hyper-V VM name (auto-detects disk, stops VM first)
+    -Force                 Bypass confirmation prompts for scripted repair runs
   -LeaveDiskOnline       Keep disk online after repairs (default: take offline)
   -LoadHive <hive[,...]> Mount one or more offline registry hives and leave them loaded for manual
                            inspection/editing (implies disk stays online). Valid: SYSTEM SOFTWARE COMPONENTS SAM SECURITY
@@ -11346,7 +11776,8 @@ PARAMETERS:
   -EnableTestSigning     Enable BCD test signing (allow unsigned drivers)
   -DisableTestSigning    Disable BCD test signing
   -FixBoot               Rebuild BCD from scratch
-    -FixSecureBootCodeIntegrity  Refresh Gen2 EFI boot manager + SKUSiPolicy.p7b for winload.efi / 0xc0430001
+        -FixSecureBootCodeIntegrity  Refresh Gen2 EFI boot manager + SKUSiPolicy.p7b and repair CodeIntegrity Driver.stl/DriverSiPolicy.p7b for winload.efi / 0xc0430001
+            -CodeIntegrityPolicySourcePath <path> Optional known-good CodeIntegrity folder/file source; otherwise uses offline WinSxS, then same-build rescue host fallback
   -FixBootSector         Repair MBR/VBR boot sector (Gen1/BIOS only; bootrec)
     -FixBootStorageDrivers Repair boot storage Start/StartOverride settings and recreate safe missing inbox service keys
   -RecreateBootPartition Recreate missing boot partition (System Reserved for Gen1, EFI SP for Gen2) and run bcdboot
@@ -11503,7 +11934,7 @@ AVAILABLE DISKS:
         # Initialize logging and target (resolve VM/disk, bring disk online, detect partitions)
         # Determine if any write/repair action was requested (exclude pure read-only switches)
         $readOnlySwitches = @('SysCheck', 'CheckDiskHealth', 'ScanNetBindings', 'CheckRDPPolicies', 'CollectEventLogs', 'CollectMinidumps', 'ShowLastSession', 'GetServicesReport', 'GetAppLockerReport', 'ListInstalledUpdates', 'ListStartupPrograms', 'AnalyzeCriticalBootFiles', 'AnalyzeSyntheticDrivers', 'AnalyzeProxyState', 'GetBootPathReport', 'AnalyzeBcdConsistency', 'AnalyzeComponentStore', 'AnalyzeServicingState', 'AnalyzeDomainTrustState')
-        $hasRepairAction = $PSBoundParameters.Keys | Where-Object { $readOnlySwitches -notcontains $_ -and $_ -notin @('VMName', 'DiskNumber', 'LeaveDiskOnline', 'DriveLetter', 'RepairSource', 'IncludeServices', 'IssuesOnly', 'KeepDefaultFilters', 'DriverStartType', 'LoadHive', 'UnloadHive') }
+        $hasRepairAction = $PSBoundParameters.Keys | Where-Object { $readOnlySwitches -notcontains $_ -and $_ -notin @('VMName', 'DiskNumber', 'Force', 'LeaveDiskOnline', 'DriveLetter', 'RepairSource', 'CodeIntegrityPolicySourcePath', 'IncludeServices', 'IssuesOnly', 'KeepDefaultFilters', 'DriverStartType', 'LoadHive', 'UnloadHive') }
         if ($hasRepairAction) {
             Write-Host "  Tip: if you haven't already, a VM snapshot or disk backup before making changes is always a safe starting point." -ForegroundColor DarkGray
             Write-Host ""
@@ -11522,7 +11953,7 @@ AVAILABLE DISKS:
         try {
             if ($FixNTFS) { FixDiskCorruption -DriveLetter $DriveLetter }
             if ($FixBoot) { RebuildBCD }
-            if ($FixSecureBootCodeIntegrity) { RepairSecureBootCodeIntegrity }
+            if ($FixSecureBootCodeIntegrity) { RepairSecureBootCodeIntegrity -CodeIntegrityPolicySourcePath $CodeIntegrityPolicySourcePath }
             if ($FixBootSector) { FixBootSector }
             if ($FixBootStorageDrivers) { FixBootStorageDrivers }
             if ($RecreateBootPartition) { RecreateBootPartition }
