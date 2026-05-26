@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.4.15
+        Version: 0.4.16
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -168,6 +168,7 @@ param (
     [Parameter(ParameterSetName = 'Repair')][switch]$GetBootPathReport,
     [Parameter(ParameterSetName = 'Repair')][switch]$AnalyzeBcdConsistency,
     [Parameter(ParameterSetName = 'Repair')][switch]$AnalyzeServicingState,
+    [Parameter(ParameterSetName = 'Repair')][switch]$AnalyzeRecentChanges,
     [Parameter(ParameterSetName = 'Repair')][switch]$AnalyzeDomainTrustState,
     [Parameter(ParameterSetName = 'Repair')][switch]$PrepareRecoveryDiagnostics,
     [Parameter(ParameterSetName = 'Repair')][switch]$DisableDriverVerifier,
@@ -228,6 +229,11 @@ dynamicparam {
         $vs = [System.Management.Automation.ValidateSetAttribute]::new(
             'Boot', 'System', 'Automatic', 'Manual', 'Disabled')
         & $addParam 'DriverStartType' ([string]) 'Repair' $null @($vs) $true
+    }
+    # -RecentChangeDays: sub-option of -AnalyzeRecentChanges
+    if ($PSBoundParameters.ContainsKey('AnalyzeRecentChanges')) {
+        $vr = [System.Management.Automation.ValidateRangeAttribute]::new(1, 180)
+        & $addParam 'RecentChangeDays' ([int]) 'Repair' 14 @($vr)
     }
     # -Detailed, -All, -SessionId, -ExportTo: sub-options of -ShowLastSession
     if ($PSBoundParameters.ContainsKey('ShowLastSession')) {
@@ -1394,14 +1400,27 @@ $($htmlRows -join "`n")
     function Invoke-WithHive {
         # Mounts one or more offline registry hives, executes the given script block,
         # and guarantees the hives are unmounted in the finally block (reverse order).
+        # Nested calls are reference-counted so a collector can reuse an outer mount
+        # without unloading it out from under the caller.
         # Usage:  Invoke-WithHive 'SYSTEM' { <body> }
         #         Invoke-WithHive 'SYSTEM','SOFTWARE' { <body> }
         param(
             [Parameter(Mandatory)][string[]]$Hive,
             [Parameter(Mandatory)][scriptblock]$ScriptBlock
         )
+        if (-not (Get-Variable -Name OfflineHiveLoadDepth -Scope Script -ErrorAction SilentlyContinue)) { $script:OfflineHiveLoadDepth = @{} }
+
         $wp = Join-Path $script:WinDriveLetter "Windows"
-        foreach ($h in $Hive) { MountOffHive -WinPath $wp -Hive $h }
+        $mountedHere = [System.Collections.Generic.List[string]]::new()
+        foreach ($h in $Hive) {
+            $hiveName = $h.ToUpperInvariant()
+            $depth = if ($script:OfflineHiveLoadDepth.ContainsKey($hiveName)) { [int]$script:OfflineHiveLoadDepth[$hiveName] } else { 0 }
+            if ($depth -eq 0) {
+                MountOffHive -WinPath $wp -Hive $hiveName
+                $mountedHere.Add($hiveName) | Out-Null
+            }
+            $script:OfflineHiveLoadDepth[$hiveName] = $depth + 1
+        }
         try {
             # Opportunistically capture the guest computer name the first time
             # the SYSTEM hive is loaded for any reason (avoids a dedicated load).
@@ -1419,7 +1438,17 @@ $($htmlRows -join "`n")
             & $ScriptBlock
         }
         finally {
-            for ($i = $Hive.Count - 1; $i -ge 0; $i--) { UnmountOffHive -Hive $Hive[$i] }
+            for ($i = $Hive.Count - 1; $i -ge 0; $i--) {
+                $hiveName = $Hive[$i].ToUpperInvariant()
+                $depth = if ($script:OfflineHiveLoadDepth.ContainsKey($hiveName)) { [int]$script:OfflineHiveLoadDepth[$hiveName] } else { 0 }
+                if ($depth -le 1) {
+                    $script:OfflineHiveLoadDepth.Remove($hiveName)
+                    if ($mountedHere.Contains($hiveName)) { UnmountOffHive -Hive $hiveName }
+                }
+                else {
+                    $script:OfflineHiveLoadDepth[$hiveName] = $depth - 1
+                }
+            }
         }
     }
 
@@ -11184,6 +11213,930 @@ Use this when stale proxy/PAC settings prevent WinRM/RDP reachability after migr
         Write-Host "build $fullBuild is the most reliable source for the exact file versions needed." -ForegroundColor DarkGray
     }
 
+    function Ensure-RecentChangeRegistryLastWriteAccessor {
+        if (([System.Management.Automation.PSTypeName]'RepairAzVmDiskRegistryLastWrite').Type) { return }
+
+        $source = @"
+using System;
+using System.Runtime.InteropServices;
+public static class RepairAzVmDiskRegistryLastWrite {
+  [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  public static extern int RegQueryInfoKey(IntPtr hKey, System.Text.StringBuilder lpClass, ref uint lpcchClass, IntPtr lpReserved, out uint lpcSubKeys, out uint lpcbMaxSubKeyLen, out uint lpcbMaxClassLen, out uint lpcValues, out uint lpcbMaxValueNameLen, out uint lpcbMaxValueLen, out uint lpcbSecurityDescriptor, out long lpftLastWriteTime);
+  public static object GetLastWriteTime(Microsoft.Win32.RegistryKey key) {
+    if (key == null) return null;
+    uint classLength = 0, subKeys, maxSubKeyLength, maxClassLength, values, maxValueNameLength, maxValueLength, securityDescriptor;
+    long fileTime;
+    int result = RegQueryInfoKey(key.Handle.DangerousGetHandle(), null, ref classLength, IntPtr.Zero, out subKeys, out maxSubKeyLength, out maxClassLength, out values, out maxValueNameLength, out maxValueLength, out securityDescriptor, out fileTime);
+    if (result != 0) return null;
+    return DateTime.FromFileTimeUtc(fileTime).ToLocalTime();
+  }
+}
+"@
+        Add-Type -TypeDefinition $source -ErrorAction Stop
+    }
+
+    function Get-RegistryKeyLastWriteTime {
+        param([Parameter(Mandatory = $true)][string]$Path)
+
+        try { Ensure-RecentChangeRegistryLastWriteAccessor }
+        catch { return $null }
+
+        $subKey = ''
+        if ($Path -match '^Microsoft\.PowerShell\.Core\\Registry::HKEY_LOCAL_MACHINE\\(.+)$') {
+            $subKey = $Matches[1]
+        }
+        elseif ($Path -match '^HKEY_LOCAL_MACHINE\\(.+)$') {
+            $subKey = $Matches[1]
+        }
+        elseif ($Path -match '^HKLM:\\(.+)$') {
+            $subKey = $Matches[1]
+        }
+        else {
+            return $null
+        }
+
+        $registryKey = $null
+        try {
+            $registryKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($subKey)
+            if (-not $registryKey) { return $null }
+            $lastWrite = [RepairAzVmDiskRegistryLastWrite]::GetLastWriteTime($registryKey)
+            if ($lastWrite) { return [datetime]$lastWrite }
+        }
+        catch { return $null }
+        finally { if ($registryKey) { $registryKey.Close() } }
+        return $null
+    }
+
+    function ConvertTo-RecentChangeShortText {
+        param([string]$Text, [int]$MaxLength = 180)
+        if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+        $trimmed = $Text.Trim()
+        if ($trimmed.Length -le $MaxLength) { return $trimmed }
+        return ($trimmed.Substring(0, $MaxLength) + '...')
+    }
+
+    function Get-RecentChangeTimestampFromText {
+        param([string]$Text)
+
+        if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+        $culture = [System.Globalization.CultureInfo]::InvariantCulture
+        $styles = [System.Globalization.DateTimeStyles]::AssumeLocal
+        if ($Text -match '(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})') {
+            $value = $Matches[1] + ' ' + $Matches[2]
+            $parsed = [datetime]::MinValue
+            if ([datetime]::TryParseExact($value, 'yyyy-MM-dd HH:mm:ss', $culture, $styles, [ref]$parsed)) { return $parsed }
+        }
+        if ($Text -match '(\d{4}/\d{2}/\d{2})\s+(\d{2}:\d{2}:\d{2})(?:\.\d+)?') {
+            $value = $Matches[1] + ' ' + $Matches[2]
+            $parsed = [datetime]::MinValue
+            if ([datetime]::TryParseExact($value, 'yyyy/MM/dd HH:mm:ss', $culture, $styles, [ref]$parsed)) { return $parsed }
+        }
+        return $null
+    }
+
+    function ConvertFrom-RecentChangeInstallDate {
+        param([string]$InstallDate)
+
+        if ([string]::IsNullOrWhiteSpace($InstallDate) -or $InstallDate -notmatch '^\d{8}$') { return $null }
+        $parsed = [datetime]::MinValue
+        if ([datetime]::TryParseExact($InstallDate, 'yyyyMMdd', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeLocal, [ref]$parsed)) {
+            return $parsed
+        }
+        return $null
+    }
+
+    function New-RecentChangeFinding {
+        param(
+            [ValidateSet('CRITICAL', 'WARN', 'INFO')][string]$Severity = 'INFO',
+            [int]$Priority = 80,
+            [string]$Category = 'General',
+            [Nullable[datetime]]$Timestamp = $null,
+            [string]$Source = '',
+            [string]$Item = '',
+            [string]$ChangeType = '',
+            [string]$Evidence = '',
+            [string]$Confidence = 'Medium',
+            [string]$LikelyImpact = '',
+            [string]$SuggestedNextStep = '',
+            [string]$SuggestedRepairSwitch = '',
+            [string]$Path = ''
+        )
+
+        [PSCustomObject]@{
+            Severity              = $Severity
+            Priority              = $Priority
+            Category              = $Category
+            Timestamp             = $Timestamp
+            Source                = $Source
+            Item                  = $Item
+            ChangeType            = $ChangeType
+            Evidence              = ConvertTo-RecentChangeShortText -Text $Evidence -MaxLength 600
+            Confidence            = $Confidence
+            LikelyImpact          = $LikelyImpact
+            SuggestedNextStep     = $SuggestedNextStep
+            SuggestedRepairSwitch = $SuggestedRepairSwitch
+            Path                  = $Path
+        }
+    }
+
+    function Add-RecentChangeFinding {
+        param(
+            [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Findings,
+            [ValidateSet('CRITICAL', 'WARN', 'INFO')][string]$Severity = 'INFO',
+            [int]$Priority = 80,
+            [string]$Category = 'General',
+            [Nullable[datetime]]$Timestamp = $null,
+            [string]$Source = '',
+            [string]$Item = '',
+            [string]$ChangeType = '',
+            [string]$Evidence = '',
+            [string]$Confidence = 'Medium',
+            [string]$LikelyImpact = '',
+            [string]$SuggestedNextStep = '',
+            [string]$SuggestedRepairSwitch = '',
+            [string]$Path = ''
+        )
+
+        $Findings.Add((New-RecentChangeFinding -Severity $Severity -Priority $Priority -Category $Category -Timestamp $Timestamp -Source $Source -Item $Item -ChangeType $ChangeType -Evidence $Evidence -Confidence $Confidence -LikelyImpact $LikelyImpact -SuggestedNextStep $SuggestedNextStep -SuggestedRepairSwitch $SuggestedRepairSwitch -Path $Path)) | Out-Null
+    }
+
+    function Add-RecentChangeCollectorFailure {
+        param(
+            [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Findings,
+            [Parameter(Mandatory = $true)][string]$Collector,
+            [Parameter(Mandatory = $true)][string]$ErrorText
+        )
+
+        Add-RecentChangeFinding -Findings $Findings -Severity 'INFO' -Priority 95 -Category 'Analyzer' -Timestamp (Get-Date) -Source $Collector -Item $Collector -ChangeType 'CollectorSkipped' -Evidence $ErrorText -Confidence 'High' -LikelyImpact 'This collector could not complete; other evidence is still usable.'
+    }
+
+    function Read-RecentChangeLogMatches {
+        param(
+            [Parameter(Mandatory = $true)][string]$Path,
+            [Parameter(Mandatory = $true)][string]$Pattern,
+            [Parameter(Mandatory = $true)][datetime]$Cutoff,
+            [int]$Tail = 6000,
+            [int]$Limit = 50
+        )
+
+        $matches = [System.Collections.Generic.List[object]]::new()
+        if (-not (Test-Path -LiteralPath $Path)) { return @() }
+        try {
+            $lines = Get-Content -LiteralPath $Path -Tail $Tail -ErrorAction Stop
+            foreach ($line in $lines) {
+                if ($line -notmatch $Pattern) { continue }
+                $timestamp = Get-RecentChangeTimestampFromText -Text $line
+                if ($timestamp -and $timestamp -lt $Cutoff) { continue }
+                $matches.Add([PSCustomObject]@{ Timestamp = $timestamp; Line = [string]$line }) | Out-Null
+                if ($matches.Count -ge $Limit) { break }
+            }
+        }
+        catch {}
+        return @($matches)
+    }
+
+    function Add-RecentChangeServicingFindings {
+        param(
+            [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Findings,
+            [Parameter(Mandatory = $true)][datetime]$Cutoff
+        )
+
+        $windowsRoot = Join-Path $script:WinDriveLetter 'Windows'
+        $pendingXml = Join-Path $windowsRoot 'WinSxS\pending.xml'
+        if (Test-Path -LiteralPath $pendingXml) {
+            $pendingItem = Get-Item -LiteralPath $pendingXml -Force -ErrorAction SilentlyContinue
+            Add-RecentChangeFinding -Findings $Findings -Severity 'WARN' -Priority 25 -Category 'Servicing' -Timestamp $pendingItem.LastWriteTime -Source 'pending.xml' -Item 'pending.xml' -ChangeType 'PendingServicing' -Evidence 'Windows\WinSxS\pending.xml is present.' -Confidence 'High' -LikelyImpact 'The guest may be stuck completing or rolling back servicing operations.' -SuggestedNextStep 'Review servicing state before removing pending transactions.' -SuggestedRepairSwitch '-AnalyzeServicingState / -FixPendingUpdates' -Path $pendingXml
+        }
+
+        $cbsLog = Join-Path $windowsRoot 'Logs\CBS\CBS.log'
+        foreach ($entry in (Read-RecentChangeLogMatches -Path $cbsLog -Pattern 'Package_for_|KB\d{6,}|Failed|failure|error|Reboot required|corrupt|rollback|Session:' -Cutoff $Cutoff -Tail 8000 -Limit 40)) {
+            $line = [string]$entry.Line
+            $severity = 'INFO'
+            $priority = 70
+            $impact = 'Recent component servicing activity was observed.'
+            $nextStep = 'Review CBS and servicing state if the boot failure began after updates.'
+            $switch = '-AnalyzeServicingState'
+            if ($line -match 'CSI Payload Corrupt|CSI Manifest Corrupt|CBS_E_STORE_CORRUPTION|Mark store corruption') {
+                $severity = 'CRITICAL'; $priority = 15; $impact = 'Component store corruption can block updates, repair, or boot.'; $switch = '-AnalyzeComponentStore'
+            }
+            elseif ($line -match 'Failed|failure|\[HRESULT = 0x(?!00000000)|CBS_E_|error') {
+                $severity = 'WARN'; $priority = 35; $impact = 'A recent CBS package or session error may be related to update rollback or boot loops.'; $switch = '-AnalyzeServicingState'
+            }
+            elseif ($line -match 'Reboot required|pending') {
+                $severity = 'WARN'; $priority = 40; $impact = 'Pending reboot servicing can explain update-stage boot loops.'; $switch = '-AnalyzeServicingState'
+            }
+            $item = if ($line -match '(KB\d{6,8})') { $Matches[1] } elseif ($line -match '(Package_for_[^,\s]+)') { $Matches[1] } else { 'CBS.log' }
+            Add-RecentChangeFinding -Findings $Findings -Severity $severity -Priority $priority -Category 'Servicing' -Timestamp $entry.Timestamp -Source 'CBS.log' -Item $item -ChangeType 'ServicingLog' -Evidence $line -Confidence 'Medium' -LikelyImpact $impact -SuggestedNextStep $nextStep -SuggestedRepairSwitch $switch -Path $cbsLog
+        }
+
+        $dismLog = Join-Path $windowsRoot 'Logs\DISM\dism.log'
+        foreach ($entry in (Read-RecentChangeLogMatches -Path $dismLog -Pattern 'Error|Warning|Failed|Package|RestoreHealth|ScanHealth|Add-Package|Remove-Package' -Cutoff $Cutoff -Tail 5000 -Limit 30)) {
+            $line = [string]$entry.Line
+            $severity = 'INFO'
+            $priority = 75
+            $impact = 'DISM activity was observed in the recent window.'
+            if ($line -match 'Failed to create dismhost|InternalExecute failed|DismOpenSessionInternal|RestoreHealth|ScanHealth|Add-Package|Remove-Package') {
+                $severity = 'WARN'; $priority = 45; $impact = 'A recent DISM operation failed or changed the servicing state.'
+            }
+            elseif ($line -match 'Failed to Load the provider') {
+                $severity = 'INFO'; $priority = 88; $impact = 'Provider-load warnings are often non-fatal during offline DISM probing.'
+            }
+            Add-RecentChangeFinding -Findings $Findings -Severity $severity -Priority $priority -Category 'Servicing' -Timestamp $entry.Timestamp -Source 'DISM.log' -Item 'DISM' -ChangeType 'DismLog' -Evidence $line -Confidence 'Medium' -LikelyImpact $impact -SuggestedNextStep 'Review DISM.log only if servicing or component-store symptoms match.' -SuggestedRepairSwitch '-AnalyzeComponentStore' -Path $dismLog
+        }
+
+        Invoke-WithHive 'SOFTWARE', 'COMPONENTS' {
+            & {
+                $cbsRoot = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing'
+                foreach ($subName in @('PackagesPending', 'SessionsPending', 'RebootPending')) {
+                    $subPath = Join-Path $cbsRoot $subName
+                    if (-not (Test-Path $subPath)) { continue }
+                    $lastWrite = Get-RegistryKeyLastWriteTime -Path $subPath
+                    $childCount = (Get-ChildItem $subPath -ErrorAction SilentlyContinue | Measure-Object).Count
+                    $isRecentPendingMarker = ($lastWrite -and $lastWrite -ge $Cutoff)
+                    $pendingSeverity = if ($isRecentPendingMarker) { 'WARN' } else { 'INFO' }
+                    $pendingPriority = if ($isRecentPendingMarker) { 30 } else { 86 }
+                    $pendingImpact = if ($isRecentPendingMarker) { 'Recent pending servicing registry markers can indicate interrupted updates or rollback loops.' } else { 'Pending servicing registry markers exist, but their key timestamp is outside the selected recent-change window.' }
+                    Add-RecentChangeFinding -Findings $Findings -Severity $pendingSeverity -Priority $pendingPriority -Category 'Servicing' -Timestamp $lastWrite -Source 'CBS registry' -Item $subName -ChangeType 'PendingServicingRegistry' -Evidence "$subName exists with $childCount child item(s)." -Confidence 'High' -LikelyImpact $pendingImpact -SuggestedNextStep 'Review servicing state and CBS log before applying repairs.' -SuggestedRepairSwitch '-AnalyzeServicingState' -Path $subPath
+                }
+
+                $componentRoot = 'HKLM:\BROKENCOMPONENTS'
+                $componentProps = Get-ItemProperty $componentRoot -ErrorAction SilentlyContinue
+                if ($componentProps) {
+                    foreach ($propertyName in @('ExecutionState', 'PendingXmlIdentifier', 'StoreDirty')) {
+                        $propertyValue = $componentProps.$propertyName
+                        if ($null -eq $propertyValue -or $propertyValue -eq 0 -or $propertyValue -eq '') { continue }
+                        $lastWrite = Get-RegistryKeyLastWriteTime -Path $componentRoot
+                        Add-RecentChangeFinding -Findings $Findings -Severity 'WARN' -Priority 35 -Category 'Servicing' -Timestamp $lastWrite -Source 'COMPONENTS hive' -Item $propertyName -ChangeType 'ComponentStoreState' -Evidence "$propertyName = $propertyValue" -Confidence 'High' -LikelyImpact 'The COMPONENTS hive records active or dirty servicing state.' -SuggestedNextStep 'Review CBS pending state and avoid blind package removal.' -SuggestedRepairSwitch '-AnalyzeServicingState' -Path $componentRoot
+                    }
+                }
+            }
+        }
+    }
+
+    function Add-RecentChangeSetupApiFindings {
+        param(
+            [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Findings,
+            [Parameter(Mandatory = $true)][datetime]$Cutoff
+        )
+
+        $infRoot = Join-Path $script:WinDriveLetter 'Windows\INF'
+        $logs = @(
+            @{ Name = 'setupapi.dev.log'; Path = (Join-Path $infRoot 'setupapi.dev.log') }
+            @{ Name = 'setupapi.app.log'; Path = (Join-Path $infRoot 'setupapi.app.log') }
+            @{ Name = 'setupapi.offline.log'; Path = (Join-Path $infRoot 'setupapi.offline.log') }
+        )
+
+        foreach ($log in $logs) {
+            if (-not (Test-Path -LiteralPath $log.Path)) { continue }
+            $currentSection = ''
+            $sectionStart = $null
+            $reported = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $offlineHiveUnloadMatches = [System.Collections.Generic.List[object]]::new()
+            try {
+                foreach ($line in (Get-Content -LiteralPath $log.Path -Tail 7000 -ErrorAction Stop)) {
+                    if ($line -match '^>>>\s+\[(.+)\]') {
+                        $currentSection = $Matches[1]
+                        continue
+                    }
+                    if ($line -match '^>>>\s+Section start\s+(.+)$') {
+                        $sectionStart = Get-RecentChangeTimestampFromText -Text $line
+                        continue
+                    }
+                    if (-not $sectionStart -or $sectionStart -lt $Cutoff) { continue }
+
+                    if ($log.Name -eq 'setupapi.offline.log' -and $line -match '(?i)Unable to unload hive key.*Windows[\\/]+System32[\\/]+config[\\/]+(SYSTEM|DRIVERS|SOFTWARE|SECURITY|SAM|DEFAULT).*Error\s*=\s*(0x[0-9a-f]+)') {
+                        $offlineHiveUnloadMatches.Add([PSCustomObject]@{
+                            Timestamp = $sectionStart
+                            Section   = $currentSection
+                            Hive      = $Matches[1].ToUpperInvariant()
+                            Error     = $Matches[2]
+                        }) | Out-Null
+                        continue
+                    }
+
+                    if ($line -notmatch 'Configure Driver Package|Publish Driver Package|Unpublish Driver Package|Driver Package\s*=|Exit status|!!!|failed|error|Device Install|Driver Install') { continue }
+
+                    $severity = 'INFO'
+                    $priority = 72
+                    $impact = 'Recent driver or device setup activity was recorded.'
+                    if ($line -match '^<<<\s+\[Exit status:\s*SUCCESS\]') {
+                        $severity = 'INFO'; $priority = 82; $impact = 'Recent setupapi section completed successfully; supporting timeline evidence only.'
+                    }
+                    elseif ($line -match '!!!|failed|error|exit\(0x(?!00000000)|Exit status:\s*(?!SUCCESS)') {
+                        $severity = 'WARN'; $priority = 28; $impact = 'Failed driver/device setup can cause boot, storage, network, or device initialization problems.'
+                    }
+                    elseif ($currentSection -match 'Device Install|Driver Install|Install Driver Updates') {
+                        $priority = 55
+                    }
+
+                    $item = if ($line -match 'FileRepository\\([^\\]+)\\([^\\]+\.inf)') { $Matches[2] } elseif ($line -match 'Driver Package\s*=\s*(\S+)') { $Matches[1] } elseif ($currentSection) { $currentSection } else { $log.Name }
+                    $key = "$($log.Name)|$sectionStart|$item|$severity|$line"
+                    if (-not $reported.Add($key)) { continue }
+                    Add-RecentChangeFinding -Findings $Findings -Severity $severity -Priority $priority -Category 'DriverSetup' -Timestamp $sectionStart -Source $log.Name -Item $item -ChangeType $currentSection -Evidence $line -Confidence 'Medium' -LikelyImpact $impact -SuggestedNextStep 'Correlate this INF/device with Services, DriverStore, and Kernel-PnP evidence.' -SuggestedRepairSwitch '-GetServicesReport -IssuesOnly' -Path $log.Path
+                    if ($reported.Count -ge 60) { break }
+                }
+            }
+            catch {}
+
+            if ($offlineHiveUnloadMatches.Count -gt 0) {
+                $latest = @($offlineHiveUnloadMatches | Sort-Object Timestamp -Descending | Select-Object -First 1)[0]
+                $hives = (@($offlineHiveUnloadMatches | Select-Object -ExpandProperty Hive -Unique | Sort-Object) -join ', ')
+                $errors = (@($offlineHiveUnloadMatches | Select-Object -ExpandProperty Error -Unique | Sort-Object) -join ', ')
+                $sections = (@($offlineHiveUnloadMatches | Select-Object -ExpandProperty Section -Unique | Where-Object { $_ } | Select-Object -First 4) -join '; ')
+                $firstTime = @($offlineHiveUnloadMatches | Sort-Object Timestamp | Select-Object -First 1)[0].Timestamp
+                $timeText = if ($firstTime -and $latest.Timestamp -and $firstTime -ne $latest.Timestamp) { "$($firstTime.ToString('yyyy-MM-dd HH:mm:ss')) to $($latest.Timestamp.ToString('yyyy-MM-dd HH:mm:ss'))" } elseif ($latest.Timestamp) { $latest.Timestamp.ToString('yyyy-MM-dd HH:mm:ss') } else { 'timestamp unavailable' }
+                $evidence = "Collapsed $($offlineHiveUnloadMatches.Count) repeated offline hive-unload cleanup line(s); Hives=$hives; Error=$errors; Time=$timeText"
+                if ($sections) { $evidence += "; Sections=$sections" }
+
+                Add-RecentChangeFinding -Findings $Findings -Severity 'INFO' -Priority 84 -Category 'DriverSetup' -Timestamp $latest.Timestamp -Source $log.Name -Item 'Offline registry hive unload cleanup' -ChangeType 'OfflineHiveUnloadCleanup' -Evidence $evidence -Confidence 'Medium' -LikelyImpact 'Offline driver servicing could not unload temporary registry hives. This is usually cleanup noise unless it aligns with the boot failure time or nearby driver-package errors.' -SuggestedNextStep 'Use this as timeline context only; prioritize actual setupapi failure lines, boot-critical services/files, and registry changes first.' -SuggestedRepairSwitch '-GetServicesReport -IssuesOnly' -Path $log.Path
+            }
+        }
+    }
+
+    function Add-RecentChangeServiceFindings {
+        param(
+            [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Findings,
+            [Parameter(Mandatory = $true)][datetime]$Cutoff
+        )
+
+        Invoke-WithHive 'SYSTEM' {
+            & {
+                $systemRoot = Get-SystemRootPath
+                $servicesRoot = "$systemRoot\Services"
+                if (-not (Test-Path $servicesRoot)) { return }
+                $startNames = @{ 0 = 'Boot'; 1 = 'System'; 2 = 'Automatic'; 3 = 'Manual'; 4 = 'Disabled' }
+                $typeNames = @{ 1 = 'KernelDriver'; 2 = 'FileSystemDriver'; 4 = 'Adapter'; 8 = 'RecognizerDriver'; 16 = 'Win32OwnProcess'; 32 = 'Win32ShareProcess'; 256 = 'Interactive' }
+                $importantServices = @{
+                    TermService              = @{ Role = 'Remote access (RDP)'; Priority = 30; DisabledImpact = 'Remote Desktop Services is disabled; this directly explains no RDP even when the guest boots successfully.' }
+                    WinRM                    = @{ Role = 'Remote access (WinRM)'; Priority = 31; DisabledImpact = 'Windows Remote Management is disabled; PowerShell remoting and automation access will fail.' }
+                    WindowsAzureGuestAgent   = @{ Role = 'Azure VM agent'; Priority = 32; DisabledImpact = 'The Azure VM Guest Agent is disabled; Azure extensions, health reporting, and some recovery workflows can fail.' }
+                    RdAgent                  = @{ Role = 'Azure fabric/guest agent'; Priority = 32; DisabledImpact = 'The Azure RdAgent service is disabled; Azure guest/fabric integration may be impaired.' }
+                    WindowsAzureTelemetryService = @{ Role = 'Azure telemetry agent'; Priority = 54; DisabledImpact = 'The Azure telemetry service is disabled; this is usually not a boot blocker, but can affect platform visibility.' }
+                    Dhcp                     = @{ Role = 'Network connectivity'; Priority = 34; DisabledImpact = 'DHCP Client is disabled; the VM may boot without a usable IP address.' }
+                    Dnscache                 = @{ Role = 'Network name resolution'; Priority = 36; DisabledImpact = 'DNS Client is disabled; network may appear up while name resolution fails.' }
+                    NlaSvc                   = @{ Role = 'Network profile detection'; Priority = 40; DisabledImpact = 'Network Location Awareness is disabled; firewall/profile behavior and domain detection can be wrong.' }
+                    Netlogon                 = @{ Role = 'Domain connectivity'; Priority = 38; DisabledImpact = 'Netlogon is disabled; domain authentication and domain-dependent services can fail.' }
+                    LanmanWorkstation        = @{ Role = 'SMB/client networking'; Priority = 42; DisabledImpact = 'Workstation service is disabled; SMB client access and domain resource access can fail.' }
+                    LanmanServer             = @{ Role = 'SMB/server networking'; Priority = 48; DisabledImpact = 'Server service is disabled; inbound SMB/admin-share access can fail.' }
+                    RpcSs                    = @{ Role = 'Core service control'; Priority = 28; DisabledImpact = 'Remote Procedure Call is disabled; Windows service control and many core components cannot function correctly.' }
+                    EventLog                 = @{ Role = 'Core logging/service dependency'; Priority = 52; DisabledImpact = 'Windows Event Log is disabled; diagnostics and dependent services can be impaired.' }
+                    PlugPlay                 = @{ Role = 'Device initialization'; Priority = 35; DisabledImpact = 'Plug and Play is disabled; device initialization and driver binding can fail.' }
+                }
+                $reportedCount = 0
+                foreach ($serviceKey in (Get-ChildItem $servicesRoot -ErrorAction SilentlyContinue)) {
+                    if ($reportedCount -ge 80) { break }
+                    $serviceName = [string]$serviceKey.PSChildName
+                    $serviceRole = if ($importantServices.ContainsKey($serviceName)) { $importantServices[$serviceName] } else { $null }
+                    $props = Get-ItemProperty -Path $serviceKey.PSPath -ErrorAction SilentlyContinue
+                    if (-not $props -or $null -eq $props.Start -or $null -eq $props.Type) { continue }
+                    $typeValue = [int]$props.Type
+                    $isDriverType = (($typeValue -band 0x0F) -ne 0)
+                    $isWin32ServiceType = (($typeValue -band 0x30) -ne 0)
+                    if (-not ($isDriverType -or $isWin32ServiceType)) { continue }
+                    $startValue = [int]$props.Start
+                    $keyLastWrite = Get-RegistryKeyLastWriteTime -Path $serviceKey.Name
+                    $imageRaw = if ($props.ImagePath) { [string]$props.ImagePath } else { '' }
+                    $imagePath = if ($imageRaw) { Resolve-GuestImagePath $imageRaw } else { '' }
+                    $fileItem = if ($imagePath -and (Test-Path -LiteralPath $imagePath)) { Get-Item -LiteralPath $imagePath -Force -ErrorAction SilentlyContinue } else { $null }
+                    $fileLastWrite = if ($fileItem) { $fileItem.LastWriteTime } else { $null }
+                    $isRecentKey = ($keyLastWrite -and $keyLastWrite -ge $Cutoff)
+                    $isRecentBinary = ($fileLastWrite -and $fileLastWrite -ge $Cutoff)
+                    $isRecent = ($isRecentKey -or $isRecentBinary)
+                    $binaryMissing = ($imageRaw -and -not $fileItem)
+                    $binaryZero = ($fileItem -and $fileItem.Length -eq 0)
+                    $vendor = 'N/A'
+                    $isMicrosoft = $false
+                    if ($fileItem) {
+                        $vendor = if ($fileItem.VersionInfo.CompanyName) { $fileItem.VersionInfo.CompanyName.Trim() } else { '(no version info)' }
+                        $isMicrosoft = ($vendor -match 'Microsoft')
+                    }
+                    $isBootOrSystem = ($startValue -in @(0, 1))
+                    $isAutomatic = ($startValue -eq 2)
+                    $isSevere = ($null -ne $props.ErrorControl -and [int]$props.ErrorControl -ge 2)
+                    $interesting = $isRecent -or (($binaryMissing -or $binaryZero) -and $isBootOrSystem)
+                    if (-not $interesting) { continue }
+
+                    $severity = 'INFO'
+                    $priority = 78
+                    $impact = 'A driver/service registry key or binary changed recently.'
+                    $suggested = '-GetServicesReport -IssuesOnly'
+                    if (($binaryMissing -or $binaryZero) -and $isBootOrSystem) {
+                        $severity = 'CRITICAL'; $priority = 12; $impact = 'A Boot/System driver with a missing or zero-byte binary can block boot.'; $suggested = if ($fileItem -and $fileItem.Length -eq 0) { '-RepairSystemFile <driver.sys>' } else { '-GetServicesReport -IssuesOnly' }
+                    }
+                    elseif ($isRecentBinary -and $isBootOrSystem -and -not $isMicrosoft) {
+                        $severity = 'WARN'; $priority = 22; $impact = 'A recent non-Microsoft Boot/System driver binary change is a strong boot-failure suspect.'; $suggested = '-DisableDriverOrService <name> after snapshot/backup'
+                    }
+                    elseif ($isRecentBinary -and $isSevere -and -not $isMicrosoft) {
+                        $severity = 'WARN'; $priority = 32; $impact = 'A recent non-Microsoft driver binary with Severe/Critical ErrorControl can fail closed during boot.'
+                    }
+                    elseif ($isRecentKey -and $isBootOrSystem -and -not $isMicrosoft) {
+                        $severity = 'INFO'; $priority = 76; $impact = 'A non-Microsoft Boot/System driver service key changed recently, but the driver binary timestamp did not. Treat as supporting evidence only.'; $suggested = '-GetServicesReport -IssuesOnly'
+                    }
+                    elseif ($isRecent -and $isBootOrSystem) {
+                        $severity = 'INFO'; $priority = 60; $impact = 'A Microsoft Boot/System driver changed recently; correlate with updates before treating it as suspicious.'
+                    }
+                    elseif ($isRecentKey -and $serviceRole -and $startValue -eq 4) {
+                        $severity = 'WARN'; $priority = [int]$serviceRole.Priority; $impact = [string]$serviceRole.DisabledImpact; $suggested = '-LoadHive SYSTEM / -GetServicesReport -IssuesOnly'
+                    }
+                    elseif ($isRecentKey -and $serviceRole) {
+                        $severity = 'INFO'; $priority = 58; $impact = "A service involved in $($serviceRole.Role) changed recently. Treat as timeline evidence unless the symptom matches."
+                    }
+                    elseif (($binaryMissing -or $binaryZero) -and $isWin32ServiceType -and $isAutomatic -and -not $isMicrosoft) {
+                        $severity = 'WARN'; $priority = 44; $impact = 'An automatic non-Microsoft service points to a missing or empty executable; this can break agent, networking, security, or application startup.'
+                    }
+                    elseif ($isRecentKey -and $isWin32ServiceType -and $isAutomatic -and -not $isMicrosoft) {
+                        $severity = 'WARN'; $priority = 48; $impact = 'An automatic non-Microsoft service configuration changed recently. This is a common footprint of agent, updater, security, or application changes.'
+                    }
+                    elseif ($isRecentKey -and $isWin32ServiceType) {
+                        $severity = 'INFO'; $priority = 70; $impact = 'A Win32 service registry key changed recently; treat as timeline evidence unless it lines up with the failure or another warning.'
+                    }
+
+                    $timestampCandidates = @($keyLastWrite, $fileLastWrite) | Where-Object { $_ } | Sort-Object -Descending
+                    $timestamp = @($timestampCandidates | Select-Object -First 1)[0]
+                    $startName = if ($startNames.ContainsKey($startValue)) { $startNames[$startValue] } else { "Start=$startValue" }
+                    $typeLabelParts = @($typeNames.Keys | Where-Object { ($typeValue -band $_) -ne 0 } | Sort-Object | ForEach-Object { $typeNames[$_] })
+                    $typeLabel = if ($typeLabelParts.Count -gt 0) { $typeLabelParts -join '+' } else { "Type=$typeValue" }
+                    $evidence = "Start=$startName; Type=$typeValue ($typeLabel); ErrorControl=$($props.ErrorControl); Vendor=$vendor; ImagePath=$imageRaw"
+                    if ($serviceRole) { $evidence += "; Role=$($serviceRole.Role)" }
+                    if ($keyLastWrite) { $evidence += "; KeyLastWrite=$($keyLastWrite.ToString('yyyy-MM-dd HH:mm:ss'))" }
+                    if ($fileLastWrite) { $evidence += "; BinaryLastWrite=$($fileLastWrite.ToString('yyyy-MM-dd HH:mm:ss'))" }
+                    if ($binaryMissing) { $evidence += '; Binary missing' }
+                    if ($binaryZero) { $evidence += '; Binary is 0 bytes' }
+                    Add-RecentChangeFinding -Findings $Findings -Severity $severity -Priority $priority -Category 'DriversServices' -Timestamp $timestamp -Source 'SYSTEM Services' -Item $serviceKey.PSChildName -ChangeType 'ServiceKeyOrBinary' -Evidence $evidence -Confidence 'Medium' -LikelyImpact $impact -SuggestedNextStep 'Use the services report and setupapi evidence to decide whether this service should be disabled, restored, or repaired.' -SuggestedRepairSwitch $suggested -Path $serviceKey.Name
+                    $reportedCount++
+                }
+            }
+        }
+    }
+
+    function Add-RecentChangeRegistryRiskFindings {
+        param(
+            [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Findings,
+            [Parameter(Mandatory = $true)][datetime]$Cutoff
+        )
+
+        Invoke-WithHive 'SYSTEM', 'SOFTWARE' {
+            & {
+                $systemRoot = Get-SystemRootPath
+                $sessionManagerPath = "$systemRoot\Control\Session Manager"
+                $sessionLastWrite = Get-RegistryKeyLastWriteTime -Path $sessionManagerPath
+                if ($sessionLastWrite -and $sessionLastWrite -ge $Cutoff -and (Test-Path $sessionManagerPath)) {
+                    $sessionProps = Get-ItemProperty $sessionManagerPath -ErrorAction SilentlyContinue
+                    foreach ($propertyName in @('BootExecute', 'SetupExecute', 'PendingFileRenameOperations')) {
+                        $value = $sessionProps.$propertyName
+                        if ($null -eq $value) { continue }
+                        $valueText = if ($value -is [array]) { $value -join '; ' } else { [string]$value }
+                        $severity = if ($propertyName -eq 'BootExecute' -and $valueText -match '^autocheck autochk \*$') { 'INFO' } else { 'WARN' }
+                        $priority = if ($severity -eq 'WARN') { 26 } else { 68 }
+                        Add-RecentChangeFinding -Findings $Findings -Severity $severity -Priority $priority -Category 'BootRegistry' -Timestamp $sessionLastWrite -Source 'Session Manager' -Item $propertyName -ChangeType 'RegistryValue' -Evidence "$propertyName = $valueText" -Confidence 'High' -LikelyImpact 'Session Manager startup commands can hang boot before logon if they reference missing or problematic binaries.' -SuggestedNextStep 'Review Session Manager startup commands before booting.' -SuggestedRepairSwitch '-FixSessionManager' -Path $sessionManagerPath
+                    }
+                }
+
+                $winlogonPath = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+                $winlogonLastWrite = Get-RegistryKeyLastWriteTime -Path $winlogonPath
+                if ($winlogonLastWrite -and $winlogonLastWrite -ge $Cutoff -and (Test-Path $winlogonPath)) {
+                    $winlogonProps = Get-ItemProperty $winlogonPath -ErrorAction SilentlyContinue
+                    $shell = [string]$winlogonProps.Shell
+                    $userinit = [string]$winlogonProps.Userinit
+                    if ($shell -and $shell -ne 'explorer.exe') {
+                        Add-RecentChangeFinding -Findings $Findings -Severity 'WARN' -Priority 24 -Category 'LogonRegistry' -Timestamp $winlogonLastWrite -Source 'Winlogon' -Item 'Shell' -ChangeType 'RegistryValue' -Evidence "Shell=$shell" -Confidence 'High' -LikelyImpact 'A non-default shell can cause black screen or missing desktop after boot.' -SuggestedNextStep 'Validate the shell path and source of the change.' -SuggestedRepairSwitch '-FixWinlogon' -Path $winlogonPath
+                    }
+                    if ($userinit -and $userinit -notmatch '(?i)userinit\.exe') {
+                        Add-RecentChangeFinding -Findings $Findings -Severity 'WARN' -Priority 24 -Category 'LogonRegistry' -Timestamp $winlogonLastWrite -Source 'Winlogon' -Item 'Userinit' -ChangeType 'RegistryValue' -Evidence "Userinit=$userinit" -Confidence 'High' -LikelyImpact 'A non-default Userinit value can prevent interactive logon.' -SuggestedNextStep 'Validate Userinit and restore defaults if needed.' -SuggestedRepairSwitch '-FixWinlogon' -Path $winlogonPath
+                    }
+                }
+
+                $runPaths = @(
+                    'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+                    'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce',
+                    'HKLM:\BROKENSOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Run',
+                    'HKLM:\BROKENSOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\RunOnce'
+                )
+                foreach ($runPath in $runPaths) {
+                    if (-not (Test-Path $runPath)) { continue }
+                    $lastWrite = Get-RegistryKeyLastWriteTime -Path $runPath
+                    if (-not $lastWrite -or $lastWrite -lt $Cutoff) { continue }
+                    $runProps = Get-ItemProperty $runPath -ErrorAction SilentlyContinue
+                    $entries = @($runProps.PSObject.Properties | Where-Object { $_.Name -notin @('PSPath', 'PSParentPath', 'PSChildName', 'PSDrive', 'PSProvider') })
+                    foreach ($entry in ($entries | Select-Object -First 12)) {
+                        Add-RecentChangeFinding -Findings $Findings -Severity 'INFO' -Priority 76 -Category 'Startup' -Timestamp $lastWrite -Source (Split-Path -Leaf $runPath) -Item $entry.Name -ChangeType 'StartupRegistry' -Evidence "$($entry.Name) = $($entry.Value)" -Confidence 'Medium' -LikelyImpact 'Recent autoruns can affect startup/logon, but are not boot blockers by themselves.' -SuggestedNextStep 'Review startup programs if boot reaches logon then hangs.' -SuggestedRepairSwitch '-ListStartupPrograms / -DisableStartupPrograms' -Path $runPath
+                    }
+                }
+
+                $controlSetName = Get-CurrentOfflineControlSetName
+                $classRoot = "HKLM:\BROKENSYSTEM\$controlSetName\Control\Class"
+                foreach ($classSpec in (Get-DeviceClassFilterSpec)) {
+                    $classPath = "$classRoot\$($classSpec.GUID)"
+                    if (-not (Test-Path $classPath)) { continue }
+                    $lastWrite = Get-RegistryKeyLastWriteTime -Path $classPath
+                    $classProps = Get-ItemProperty $classPath -ErrorAction SilentlyContinue
+                    foreach ($filterType in @('UpperFilters', 'LowerFilters')) {
+                        $filters = @($classProps.$filterType | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
+                        if ($filters.Count -eq 0) { continue }
+                        $unsafe = @($filters | Where-Object { $classSpec.SafeFilters -inotcontains $_ })
+                        if ($unsafe.Count -eq 0 -and (-not $lastWrite -or $lastWrite -lt $Cutoff)) { continue }
+                        $severity = if ($unsafe.Count -gt 0 -and $classSpec.Risk -eq 'CRITICAL') { 'WARN' } else { 'INFO' }
+                        $priority = if ($severity -eq 'WARN') { 23 } else { 74 }
+                        $evidence = "$filterType = $($filters -join ', ')"
+                        if ($unsafe.Count -gt 0) { $evidence += "; non-safe-list entries: $($unsafe -join ', ')" }
+                        Add-RecentChangeFinding -Findings $Findings -Severity $severity -Priority $priority -Category 'DeviceFilters' -Timestamp $lastWrite -Source 'Class filters' -Item $classSpec.Name -ChangeType $filterType -Evidence $evidence -Confidence 'High' -LikelyImpact $classSpec.Description -SuggestedNextStep 'Review filter drivers and binaries before booting.' -SuggestedRepairSwitch '-FixDeviceFilters' -Path $classPath
+                    }
+                }
+            }
+        }
+    }
+
+    function Add-RecentChangeSoftwareFindings {
+        param(
+            [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Findings,
+            [Parameter(Mandatory = $true)][datetime]$Cutoff
+        )
+
+        Invoke-WithHive 'SOFTWARE' {
+            & {
+                $uninstallRoots = @(
+                    'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+                    'HKLM:\BROKENSOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+                )
+                $reportedCount = 0
+                foreach ($root in $uninstallRoots) {
+                    if (-not (Test-Path $root)) { continue }
+                    foreach ($appKey in (Get-ChildItem $root -ErrorAction SilentlyContinue)) {
+                        if ($reportedCount -ge 50) { break }
+                        $props = Get-ItemProperty $appKey.PSPath -ErrorAction SilentlyContinue
+                        if (-not $props -or [string]::IsNullOrWhiteSpace($props.DisplayName)) { continue }
+                        $lastWrite = Get-RegistryKeyLastWriteTime -Path $appKey.Name
+                        $installDate = ConvertFrom-RecentChangeInstallDate -InstallDate ([string]$props.InstallDate)
+                        $timestamp = if ($installDate) { $installDate } else { $lastWrite }
+                        if (-not $timestamp -or $timestamp -lt $Cutoff) { continue }
+                        $publisher = if ($props.Publisher) { [string]$props.Publisher } else { '' }
+                        $name = [string]$props.DisplayName
+                        $riskySoftware = ($name -match '(?i)driver|vpn|filter|network|backup|endpoint|security|antivirus|defender|crowd|sentinel|carbon|zscaler|globalprotect|storage|disk' -or $publisher -match '(?i)crowd|sentinel|carbon|zscaler|palo alto|cisco|symantec|mcafee|trend|veeam|commvault')
+                        $isMicrosoft = ($publisher -match 'Microsoft')
+                        $severity = if ($riskySoftware -and -not $isMicrosoft) { 'WARN' } else { 'INFO' }
+                        $priority = if ($severity -eq 'WARN') { 42 } else { 82 }
+                        $evidence = "Publisher=$publisher; Version=$($props.DisplayVersion); InstallDate=$($props.InstallDate)"
+                        Add-RecentChangeFinding -Findings $Findings -Severity $severity -Priority $priority -Category 'Software' -Timestamp $timestamp -Source 'Uninstall registry' -Item $name -ChangeType 'InstalledOrModifiedSoftware' -Evidence $evidence -Confidence 'Medium' -LikelyImpact 'Recently installed or modified software may have added drivers, filters, services, or startup tasks.' -SuggestedNextStep 'Correlate this software with services, drivers, filters, and setupapi evidence.' -SuggestedRepairSwitch '-ListStartupPrograms / -GetServicesReport -IssuesOnly' -Path $appKey.Name
+                        $reportedCount++
+                    }
+                }
+            }
+        }
+    }
+
+    function Add-RecentChangeFileFindings {
+        param(
+            [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Findings,
+            [Parameter(Mandatory = $true)][datetime]$Cutoff
+        )
+
+        $windowsRoot = Join-Path $script:WinDriveLetter 'Windows'
+        $criticalFiles = @(
+            @{ Name = 'BCD store'; Path = (Get-BcdStorePath -BootDrive $script:BootDriveLetter -Generation $script:VMGen); Category = 'BootFiles'; Signed = $false }
+            @{ Name = 'winload'; Path = (Join-Path $script:WinDriveLetter $(if ($script:VMGen -eq 2) { 'Windows\System32\winload.efi' } else { 'Windows\System32\winload.exe' })); Category = 'BootFiles'; Signed = $true }
+            @{ Name = 'ntoskrnl.exe'; Path = (Join-Path $windowsRoot 'System32\ntoskrnl.exe'); Category = 'BootFiles'; Signed = $true }
+            @{ Name = 'hal.dll'; Path = (Join-Path $windowsRoot 'System32\hal.dll'); Category = 'BootFiles'; Signed = $true }
+            @{ Name = 'ci.dll'; Path = (Join-Path $windowsRoot 'System32\ci.dll'); Category = 'BootFiles'; Signed = $true }
+            @{ Name = 'smss.exe'; Path = (Join-Path $windowsRoot 'System32\smss.exe'); Category = 'LogonFiles'; Signed = $true }
+            @{ Name = 'wininit.exe'; Path = (Join-Path $windowsRoot 'System32\wininit.exe'); Category = 'LogonFiles'; Signed = $true }
+            @{ Name = 'services.exe'; Path = (Join-Path $windowsRoot 'System32\services.exe'); Category = 'LogonFiles'; Signed = $true }
+            @{ Name = 'lsass.exe'; Path = (Join-Path $windowsRoot 'System32\lsass.exe'); Category = 'LogonFiles'; Signed = $true }
+            @{ Name = 'winlogon.exe'; Path = (Join-Path $windowsRoot 'System32\winlogon.exe'); Category = 'LogonFiles'; Signed = $true }
+            @{ Name = 'vmbus.sys'; Path = (Join-Path $windowsRoot 'System32\drivers\vmbus.sys'); Category = 'DriverFiles'; Signed = $true }
+            @{ Name = 'storvsc.sys'; Path = (Join-Path $windowsRoot 'System32\drivers\storvsc.sys'); Category = 'DriverFiles'; Signed = $true }
+            @{ Name = 'netvsc.sys'; Path = (Join-Path $windowsRoot 'System32\drivers\netvsc.sys'); Category = 'DriverFiles'; Signed = $true }
+        )
+
+        foreach ($fileSpec in $criticalFiles) {
+            $fileItem = Get-Item -LiteralPath $fileSpec.Path -Force -ErrorAction SilentlyContinue
+            if (-not $fileItem) {
+                Add-RecentChangeFinding -Findings $Findings -Severity 'CRITICAL' -Priority 10 -Category $fileSpec.Category -Timestamp $null -Source 'Critical file inventory' -Item $fileSpec.Name -ChangeType 'MissingCriticalFile' -Evidence 'Critical boot/logon artifact is missing.' -Confidence 'High' -LikelyImpact 'Missing boot, kernel, session, or Azure synthetic driver files can prevent startup.' -SuggestedNextStep 'Confirm whether the file is expected for this OS and restore from WinSxS or a known-good source.' -SuggestedRepairSwitch '-AnalyzeCriticalBootFiles / -RepairSystemFile <name>' -Path $fileSpec.Path
+                continue
+            }
+            if ($fileItem.Length -eq 0) {
+                Add-RecentChangeFinding -Findings $Findings -Severity 'CRITICAL' -Priority 10 -Category $fileSpec.Category -Timestamp $fileItem.LastWriteTime -Source 'Critical file inventory' -Item $fileSpec.Name -ChangeType 'ZeroByteCriticalFile' -Evidence 'Critical file exists but is 0 bytes.' -Confidence 'High' -LikelyImpact 'A zero-byte critical binary can prevent boot or logon.' -SuggestedNextStep 'Restore the file from WinSxS or a known-good source.' -SuggestedRepairSwitch '-RepairSystemFile <name>' -Path $fileSpec.Path
+                continue
+            }
+            if ($fileItem.LastWriteTime -lt $Cutoff) { continue }
+            $severity = 'INFO'
+            $priority = 76
+            $evidence = "LastWriteTime=$($fileItem.LastWriteTime); Size=$($fileItem.Length)"
+            if ($fileSpec.Signed) {
+                $signature = Test-MicrosoftSignature -FilePath $fileSpec.Path
+                $evidence += "; Signature=$($signature.Status); Subject=$($signature.Subject)"
+                if (-not $signature.IsMicrosoft) { $severity = 'WARN'; $priority = 18 }
+            }
+            Add-RecentChangeFinding -Findings $Findings -Severity $severity -Priority $priority -Category $fileSpec.Category -Timestamp $fileItem.LastWriteTime -Source 'Critical file timestamp' -Item $fileSpec.Name -ChangeType 'RecentCriticalFileTimestamp' -Evidence $evidence -Confidence 'Medium' -LikelyImpact 'A recently modified critical file should be correlated with servicing or driver installation evidence.' -SuggestedNextStep 'Use file health and servicing analysis before replacing files.' -SuggestedRepairSwitch '-AnalyzeCriticalBootFiles' -Path $fileSpec.Path
+        }
+
+        $driversRoot = Join-Path $windowsRoot 'System32\drivers'
+        if (Test-Path -LiteralPath $driversRoot) {
+            foreach ($driverFile in (Get-ChildItem -LiteralPath $driversRoot -Filter '*.sys' -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $Cutoff } | Sort-Object LastWriteTime -Descending | Select-Object -First 40)) {
+                $signature = Test-MicrosoftSignature -FilePath $driverFile.FullName
+                $severity = if ($signature.IsMicrosoft) { 'INFO' } else { 'WARN' }
+                $priority = if ($severity -eq 'WARN') { 34 } else { 84 }
+                Add-RecentChangeFinding -Findings $Findings -Severity $severity -Priority $priority -Category 'DriverFiles' -Timestamp $driverFile.LastWriteTime -Source 'System32\drivers' -Item $driverFile.Name -ChangeType 'RecentDriverFile' -Evidence "Size=$($driverFile.Length); Company=$($driverFile.VersionInfo.CompanyName); Signature=$($signature.Status)" -Confidence 'Medium' -LikelyImpact 'A recently modified driver file may correspond to an update or third-party driver install.' -SuggestedNextStep 'Correlate with Services and setupapi evidence before disabling anything.' -SuggestedRepairSwitch '-GetServicesReport -IssuesOnly' -Path $driverFile.FullName
+            }
+        }
+
+        $driverStoreRoot = Join-Path $windowsRoot 'System32\DriverStore\FileRepository'
+        if (Test-Path -LiteralPath $driverStoreRoot) {
+            foreach ($driverStoreDir in (Get-ChildItem -LiteralPath $driverStoreRoot -Directory -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $Cutoff } | Sort-Object LastWriteTime -Descending | Select-Object -First 40)) {
+                $severity = if ($driverStoreDir.Name -match '(?i)stor|disk|scsi|net|ndis|filter|vpn|av|edr|crowd|sentinel|zscaler|globalprotect') { 'WARN' } else { 'INFO' }
+                $priority = if ($severity -eq 'WARN') { 46 } else { 86 }
+                Add-RecentChangeFinding -Findings $Findings -Severity $severity -Priority $priority -Category 'DriverStore' -Timestamp $driverStoreDir.LastWriteTime -Source 'DriverStore' -Item $driverStoreDir.Name -ChangeType 'RecentDriverPackageDirectory' -Evidence "DriverStore package directory timestamp: $($driverStoreDir.LastWriteTime)" -Confidence 'Low' -LikelyImpact 'DriverStore timestamps are supporting evidence; correlate with setupapi and service keys.' -SuggestedNextStep 'Inspect matching INF/service entries before treating this as causal.' -SuggestedRepairSwitch '-GetServicesReport -IssuesOnly' -Path $driverStoreDir.FullName
+            }
+        }
+    }
+
+    function Add-RecentChangeEventFindings {
+        param(
+            [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Findings,
+            [Parameter(Mandatory = $true)][datetime]$Cutoff
+        )
+
+        $logRoot = Join-Path $script:WinDriveLetter 'Windows\System32\winevt\Logs'
+        $eventLogs = @(
+            @{ Name = 'Setup'; Path = (Join-Path $logRoot 'Setup.evtx'); Category = 'ServicingEvents' }
+            @{ Name = 'WindowsUpdateClient'; Path = (Join-Path $logRoot 'Microsoft-Windows-WindowsUpdateClient%4Operational.evtx'); Category = 'ServicingEvents' }
+            @{ Name = 'DeviceSetupManager'; Path = (Join-Path $logRoot 'Microsoft-Windows-DeviceSetupManager%4Admin.evtx'); Category = 'DeviceEvents' }
+            @{ Name = 'Kernel-PnP'; Path = (Join-Path $logRoot 'Microsoft-Windows-Kernel-PnP%4Configuration.evtx'); Category = 'DeviceEvents' }
+            @{ Name = 'CodeIntegrity'; Path = (Join-Path $logRoot 'Microsoft-Windows-CodeIntegrity%4Operational.evtx'); Category = 'SecurityEvents' }
+            @{ Name = 'User Profile Service'; Path = (Join-Path $logRoot 'Microsoft-Windows-User Profile Service%4Operational.evtx'); Category = 'LogonEvents' }
+        )
+
+        foreach ($eventLog in $eventLogs) {
+            if (-not (Test-Path -LiteralPath $eventLog.Path)) { continue }
+            try {
+                $recentEvents = @(Get-WinEvent -Path $eventLog.Path -MaxEvents 120 -ErrorAction Stop | Where-Object { $_.TimeCreated -and $_.TimeCreated -ge $Cutoff } | Sort-Object TimeCreated | Select-Object -First 20)
+                foreach ($eventRecord in $recentEvents) {
+                    $message = [string]$eventRecord.Message
+                    $severity = 'INFO'
+                    $priority = 88
+                    $impact = 'Supporting event-log evidence in the recent window.'
+                    if ($eventRecord.LevelDisplayName -match 'Error|Critical' -or $message -match '(?i)failed|failure|cannot|0x[0-9a-f]{8}') {
+                        $severity = 'WARN'; $priority = 44; $impact = 'Recent error event may correlate with update, driver, device, security, or logon failure.'
+                    }
+                    if ($eventLog.Name -eq 'WindowsUpdateClient' -and $eventRecord.Id -eq 25 -and $message -match '0x8024402C') {
+                        $severity = 'INFO'; $priority = 92; $impact = 'Windows Update connectivity check failure; usually not a boot blocker by itself.'
+                    }
+                    if ($eventLog.Name -eq 'Kernel-PnP' -and $eventRecord.Id -in @(400, 410)) {
+                        $priority = 80
+                    }
+                    $item = if ($message -match '(KB\d{6,8})') { $Matches[1] } elseif ($message -match 'Driver Name:\s*([^\r\n]+)') { $Matches[1].Trim() } else { "$($eventRecord.ProviderName)#$($eventRecord.Id)" }
+                    Add-RecentChangeFinding -Findings $Findings -Severity $severity -Priority $priority -Category $eventLog.Category -Timestamp $eventRecord.TimeCreated -Source $eventLog.Name -Item $item -ChangeType "EventId $($eventRecord.Id)" -Evidence $message -Confidence 'Medium' -LikelyImpact $impact -SuggestedNextStep 'Correlate this event with registry, file, setupapi, and servicing evidence.' -SuggestedRepairSwitch '' -Path $eventLog.Path
+                }
+            }
+            catch {
+                if ($_.Exception.Message -notmatch 'No events were found') {
+                    Add-RecentChangeCollectorFailure -Findings $Findings -Collector $eventLog.Name -ErrorText $_.Exception.Message
+                }
+            }
+        }
+    }
+
+    function Get-RecentChangeInsights {
+        param(
+            [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Findings
+        )
+
+        $insights = [System.Collections.Generic.List[object]]::new()
+        if ($Findings.Count -eq 0) { return [object[]]@() }
+
+        $criticalsAndWarns = @($Findings | Where-Object { $_.Severity -in @('CRITICAL', 'WARN') })
+        $addInsight = {
+            param($sev, $title, $why, $support, $action, $conf)
+            $insights.Add([pscustomobject]@{
+                Severity           = $sev
+                Title              = $title
+                WhyItMatters       = $why
+                SupportingFindings = $support
+                SuggestedAction    = $action
+                Confidence         = $conf
+            }) | Out-Null
+        }
+
+        $missingBoot = @($Findings | Where-Object { $_.Severity -eq 'CRITICAL' -and $_.Category -in @('BootFiles', 'LogonFiles', 'DriverFiles') -and $_.ChangeType -in @('MissingCriticalFile', 'ZeroByteCriticalFile') })
+        if ($missingBoot.Count -gt 0) {
+            & $addInsight 'CRITICAL' 'Critical boot/logon binary is missing or empty' 'A missing or 0-byte boot, kernel, session, or logon binary will prevent the guest from starting or reaching logon.' (($missingBoot | Select-Object -ExpandProperty Item -First 8) -join ', ') 'Restore the binary from WinSxS or a same-build source: -RepairSystemFile <name>' 'High'
+        }
+
+        $driverBinReg = @($Findings | Where-Object { $_.Severity -eq 'CRITICAL' -and $_.Category -eq 'DriversServices' -and $_.Evidence -match '(?i)binary (missing|is 0 bytes)' })
+        if ($driverBinReg.Count -gt 0) {
+            & $addInsight 'CRITICAL' 'Boot/System driver has a missing or empty binary' 'A Boot/System start driver with no binary will fail to load and can BSOD before Last Known Good recovers.' (($driverBinReg | Select-Object -ExpandProperty Item -First 8) -join ', ') 'Restore the .sys (-RepairSystemFile <driver.sys>) or disable the service (-DisableDriverOrService <name>).' 'High'
+        }
+
+        $servPending = @($Findings | Where-Object { $_.Severity -eq 'WARN' -and $_.Category -eq 'Servicing' -and ($_.ChangeType -match 'Pending|Sessions|Packages' -or $_.Evidence -match '(?i)pending\.xml|SessionsPending|PackagesPending') })
+        $servErrors = @($Findings | Where-Object { $_.Severity -in @('CRITICAL', 'WARN') -and $_.Category -eq 'Servicing' -and ($_.Evidence -match '(?i)failed|failure|hresult|0x8|corrupt|rollback') })
+        if ($servPending.Count -gt 0 -and $servErrors.Count -gt 0) {
+            $support = ((@($servPending) + @($servErrors)) | Select-Object -ExpandProperty Item -First 6 -Unique) -join ', '
+            & $addInsight 'WARN' 'Interrupted Windows Update / servicing transaction' 'Pending servicing markers combined with recent CBS/DISM errors suggest an update that did not complete cleanly. This frequently causes update-stage boot loops.' $support 'Run -AnalyzeServicingState first; then -FixPendingUpdates if that report confirms pending operations.' 'Medium'
+        }
+
+        $thirdPartyBoot = @($Findings | Where-Object { $_.Severity -eq 'WARN' -and $_.Category -eq 'DriversServices' -and $_.Evidence -notmatch '(?i)vendor=.*microsoft' -and $_.Evidence -match '(?i)start=(boot|system)' })
+        if ($thirdPartyBoot.Count -gt 0) {
+            & $addInsight 'WARN' 'Recent non-Microsoft Boot/System driver change' 'Third-party drivers loading at Boot or System start are a top boot-failure suspect, especially storage, network, AV/EDR, VPN, or filter drivers.' (($thirdPartyBoot | Select-Object -ExpandProperty Item -First 8) -join ', ') 'Snapshot disk, then -DisableDriverOrService <name> on the suspect driver and retry boot.' 'Medium'
+        }
+
+        $logonTamper = @($Findings | Where-Object { $_.Severity -in @('CRITICAL', 'WARN') -and $_.Category -in @('LogonRegistry', 'BootRegistry') })
+        if ($logonTamper.Count -gt 0) {
+            & $addInsight 'WARN' 'Boot/logon registry values modified recently' 'Changes to Winlogon Shell/Userinit or Session Manager BootExecute can prevent logon (black screen) or hang boot before the Service Control Manager starts.' (($logonTamper | ForEach-Object { "$($_.Source):$($_.Item)" }) -join ', ') 'Inspect values with -LoadHive SOFTWARE,SYSTEM and run -FixWinlogon / -FixSessionManager if values are non-default.' 'High'
+        }
+
+        $driverInstallFail = @($Findings | Where-Object { $_.Category -eq 'DriverSetup' -and $_.Severity -in @('WARN', 'CRITICAL') -and ($_.Evidence -match '!!!|failed|error|Exit status:\s*(?!SUCCESS)') })
+        if ($driverInstallFail.Count -gt 0) {
+            & $addInsight 'WARN' 'Recent driver/device installation failed' 'A failed driver/device install can leave half-registered services, broken filter chains, or pending reboot state that breaks boot.' (($driverInstallFail | Select-Object -ExpandProperty Item -First 6) -join ', ') 'Cross-reference Services and DriverFiles for the failed package; use -GetServicesReport -IssuesOnly.' 'Medium'
+        }
+
+        $unsafeFilters = @($Findings | Where-Object { $_.Category -eq 'DeviceFilters' -and $_.Severity -eq 'WARN' })
+        if ($unsafeFilters.Count -gt 0) {
+            & $addInsight 'WARN' 'Unsafe device-class filter drivers detected' 'Non-inbox UpperFilters/LowerFilters on boot-critical device classes (disk, volume, partmgr) can prevent disk enumeration at boot.' (($unsafeFilters | Select-Object -ExpandProperty Item) -join ', ') 'Use -FixDeviceFilters to restore the safe inbox list.' 'High'
+        }
+
+        $secProduct = @($Findings | Where-Object { $_.Category -eq 'Software' -and $_.Severity -eq 'WARN' -and ($_.Evidence -match '(?i)crowd|sentinel|carbon|zscaler|globalprotect|symantec|mcafee|trend|veeam|commvault|defender' -or $_.Item -match '(?i)edr|antivirus|defender|crowd|sentinel|carbon|zscaler|globalprotect') })
+        if ($secProduct.Count -gt 0) {
+            & $addInsight 'WARN' 'Recent security/EDR/AV product change' 'Security agents register filter drivers and boot-time minifilters; recent install or upgrade is a common boot regression source.' (($secProduct | Select-Object -ExpandProperty Item -First 6) -join ', ') 'Identify the agent service and consider -DisableDriverOrService <minifilter> after a disk snapshot.' 'Medium'
+        }
+
+        $bootFileTouched = @($Findings | Where-Object { $_.Severity -eq 'WARN' -and $_.Category -in @('BootFiles', 'LogonFiles', 'DriverFiles') -and $_.ChangeType -eq 'RecentCriticalFileTimestamp' })
+        if ($bootFileTouched.Count -gt 0) {
+            & $addInsight 'WARN' 'Critical boot/logon file modified by a non-Microsoft signer' 'A critical boot/logon binary with a non-Microsoft signature should never appear on a healthy Windows install; this often indicates corruption, replacement, or tampering.' (($bootFileTouched | Select-Object -ExpandProperty Item -First 6) -join ', ') 'Compare against WinSxS reference: -AnalyzeCriticalBootFiles, then -RepairSystemFile <name>.' 'High'
+        }
+
+        $timedWarn = @($criticalsAndWarns | Where-Object { $_.Timestamp } | Sort-Object Timestamp)
+        if ($timedWarn.Count -ge 3) {
+            for ($i = 0; $i -le ($timedWarn.Count - 3); $i++) {
+                $windowStart = $timedWarn[$i].Timestamp
+                $window = @($timedWarn | Where-Object { $_.Timestamp -ge $windowStart -and $_.Timestamp -le $windowStart.AddMinutes(60) })
+                $distinctCats = @($window.Category | Sort-Object -Unique)
+                if ($window.Count -ge 3 -and $distinctCats.Count -ge 2) {
+                    $title = "Cluster of $($window.Count) suspect changes within 60 minutes starting $($windowStart.ToString('yyyy-MM-dd HH:mm'))"
+                    $support = (($window | ForEach-Object { "[$($_.Category)] $($_.Item)" } | Select-Object -First 8) -join ', ')
+                    & $addInsight 'WARN' $title 'Multiple unrelated changes within a short window usually map to a single triggering event (update install, agent deployment, GPO push, sysprep). Treat them as one incident.' $support 'Investigate the parent event (servicing log, GPO log, deployment record) and address that root cause, not each child symptom.' 'Medium'
+                    break
+                }
+            }
+        }
+
+        $driverStorePkgs = @($Findings | Where-Object { $_.Category -eq 'DriverStore' -and $_.ChangeType -eq 'RecentDriverPackageDirectory' })
+        if ($driverStorePkgs.Count -ge 5) {
+            $title = "DriverStore churn: $($driverStorePkgs.Count) recent driver packages"
+            & $addInsight 'INFO' $title 'A burst of new DriverStore packages usually indicates a Windows Update wave, an agent push, or a driver pack install.' (($driverStorePkgs | Select-Object -ExpandProperty Item -First 8) -join ', ') 'If post-update boot is broken, focus on the most recent storage/network/AV-related package and use -GetServicesReport -IssuesOnly.' 'Low'
+        }
+
+        return $insights.ToArray()
+    }
+
+    function Write-RecentChangeReport {
+        param(
+            [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Findings,
+            [Parameter(Mandatory = $true)][datetime]$Cutoff,
+            [Parameter(Mandatory = $true)][int]$RecentChangeDays,
+            [Parameter(Mandatory = $true)][datetime]$Started
+        )
+
+        $ended = Get-Date
+        $sorted = @($Findings | Sort-Object @{ Expression = 'Priority'; Ascending = $true }, @{ Expression = 'Timestamp'; Descending = $true }, Category, Item)
+        $critical = @($sorted | Where-Object { $_.Severity -eq 'CRITICAL' })
+        $warnings = @($sorted | Where-Object { $_.Severity -eq 'WARN' })
+        $infos = @($sorted | Where-Object { $_.Severity -eq 'INFO' })
+
+        Write-Host ""
+        Write-Host "=== Recent Change Analysis ===" -ForegroundColor Cyan
+        Write-Host "Lookback window : $RecentChangeDays day(s)"
+        Write-Host "Cutoff          : $($Cutoff.ToString('o'))"
+        Write-Host "Findings        : $($sorted.Count) total | $($critical.Count) critical | $($warnings.Count) warnings | $($infos.Count) info"
+        Write-Host ""
+        Write-Host "These findings are timestamped correlation signals, not proof of root cause." -ForegroundColor DarkGray
+
+        $insights = @(Get-RecentChangeInsights -Findings $sorted)
+        Write-Host ""
+        Write-Host "=== Insights (correlated hypotheses) ===" -ForegroundColor Magenta
+        if ($insights.Count -eq 0) {
+            Write-Host "No high-confidence correlated insights from the recent change window." -ForegroundColor DarkGray
+        }
+        else {
+            $insightIndex = 0
+            foreach ($insight in $insights) {
+                $insightIndex++
+                $color = switch ($insight.Severity) {
+                    'CRITICAL' { 'Red' }
+                    'WARN' { 'Yellow' }
+                    default { 'Cyan' }
+                }
+                Write-Host ""
+                Write-Host ("[{0}] {1}  (Severity: {2}, Confidence: {3})" -f $insightIndex, $insight.Title, $insight.Severity, $insight.Confidence) -ForegroundColor $color
+                Write-Host ("    Why it matters : {0}" -f $insight.WhyItMatters) -ForegroundColor Gray
+                Write-Host ("    Evidence       : {0}" -f $insight.SupportingFindings) -ForegroundColor Gray
+                Write-Host ("    Suggested fix  : {0}" -f $insight.SuggestedAction) -ForegroundColor Green
+            }
+        }
+
+        $topSuspects = @($sorted | Where-Object { $_.Severity -in @('CRITICAL', 'WARN') } | Select-Object -First 10)
+        Write-Host ""
+        Write-Host "=== Top suspects (top 10) ===" -ForegroundColor Yellow
+        if ($topSuspects.Count -eq 0) {
+            Write-Host "No critical or warning-level recent change suspects were found." -ForegroundColor Green
+        }
+        else {
+            $suspectIndex = 0
+            foreach ($s in $topSuspects) {
+                $suspectIndex++
+                $color = if ($s.Severity -eq 'CRITICAL') { 'Red' } else { 'Yellow' }
+                $ts = if ($s.Timestamp) { ([datetime]$s.Timestamp).ToString('yyyy-MM-dd HH:mm:ss') } else { '(no timestamp)' }
+                Write-Host ""
+                Write-Host ("#{0,-2} [{1,-8}] [{2}] {3}" -f $suspectIndex, $s.Severity, $s.Category, $s.Item) -ForegroundColor $color
+                Write-Host ("     Timestamp : {0}" -f $ts) -ForegroundColor Gray
+                Write-Host ("     Change    : {0}" -f $s.ChangeType) -ForegroundColor Gray
+                Write-Host ("     Evidence  : {0}" -f $s.Evidence) -ForegroundColor Gray
+                if ($s.LikelyImpact) { Write-Host ("     Impact    : {0}" -f $s.LikelyImpact) -ForegroundColor Gray }
+                if ($s.SuggestedRepairSwitch) { Write-Host ("     Repair    : {0}" -f $s.SuggestedRepairSwitch) -ForegroundColor Green }
+                if ($s.Path) { Write-Host ("     Path      : {0}" -f $s.Path) -ForegroundColor DarkGray }
+            }
+        }
+
+        Write-Host ""
+        Write-Host "=== Findings by category (most recent first, up to 10 per category) ===" -ForegroundColor Cyan
+        foreach ($category in @($sorted.Category | Sort-Object -Unique)) {
+            $categoryAll = @($sorted | Where-Object { $_.Category -eq $category })
+            $categoryRows = @($categoryAll |
+                    Sort-Object @{ Expression = { if ($_.Timestamp) { [datetime]$_.Timestamp } else { [datetime]::MinValue } }; Descending = $true },
+                        @{ Expression = 'Priority'; Ascending = $true },
+                        Item |
+                    Select-Object -First 10)
+            if ($categoryRows.Count -eq 0) { continue }
+            Write-Host ""
+            Write-Host "[$category]" -ForegroundColor Cyan
+            $categoryRows |
+                Select-Object Severity,
+                    @{ Name = 'Timestamp'; Expression = { if ($_.Timestamp) { ([datetime]$_.Timestamp).ToString('yyyy-MM-dd HH:mm') } else { '' } } },
+                    Item,
+                    ChangeType,
+                    Evidence |
+                Format-Table -Wrap |
+                Out-String -Width 200 |
+                Write-Host
+        }
+
+        $topForLog = @($sorted | Select-Object -First 60)
+        Write-ActionLog -Event 'RecentChangeAnalysis' -Details @{
+            Description      = 'AnalyzeRecentChanges'
+            Success          = $true
+            Start            = $Started.ToString('o')
+            End              = $ended.ToString('o')
+            RecentChangeDays = $RecentChangeDays
+            Cutoff           = $Cutoff.ToString('o')
+            TotalFindings    = $sorted.Count
+            CriticalCount    = $critical.Count
+            WarningCount     = $warnings.Count
+            InfoCount        = $infos.Count
+            Insights         = $insights
+            TopFindings      = $topForLog
+        }
+    }
+
+    function AnalyzeRecentChanges {
+        param([int]$RecentChangeDays = 14)
+
+        $started = Get-Date
+        $cutoff = $started.AddDays(-1 * [math]::Abs($RecentChangeDays))
+        $findings = [System.Collections.Generic.List[object]]::new()
+
+        Write-Host "Analyzing recent offline OS changes (last $RecentChangeDays day(s))..." -ForegroundColor Yellow
+        Write-Host "Cutoff: $($cutoff.ToString('o'))" -ForegroundColor DarkGray
+
+        try {
+            Invoke-WithHive 'SYSTEM', 'SOFTWARE' {
+                $currentVersion = Get-ItemProperty 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+                if ($currentVersion) {
+                    $buildText = if ($currentVersion.CurrentBuildNumber) { "$($currentVersion.CurrentBuildNumber).$($currentVersion.UBR)" } else { 'unknown' }
+                    Write-Host "Guest OS: $($currentVersion.ProductName) build $buildText" -ForegroundColor Cyan
+                }
+
+                foreach ($collector in @(
+                        @{ Name = 'Servicing'; Script = { Add-RecentChangeServicingFindings -Findings $findings -Cutoff $cutoff } }
+                        @{ Name = 'Services'; Script = { Add-RecentChangeServiceFindings -Findings $findings -Cutoff $cutoff } }
+                        @{ Name = 'Registry risks'; Script = { Add-RecentChangeRegistryRiskFindings -Findings $findings -Cutoff $cutoff } }
+                        @{ Name = 'Software'; Script = { Add-RecentChangeSoftwareFindings -Findings $findings -Cutoff $cutoff } }
+                    )) {
+                    try { & $collector.Script }
+                    catch { Add-RecentChangeCollectorFailure -Findings $findings -Collector $collector.Name -ErrorText $_.Exception.Message }
+                }
+            }
+        }
+        catch { Add-RecentChangeCollectorFailure -Findings $findings -Collector 'Registry-backed collectors' -ErrorText $_.Exception.Message }
+
+        foreach ($collector in @(
+                @{ Name = 'SetupAPI'; Script = { Add-RecentChangeSetupApiFindings -Findings $findings -Cutoff $cutoff } }
+                @{ Name = 'Critical files'; Script = { Add-RecentChangeFileFindings -Findings $findings -Cutoff $cutoff } }
+                @{ Name = 'Event logs'; Script = { Add-RecentChangeEventFindings -Findings $findings -Cutoff $cutoff } }
+            )) {
+            try { & $collector.Script }
+            catch { Add-RecentChangeCollectorFailure -Findings $findings -Collector $collector.Name -ErrorText $_.Exception.Message }
+        }
+
+        Write-RecentChangeReport -Findings $findings -Cutoff $cutoff -RecentChangeDays $RecentChangeDays -Started $started
+    }
     function AnalyzeServicingState {
         Write-Host "Analyzing servicing/CBS pending state..." -ForegroundColor Yellow
         $pendingXml = Join-Path $script:WinDriveLetter 'Windows\WinSxS\pending.xml'
@@ -11698,6 +12651,8 @@ No destructive file or registry cleanup is performed.
             [switch]$GetBootPathReport,
             [switch]$AnalyzeBcdConsistency,
             [switch]$AnalyzeServicingState,
+            [switch]$AnalyzeRecentChanges,
+            [int]$RecentChangeDays = 14,
             [switch]$AnalyzeDomainTrustState,
             [switch]$PrepareRecoveryDiagnostics,
             [switch]$DisableDriverVerifier,
@@ -11759,6 +12714,9 @@ PARAMETERS:
   -AnalyzeSyntheticDrivers  Validate Azure/Hyper-V synthetic drivers (vmbus/storvsc/netvsc)
   -AnalyzeProxyState     Show machine proxy/PAC settings that may block remote management
   -AnalyzeBcdConsistency Validate BCD loader/device/path consistency for current boot mode
+    -AnalyzeRecentChanges  Build a read-only 14-day timeline of recent servicing, driver, registry,
+                                                     software, event log, and critical file changes that may explain a broken VM
+        -RecentChangeDays <N>   (sub-option) lookback window in days, default 14, range 1-180
   -GetBootPathReport     Full boot chain health check: traces all 5 boot phases (Pre-Boot -> Boot Manager
                            -> OS Loader -> NTOS Kernel -> Logon) validating every file, driver, and registry
                            setting in load order with signature verification and fix suggestions
@@ -11863,6 +12821,7 @@ PARAMETERS:
 --- WINDOWS UPDATE ------------------------------------------------------------
   -AnalyzeComponentStore Analyze CBS.log for corrupt components and identify required update versions
   -AnalyzeServicingState Check pending CBS/servicing markers (pending.xml, SessionsPending, RebootPending)
+    -AnalyzeRecentChanges  Correlate recent update, driver, software, registry and file changes into top suspects
   -ListInstalledUpdates  List installed Windows Updates (KB numbers) from offline CBS packages
   -DisableWindowsUpdate  Disable Windows Update services to stop boot loops
   -FixPendingUpdates     Remove pending Windows Update transactions
@@ -11933,8 +12892,8 @@ AVAILABLE DISKS:
 
         # Initialize logging and target (resolve VM/disk, bring disk online, detect partitions)
         # Determine if any write/repair action was requested (exclude pure read-only switches)
-        $readOnlySwitches = @('SysCheck', 'CheckDiskHealth', 'ScanNetBindings', 'CheckRDPPolicies', 'CollectEventLogs', 'CollectMinidumps', 'ShowLastSession', 'GetServicesReport', 'GetAppLockerReport', 'ListInstalledUpdates', 'ListStartupPrograms', 'AnalyzeCriticalBootFiles', 'AnalyzeSyntheticDrivers', 'AnalyzeProxyState', 'GetBootPathReport', 'AnalyzeBcdConsistency', 'AnalyzeComponentStore', 'AnalyzeServicingState', 'AnalyzeDomainTrustState')
-        $hasRepairAction = $PSBoundParameters.Keys | Where-Object { $readOnlySwitches -notcontains $_ -and $_ -notin @('VMName', 'DiskNumber', 'Force', 'LeaveDiskOnline', 'DriveLetter', 'RepairSource', 'CodeIntegrityPolicySourcePath', 'IncludeServices', 'IssuesOnly', 'KeepDefaultFilters', 'DriverStartType', 'LoadHive', 'UnloadHive') }
+        $readOnlySwitches = @('SysCheck', 'CheckDiskHealth', 'ScanNetBindings', 'CheckRDPPolicies', 'CollectEventLogs', 'CollectMinidumps', 'ShowLastSession', 'GetServicesReport', 'GetAppLockerReport', 'ListInstalledUpdates', 'ListStartupPrograms', 'AnalyzeCriticalBootFiles', 'AnalyzeSyntheticDrivers', 'AnalyzeProxyState', 'GetBootPathReport', 'AnalyzeBcdConsistency', 'AnalyzeComponentStore', 'AnalyzeServicingState', 'AnalyzeRecentChanges', 'AnalyzeDomainTrustState')
+        $hasRepairAction = $PSBoundParameters.Keys | Where-Object { $readOnlySwitches -notcontains $_ -and $_ -notin @('VMName', 'DiskNumber', 'Force', 'LeaveDiskOnline', 'DriveLetter', 'RepairSource', 'CodeIntegrityPolicySourcePath', 'IncludeServices', 'IssuesOnly', 'KeepDefaultFilters', 'DriverStartType', 'RecentChangeDays', 'LoadHive', 'UnloadHive') }
         if ($hasRepairAction) {
             Write-Host "  Tip: if you haven't already, a VM snapshot or disk backup before making changes is always a safe starting point." -ForegroundColor DarkGray
             Write-Host ""
@@ -12031,6 +12990,7 @@ AVAILABLE DISKS:
             if ($GetBootPathReport) { GetBootPathReport }
             if ($AnalyzeBcdConsistency) { AnalyzeBcdConsistency }
             if ($AnalyzeServicingState) { AnalyzeServicingState }
+            if ($AnalyzeRecentChanges) { AnalyzeRecentChanges -RecentChangeDays $RecentChangeDays }
             if ($AnalyzeDomainTrustState) { AnalyzeDomainTrustState }
             if ($PrepareRecoveryDiagnostics) { PrepareRecoveryDiagnostics }
             if ($CheckRDPPolicies) { GetRdpAuthPolicySnapshot }
@@ -12108,6 +13068,7 @@ AVAILABLE DISKS:
     $IssuesOnly = [bool]$PSBoundParameters.ContainsKey('IssuesOnly')
     $KeepDefaultFilters = [bool]$PSBoundParameters.ContainsKey('KeepDefaultFilters')
     $DriverStartType = if ($PSBoundParameters.ContainsKey('DriverStartType')) { $PSBoundParameters['DriverStartType'] }  else { $null }
+    $RecentChangeDays = if ($PSBoundParameters.ContainsKey('RecentChangeDays')) { $PSBoundParameters['RecentChangeDays'] } else { 14 }
     $Detailed = [bool]$PSBoundParameters.ContainsKey('Detailed')
     $All = [bool]$PSBoundParameters.ContainsKey('All')
     $SessionId = if ($PSBoundParameters.ContainsKey('SessionId')) { $PSBoundParameters['SessionId'] }        else { '' }
