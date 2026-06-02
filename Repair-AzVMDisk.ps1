@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.4.16
+        Version: 0.4.17
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -38,7 +38,7 @@
         - Rescue host: Windows 10/11 or Windows Server 2016/2019/2022/2025 with Desktop Experience
           and the Hyper-V role/feature enabled. Requires Windows PowerShell 5.1.
         - Target (broken) VM may be any of the above, including Server Core variants.
-        - Use -LeaveDiskOnline to keep the disk online after repair (required for chkdsk via -FixNTFS).
+        - Use -LeaveDiskOnline to keep the disk online after repair.
 
     .PARAMETER DiskNumber
         Disk number of the attached broken VM disk (from Get-Disk). Use instead of -VMName.
@@ -73,8 +73,8 @@
         PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixBootSector
 
     .EXAMPLE
-        # Run chkdsk on a specific partition (disk must stay online for the drive letter to be available)
-        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixNTFS -DriveLetter H: -LeaveDiskOnline
+        # Run chkdsk on a specific partition
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixFileSystem -DriveLetter H:
 
     .EXAMPLE
         # Reset a forgotten local admin password
@@ -96,7 +96,7 @@
 param (
     [Parameter(ParameterSetName = 'Repair')][string]$VMName = "",
     [Parameter(ParameterSetName = 'Repair')][int]$DiskNumber = -1,
-    [Parameter(ParameterSetName = 'Repair')][switch]$FixNTFS,
+    [Parameter(ParameterSetName = 'Repair')][switch]$FixFileSystem,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixBoot,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixSecureBootCodeIntegrity,
     [Parameter(ParameterSetName = 'Repair')][string]$CodeIntegrityPolicySourcePath = '',
@@ -138,6 +138,7 @@ param (
     [Parameter(ParameterSetName = 'Repair')][switch]$GetServicesReport,
     [Parameter(ParameterSetName = 'Repair')][string[]]$DisableDriverOrService = @(),
     [Parameter(ParameterSetName = 'Repair')][string[]]$EnableDriverOrService = @(),
+    [Parameter(ParameterSetName = 'Repair')][switch]$DisableLsaProtection,
     [Parameter(ParameterSetName = 'Repair')][switch]$DisableCredentialGuard,
     [Parameter(ParameterSetName = 'Repair')][switch]$EnableCredentialGuard,
     [Parameter(ParameterSetName = 'Repair')][switch]$DisableMemoryIntegrity,
@@ -191,7 +192,7 @@ param (
 )
 
 # Dynamic sub-parameters: only appear in tab completion when the parent switch is present.
-# This prevents clutter like -DriveLetter showing without -FixNTFS, or -All without -ShowLastSession.
+# This prevents clutter like -DriveLetter showing without -FixFileSystem, or -All without -ShowLastSession.
 dynamicparam {
     $dict = [System.Management.Automation.RuntimeDefinedParameterDictionary]::new()
 
@@ -207,8 +208,8 @@ dynamicparam {
         $dict.Add($Name, $p)
     }
 
-    # -DriveLetter: sub-option of -FixNTFS
-    if ($PSBoundParameters.ContainsKey('FixNTFS')) {
+    # -DriveLetter: sub-option of -FixFileSystem
+    if ($PSBoundParameters.ContainsKey('FixFileSystem')) {
         & $addParam 'DriveLetter' ([string]) 'Repair' ''
     }
     # -RepairSource: sub-option of -RepairComponentStore
@@ -1803,7 +1804,10 @@ $($htmlRows -join "`n")
             [PSCustomObject]@{ Name = 'volmgr';   Binary = 'volmgr.sys';   Start = 0; AllowedStarts = [int[]]@(0);    Required = $true;  CanRecreate = $true;  ErrorControl = 3; Group = 'System Bus Extender'; CheckStartOverride = $false; Description = 'volume manager' }
             [PSCustomObject]@{ Name = 'mountmgr'; Binary = 'mountmgr.sys'; Start = 0; AllowedStarts = [int[]]@(0);       Required = $true;  CanRecreate = $false; ErrorControl = 1; Group = 'System Bus Extender'; CheckStartOverride = $false; Description = 'mount point manager' }
             [PSCustomObject]@{ Name = 'volsnap';  Binary = 'volsnap.sys';  Start = 1; AllowedStarts = [int[]]@(0, 1, 3); Required = $true;  CanRecreate = $false; ErrorControl = 3; Group = 'Filter';             CheckStartOverride = $false; Description = 'volume shadow copy filter' }
-            [PSCustomObject]@{ Name = 'fvevol';   Binary = 'fvevol.sys';   Start = 0; AllowedStarts = [int[]]@(0, 1, 3); Required = $true;  CanRecreate = $false; ErrorControl = 3; Group = 'Filter';             CheckStartOverride = $false; Description = 'BitLocker volume filter' }
+            # Note: fvevol (BitLocker volume filter) is intentionally NOT listed here.
+            # Whether its service key is required depends on the OS volume actually being
+            # BitLocker-encrypted, which cannot be reliably determined from the offline
+            # registry hive alone, so flagging a missing key would produce false positives.
         )
     }
 
@@ -5073,6 +5077,61 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
         }
     }
 
+    function DisableLsaProtection {
+        if (-not (Confirm-CriticalOperation -Operation 'Disable LSA protection only (-DisableLsaProtection)' -Details @"
+Deletes only the offline SYSTEM hive value:
+  Control\Lsa\RunAsPPL
+
+This does NOT change Credential Guard, Device Guard, LsaCfgFlags, VBS, HVCI,
+or application proxy connector services.
+
+If RunAsPPL was enabled with UEFI lock, removing the registry value may not be
+sufficient. In that case, boot once with the Microsoft LSA protected process
+opt-out EFI tool to clear the firmware variable.
+"@)) { return }
+
+        $script:_lsaPplRunAsPPLBefore = $null
+        $script:_lsaPplUefiLockLikely = $false
+
+        Write-Host "Disabling LSA protection only..." -ForegroundColor Yellow
+        Invoke-WithHive 'SYSTEM' {
+            $SystemRoot = Get-SystemRootPath
+            $lsaPath = "$SystemRoot\Control\Lsa"
+            if (-not (Test-Path $lsaPath)) {
+                Write-Warning "  LSA registry path not found: $lsaPath"
+                return
+            }
+
+            $lsaProps = Get-ItemProperty $lsaPath -ErrorAction SilentlyContinue
+            $runAsPPL = $lsaProps.RunAsPPL
+            $script:_lsaPplRunAsPPLBefore = $runAsPPL
+
+            if ($null -eq $runAsPPL -or [int]$runAsPPL -eq 0) {
+                Write-Host "  RunAsPPL is not enabled on the offline OS." -ForegroundColor Green
+                Write-ActionLog -Event 'DisableLsaProtection' -Details @{ BeforeRunAsPPL = $runAsPPL; Changed = $false }
+                return
+            }
+
+            if ([int]$runAsPPL -eq 1) {
+                $script:_lsaPplUefiLockLikely = $true
+            }
+
+            Remove-ItemProperty-Logged -Path $lsaPath -Name RunAsPPL -Force
+            Write-Host "  Removed Control\Lsa\RunAsPPL from the offline SYSTEM hive." -ForegroundColor Green
+            Write-ActionLog -Event 'DisableLsaProtection' -Details @{ BeforeRunAsPPL = $runAsPPL; Changed = $true }
+        }
+
+        if ($null -ne $script:_lsaPplRunAsPPLBefore -and [int]$script:_lsaPplRunAsPPLBefore -ne 0) {
+            Write-Host "`n--- REVERT COMMAND (run on the VM after recovery, if needed) ---" -ForegroundColor Cyan
+            Write-Host "Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name RunAsPPL -Value $script:_lsaPplRunAsPPLBefore -Type DWord -Force" -ForegroundColor White
+            Write-Host "----------------------------------------------------------------`n" -ForegroundColor Cyan
+        }
+
+        if ($script:_lsaPplUefiLockLikely) {
+            Write-Warning "RunAsPPL=1 can indicate LSA protection was enabled with UEFI lock. This switch intentionally did not modify Credential Guard. If LSASS still starts as a protected process after reboot, boot once with the Microsoft LSA protected process opt-out EFI tool to clear the firmware variable."
+        }
+    }
+
     function DisableMemoryIntegrity {
         if (-not (Confirm-CriticalOperation -Operation 'Disable Memory Integrity / HVCI (-DisableMemoryIntegrity)' -Details @"
 Disables offline Hypervisor-Enforced Code Integrity settings that can cause a
@@ -6484,7 +6543,8 @@ complete recovery.
 
         # Security
         $sevCredentialGuard = 1   # Credential Guard is enabled
-        $sevLsaPPL = 0   # LSA RunAsPPL=1 active
+        $sevLsaPPL = 0   # LSA RunAsPPL active
+        $sevAppProxyLsaProtection = 1   # Application proxy connector + LSA protection can cause Kerberos/LSASS issues after servicing
         $sevAppLockerConfigured = 0  # AppLocker EnforcementMode != 0 only (no service, no rules)
         $sevAppLockerEnforcing = 1   # AppLocker EnforcementMode != 0 + AppIDSvc auto-start
         $sevAppLockerActive   = 2   # AppLocker EnforcementMode != 0 + AppIDSvc auto-start + rules exist
@@ -6615,10 +6675,10 @@ complete recovery.
                     $fs = $vol.FileSystemType
                     $pLetter = if ($p.DriveLetter -and $p.DriveLetter -ne "`0") { "$($p.DriveLetter):" } else { $script:WinDriveLetter.TrimEnd('\') }
                     if ([string]::IsNullOrEmpty($fs) -or $fs -eq 'Unknown') {
-                        & $emit 'Disk' (& $toSev $sevDiskRawFs) "Partition $($p.PartitionNumber) ($pLetter): RAW filesystem - data may be inaccessible" "-FixNTFS -DriveLetter $pLetter -LeaveDiskOnline"
+                        & $emit 'Disk' (& $toSev $sevDiskRawFs) "Partition $($p.PartitionNumber) ($pLetter): RAW filesystem - data may be inaccessible" "-FixFileSystem -DriveLetter $pLetter"
                     }
                     elseif ($vol.HealthStatus -ne 'Healthy') {
-                        & $emit 'Disk' (& $toSev $sevDiskFsHealth) "Partition $($p.PartitionNumber) ($pLetter) ($fs): health=$($vol.HealthStatus)" "-FixNTFS -DriveLetter $pLetter -LeaveDiskOnline"
+                        & $emit 'Disk' (& $toSev $sevDiskFsHealth) "Partition $($p.PartitionNumber) ($pLetter) ($fs): health=$($vol.HealthStatus)" "-FixFileSystem -DriveLetter $pLetter"
                     }
                 }
             }
@@ -7357,8 +7417,24 @@ complete recovery.
                     & $emit 'Security' (& $toSev $sevCredentialGuard) "Credential Guard is enabled (LsaCfgFlags=$cgLsa, $lockType)" "-DisableCredentialGuard"
                 }
                 $runAsPPL = $lsaProps.RunAsPPL
-                if ($runAsPPL -eq 1) {
-                    & $emit 'Security' (& $toSev $sevLsaPPL) 'LSA Protected Process (RunAsPPL=1) is active - may affect some security tools'
+                if ($null -ne $runAsPPL -and [int]$runAsPPL -ne 0) {
+                    & $emit 'Security' (& $toSev $sevLsaPPL) "LSA Protected Process (RunAsPPL=$runAsPPL) is active - may affect some security tools"
+                }
+                $appProxyConnectorServices = [System.Collections.Generic.List[string]]::new()
+                foreach ($svcKey in (Get-ChildItem $svcRoot -ErrorAction SilentlyContinue)) {
+                    $svcProps = Get-ItemProperty $svcKey.PSPath -ErrorAction SilentlyContinue
+                    $svcName = $svcKey.PSChildName
+                    $svcDisplay = [string]$svcProps.DisplayName
+                    $svcImage = [string]$svcProps.ImagePath
+                    if ($svcName -in @('WAPCSvc', 'WAPCUpdaterSvc') -or
+                        $svcDisplay -match '(?i)(AAD|Entra).*Application Proxy.*Connector|Application Proxy Connector' -or
+                        $svcImage -match '(?i)AAD App Proxy Connector|Application Proxy Connector|WAPC') {
+                        $label = if ($svcDisplay) { "$svcName ($svcDisplay)" } else { $svcName }
+                        if (-not $appProxyConnectorServices.Contains($label)) { $appProxyConnectorServices.Add($label) }
+                    }
+                }
+                if ($appProxyConnectorServices.Count -gt 0 -and $null -ne $runAsPPL -and [int]$runAsPPL -ne 0) {
+                    & $emit 'Security' (& $toSev $sevAppProxyLsaProtection) "Microsoft Entra application proxy connector installed ($($appProxyConnectorServices -join ', ')) and LSA protection is enabled (RunAsPPL=$runAsPPL) - if Kerberos delegation fails or LSASS restarts after servicing, disable only LSA protection" "-DisableLsaProtection"
                 }
 
                 # -- Azure Guest Agent ------------------------------------------------
@@ -7897,13 +7973,11 @@ complete recovery.
                             & $emit 'UEFI' (& $toSev $sevBitLockerActive) "BitLocker FVE policy configured ($($fveDetail -join ', ')) - if BitLocker is active with TPM protector, the disk CANNOT auto-unlock on a different VM; a recovery key is required"
                         }
                     }
-                    # Check if BitLocker volume encryption was active via SYSTEM hive marker
-                    # FVE filter driver at boot-start is a strong indicator
-                    # (fvevol is already tracked in device class filters; emit a targeted Gen2 warning here)
-                    $fveVolPath = 'HKLM:\BROKENSOFTWARE\Microsoft\BitLocker'
-                    if (Test-Path $fveVolPath) {
-                        & $emit 'UEFI' (& $toSev $sevBitLockerActive) 'BitLocker configuration key found (SOFTWARE\\Microsoft\\BitLocker) - if volume is encrypted with vTPM protector, moving the disk or recreating the VM will require the BitLocker recovery key'
-                    }
+                    # Note: HKLM\SOFTWARE\Microsoft\BitLocker is intentionally NOT checked here.
+                    # That key exists by default on virtually every Windows install regardless of
+                    # whether any volume is actually encrypted, so testing for its presence would
+                    # fire on nearly every Gen2 VM. The FVE policy check above is gated on real
+                    # configured policy values and is the meaningful BitLocker signal.
                 }
 
                 # AppLocker enforced collections
@@ -8246,14 +8320,28 @@ complete recovery.
             Write-Host "`nCRITICAL - likely preventing boot or connectivity:" -ForegroundColor Red
             foreach ($f in $crits) {
                 Write-Host "  [$($f.Category)] $($f.Description)" -ForegroundColor Red
-                if ($f.Fix) { Write-Host "    > .\$scriptFile -DiskNumber $script:DiskNumber $($f.Fix)" -ForegroundColor DarkCyan }
+                if ($f.Fix) {
+                    if ($f.Fix.TrimStart().StartsWith('-')) {
+                        Write-Host "    > .\$scriptFile -DiskNumber $script:DiskNumber $($f.Fix)" -ForegroundColor DarkCyan
+                    }
+                    else {
+                        Write-Host "    $($f.Fix)" -ForegroundColor DarkCyan
+                    }
+                }
             }
         }
         if ($warns.Count -gt 0) {
             Write-Host "`nWARNINGS - should be investigated:" -ForegroundColor Yellow
             foreach ($f in $warns) {
                 Write-Host "  [$($f.Category)] $($f.Description)" -ForegroundColor Yellow
-                if ($f.Fix) { Write-Host "    > .\$scriptFile -DiskNumber $script:DiskNumber $($f.Fix)" -ForegroundColor DarkCyan }
+                if ($f.Fix) {
+                    if ($f.Fix.TrimStart().StartsWith('-')) {
+                        Write-Host "    > .\$scriptFile -DiskNumber $script:DiskNumber $($f.Fix)" -ForegroundColor DarkCyan
+                    }
+                    else {
+                        Write-Host "    $($f.Fix)" -ForegroundColor DarkCyan
+                    }
+                }
             }
         }
         if ($crits.Count -eq 0 -and $warns.Count -eq 0) {
@@ -9631,14 +9719,28 @@ instead of preserving ACLs that may have been modified during troubleshooting.
             @{L = 'Path'; E = { $_.Path } } -AutoSize
 
             # -- 3. Pick the best candidate ---------------------------------------
-            # Prefer candidates with valid version info (real PE binaries),
+            # For driver (.sys) files, prefer the DriverStore FileRepository copy whose
+            # INF package folder matches the driver name (e.g. netvsc.inf_*\netvsc.sys).
+            # That copy is the version actually bound to the installed driver and is the
+            # most reliable replacement - ahead of any superseded WinSxS component copy
+            # that may merely be larger/newer. This matches the manual recovery pattern
+            # used for Azure/Hyper-V synthetic drivers (netvsc.sys, storvsc.sys, vmbus.sys).
+            # After that, prefer candidates with valid version info (real PE binaries),
             # then largest size (most complete), then newest date.
             # Files without version info are likely delta stubs or placeholders.
+            $driverBaseName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
+            $infMatchPattern = '\\' + [regex]::Escape($driverBaseName) + '\.inf_'
             $best = $candidates |
-                Sort-Object @{Expression = { if ($_.Version -and $_.Company) { 0 } else { 1 } } },
+                Sort-Object @{Expression = {
+                                if ($ext -eq '.sys' -and $_.Source -eq 'DriverStore' -and $_.Path -match $infMatchPattern) { 0 } else { 1 } } },
+                            @{Expression = { if ($_.Version -and $_.Company) { 0 } else { 1 } } },
                             @{Expression = 'Size'; Descending = $true },
                             @{Expression = 'LastWrite'; Descending = $true } |
                 Select-Object -First 1
+
+            if ($ext -eq '.sys' -and $best.Source -eq 'DriverStore' -and $best.Path -match $infMatchPattern) {
+                Write-Host "  Preferring DriverStore INF-matched driver package copy ($driverBaseName.inf_*)." -ForegroundColor DarkGray
+            }
 
             Write-Host "  Selected: $($best.Path)" -ForegroundColor Cyan
             Write-Host "    Version: $($best.Version)  |  Size: $("{0:N0}" -f $best.Size) bytes  |  Date: $($best.LastWrite.ToString('yyyy-MM-dd HH:mm'))  |  Company: $($best.Company)" -ForegroundColor White
@@ -12574,7 +12676,7 @@ No destructive file or registry cleanup is performed.
         param (
             [string]$VMName = "",
             [int]$DiskNumber = -1,
-            [switch]$FixNTFS,
+            [switch]$FixFileSystem,
             [switch]$FixBoot,
             [switch]$FixSecureBootCodeIntegrity,
             [string]$CodeIntegrityPolicySourcePath = '',
@@ -12620,6 +12722,7 @@ No destructive file or registry cleanup is performed.
             [string[]]$DisableDriverOrService = @(),
             [string[]]$EnableDriverOrService = @(),
             [ValidateSet('Boot', 'System', 'Automatic', 'Manual', 'Disabled')][string]$DriverStartType,
+            [switch]$DisableLsaProtection,
             [switch]$DisableCredentialGuard,
             [switch]$EnableCredentialGuard,
             [switch]$DisableMemoryIntegrity,
@@ -12748,7 +12851,7 @@ PARAMETERS:
 --- DISK & FILESYSTEM ---------------------------------------------------------
   -RepairComponentStore   Run DISM ScanHealth + RestoreHealth on the component store
     -RepairSource <path>     (sub-option) .wim, .iso, .msu, or .cab to use as repair source
-  -FixNTFS               Run chkdsk on the Windows partition
+  -FixFileSystem         Run chkdsk on the Windows partition
     -DriveLetter <letter>    (sub-option) target a specific drive letter instead of the auto-detected Windows partition
   -FixSanPolicy          Set SAN policy to OnlineAll (fix offline disks after migration)
   -RepairSystemFile <name[,name,...]>  Replace missing/0-byte system binary from WinSxS or DriverStore
@@ -12803,6 +12906,7 @@ PARAMETERS:
 --- SECURITY ------------------------------------------------------------------
   -DisableAppLocker            Disable AppLocker enforcement and AppIDSvc (fixes boot blocked by bad policy)
   -GetAppLockerReport          Show AppLocker enforcement state, AppIDSvc config, and parsed rules per collection
+    -DisableLsaProtection        Disable only LSA protected process mode (RunAsPPL); does not change Credential Guard
   -DisableCredentialGuard      Disable Credential Guard and LSA protection
   -EnableCredentialGuard       Re-enable Credential Guard and LSA protection
     -DisableMemoryIntegrity      Disable Hypervisor-Enforced Code Integrity / Memory Integrity offline
@@ -12910,7 +13014,7 @@ AVAILABLE DISKS:
         Start-ActionLog "Repair-OfflineDisk start"
 
         try {
-            if ($FixNTFS) { FixDiskCorruption -DriveLetter $DriveLetter }
+            if ($FixFileSystem) { FixDiskCorruption -DriveLetter $DriveLetter }
             if ($FixBoot) { RebuildBCD }
             if ($FixSecureBootCodeIntegrity) { RepairSecureBootCodeIntegrity -CodeIntegrityPolicySourcePath $CodeIntegrityPolicySourcePath }
             if ($FixBootSector) { FixBootSector }
@@ -12961,6 +13065,7 @@ AVAILABLE DISKS:
                 $startInt = ConvertTo-ServiceStartValue -DriverStartType $DriverStartType
                 foreach ($d in $EnableDriverOrService) { if (-not [string]::IsNullOrWhiteSpace($d)) { Enable-ServiceOrDriver -ServiceName $d.Trim() -StartValue $startInt } }
             }
+            if ($DisableLsaProtection) { DisableLsaProtection }
             if ($DisableCredentialGuard) { DisableCredentialGuard }
             if ($EnableCredentialGuard) { EnableCredentialGuard }
             if ($DisableMemoryIntegrity) { DisableMemoryIntegrity }
