@@ -394,19 +394,152 @@ All actions are logged to a JSON-line audit file (`Repair-AzVMDisk_actions.log`)
 .\Repair-AzVMDisk.ps1 -ShowLastSession -All -ExportTo C:\Temp\repair_log.html
 ```
 
-## Common Scenarios
+## Symptom → Fix mapping
 
-| Scenario | Command |
-|---|---|
-| VM fails to boot | `-SysCheck` then the specific suggested fix |
-| Stop 0x7B / inaccessible boot device after migration | `-SysCheck` then `-FixBootStorageDrivers`; use `-FixBoot` if `-SysCheck` reports BCD findings |
-| RDP not working | `-FixRDP -DisableNLA` |
-| Blue screen / stop error investigation | `-SysCheck` then the specific suggested fix |
-| Locked out of VM | `-ResetLocalAdminPassword` or `-AddTempUser` |
-| Stuck on Windows Update | `-FixPendingUpdates` |
-| Device filter findings | `-SysCheck` then `-FixDeviceFilters` when recommended |
-| Azure VM agent broken | `-FixAzureGuestAgent` or `-InstallAzureVMAgent` |
-| Corrupted system files | `-RunSFC` then `-RepairComponentStore` |
+This section maps **what you observe** — an on-screen Windows stop/boot error code, or a behavior such as
+"no boot", "black screen", "can't RDP", or "stuck on Windows Update" — to the script actions most likely to
+address it. The listed switches *attempt* to repair the condition; they are not guaranteed fixes, and the
+underlying fault may have more than one cause.
+
+> **Always diagnose first.** Run `-SysCheck` (and, for boot problems, `-GetBootPathReport`) before applying any
+> repair. These read-only scans inspect the offline disk and print the **exact switch to run** for each finding,
+> so the tables below are a reference for the recommendations the script already surfaces.
+>
+> ```powershell
+> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -SysCheck
+> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -GetBootPathReport
+> ```
+
+### By observable behavior
+
+| Symptom / behavior | Likely cause | Try these actions (in order) | Reference |
+|---|---|---|---|
+| VM never reaches the sign-in screen; cause unknown | Mixed boot/registry/driver fault | `-SysCheck` → `-GetBootPathReport` → the specific suggested fix | [Boot errors][be] |
+| Stop **0x7B** / inaccessible boot device after migration or disk swap | Boot storage driver `Start` values, missing synthetic/inbox storage drivers, or unsafe class filters | `-SysCheck` → `-FixBootStorageDrivers` → `-EnsureSyntheticDriversEnabled` → `-FixDeviceFilters` → `-FixSanPolicy` | [INACCESSIBLE_BOOT_DEVICE][7b], [After HW change][7bhw] |
+| "Checking file system on C:" loop, or **UNMOUNTABLE_BOOT_VOLUME** | NTFS / file-system corruption on the boot volume | `-CheckDiskHealth` → `-FixFileSystem -DriveLetter H:` | [Check-disk boot error][chk], [Disk corruption][dsk] |
+| Stuck on **"Getting Windows ready. Don't turn off your computer"** or update reboot loop | Pending CBS / servicing transaction won't complete | `-AnalyzeServicingState` → `-FixPendingUpdates` → `-DisableWindowsUpdate` → `-UninstallWindowsUpdate <KB>` → `-RepairComponentStore` | [Stuck updating][upd], [Getting Windows ready][gwr] |
+| Continuous reboot / automatic-repair loop | Failed update, bad driver, or startup-repair churn | `-SysCheck` → `-FixPendingUpdates` → `-DisableStartupRepair` → `-TrySafeMode` | [Reboot loop][rbl] |
+| Black screen after logon (no desktop) | Winlogon Shell/Userinit changed, or `explorer.exe` missing | `-FixWinlogon` → `-RepairSystemFile explorer.exe` | [Critical service failed][csf] |
+| **"CRITICAL SERVICE FAILED"** blue screen | Boot-critical driver/service disabled or missing binary | `-SysCheck` → `-GetServicesReport -IssuesOnly` → `-EnsureSyntheticDriversEnabled` → `-FixBootStorageDrivers` | [Critical service failed][csf] |
+| Random driver blue screens (0x7E, 0xD1, 0x50, 0x1E) or Driver Verifier crashes | Faulty third-party driver or active Driver Verifier | `-CollectMinidumps` → `-DisableDriverVerifier` → `-DisableThirdPartyDrivers` / `-DisableDriverOrService <name>` → `-TrySafeMode` | [Common blue screen][bsod] |
+| Boot blocked after enabling HVCI / Memory Integrity, or unsigned-driver block | Code-integrity / Secure Boot policy rejects a driver | `-DisableMemoryIntegrity` → `-FixSecureBootCodeIntegrity` → `-RepairSystemFile <driver>` | [Invalid image hash][cih], [Disabling Secure Boot][sb] |
+| Can't RDP — connection reaches the VM but authentication fails | NLA / certificate / auth-policy or RDP listener misconfig | `-FixRDP` → `-DisableNLA` → `-FixRDPAuth` → `-FixRDPCert` → `-FixRDPPermissions` | [Can't RDP][rdp], [RDP connection][rdpc], [Detailed RDP][rdpd] |
+| RDP "internal error" / "general error" | Broken RDP self-signed cert or key permissions | `-FixRDPCert` → `-FixRDPPermissions` → `-FixRDP` | [Internal error][rdpi], [General error][rdpg] |
+| No network after boot / NIC bindings broken | Orphaned network bindings, missing `netvsc`, or stuck stack | `-ScanNetBindings` → `-FixNetBindings` → `-EnsureSyntheticDriversEnabled` → `-ResetNetworkStack` → `-ResetInterfacesToDHCP` | [Boot errors][be] |
+| Locked out / forgot the local admin password | Lost credentials | `-ResetLocalAdminPassword` → `-AddTempUser` (or `-AddTempUser2` for domain-joined) | [Reset password offline][rpw], [Reset RDP][reset], [VMAccess][vma] |
+| Boot or logon blocked by policy | AppLocker, Credential Guard / LSA, or bad Group Policy | `-DisableAppLocker` → `-DisableCredentialGuard` → `-ResetGroupPolicy` → `-FixUserRights` | [Boot errors][be] |
+| Corrupted / temporary user profile | `.bak` profile keys or temp-profile flag | `-FixProfileLoad` | [Boot errors][be] |
+| Azure VM Agent shows **"Not ready"** / extensions fail | Guest Agent broken or missing | `-FixAzureGuestAgent` → `-InstallAzureVMAgent` | [Guest Agent][aga], [VM assist][vmw], [Slow start / failed ext.][sext] |
+| Corrupted system files (general) | WinSxS / component-store damage | `-RunSFC` → `-RepairComponentStore` (add `-RepairSource <wim>` if offline store is broken) | [Boot errors][be] |
+| Need live triage from outside the OS | No console access | `-EnableSerialConsole` → `-EnableBootLog` → `-SetFullMemDump` → `-PrepareRecoveryDiagnostics` → `-CollectEventLogs` | [Serial Console][sac] |
+
+### By Windows stop code / boot error code
+
+The codes below are the on-screen values shown in **boot diagnostics** screenshots or on the SAC/Serial Console.
+"Try these actions" lists the switches that *attempt* to repair the most common cause; confirm with `-SysCheck`
+first.
+
+| Code | Name / on-screen text | Likely cause | Try these actions | Reference |
+|---|---|---|---|---|
+| **0xC0000001** | STATUS_UNSUCCESSFUL — generic boot failure | Missing/corrupt boot files, BCD, or boot-critical hive | `-SysCheck` → `-FixBoot` → `-RecreateBootPartition` → `-RestoreRegistryFromRegBack` | [Boot errors][be] |
+| **0xC000000F** | "couldn't read the Boot Configuration Data" | BCD or a required boot file missing/unreadable | `-FixBoot` → `-RecreateBootPartition` → `-FixBootSector` (Gen1) | [0xC000000F][c00f] |
+| **0xC0000011** | Boot error 0xC0000011 | Boot file/BCD read error | `-FixBoot` → `-RecreateBootPartition` | [0xC0000011][c011] |
+| **0xC0000034** | STATUS_OBJECT_NAME_NOT_FOUND | Pending update left a missing BCD/registry object | `-FixPendingUpdates` → `-FixBoot` | [Stuck updating][upd] |
+| **0xC0000098** | "BCD file doesn't contain a valid OS entry" | BCD has no/invalid Windows loader entry | `-FixBoot` → `-RecreateBootPartition` | [0xC0000098][c098] |
+| **0xC0000102** | STATUS_FILE_CORRUPT | Corrupt file or hive on the boot volume | `-FixFileSystem` → `-RunSFC` → `-RepairComponentStore` → `-RestoreRegistryFromRegBack` | [0xC0000102][c102] |
+| **0xC0000225** | "boot selection failed; a required device is inaccessible" | Missing boot partition / BCD device mismatch | `-FixBoot` → `-RecreateBootPartition` → `-FixBootSector` | [Boot errors][be] |
+| **0xC0000359** | Boot error 0xC0000359 | Corrupt/mismatched `winload` boot loader | `-FixBoot` → `-RepairSystemFile winload.efi` → `-RepairComponentStore` | [0xC0000359][c359] |
+| "An operating system wasn't found" / **0xC000000E** | Boot manager finds no bootable OS | Inactive/missing boot partition or empty BCD | `-FixBoot` → `-RecreateBootPartition` → `-FixBootSector` | [OS not found][osnf] |
+| **0x0000007B** | INACCESSIBLE_BOOT_DEVICE | Storage driver `Start`/filters/SAN policy after migration | `-FixBootStorageDrivers` → `-EnsureSyntheticDriversEnabled` → `-FixDeviceFilters` → `-FixSanPolicy` | [INACCESSIBLE_BOOT_DEVICE][7b], [Server 2012 R2 / platform update][2012] |
+| **0x000000ED** | UNMOUNTABLE_BOOT_VOLUME | File-system corruption on boot volume | `-CheckDiskHealth` → `-FixFileSystem` | [Check-disk boot error][chk] |
+| **0x00000074** / **0xC000014C** | BAD_SYSTEM_CONFIG_INFO / STATUS_REGISTRY_CORRUPT | Corrupt SYSTEM/SOFTWARE hive | `-CheckRegistryHealth` → `-FixRegistryCorruption` → `-RestoreRegistryFromRegBack` | [Fix corrupted hive][hive] |
+| **0xC0000218** | STATUS_CANNOT_LOAD_REGISTRY_FILE | Registry hive missing, 0-byte, or unreadable | `-RestoreRegistryFromRegBack` → `-FixRegistryCorruption` | [0xC0000218][c218], [Fix corrupted hive][hive] |
+| **0xC000021A** | STATUS_SYSTEM_PROCESS_TERMINATED | winlogon/csrss/lsass crash after bad update or file/registry mismatch | `-FixWinlogon` → `-RestoreRegistryFromRegBack` → `-FixPendingUpdates` → `-RunSFC` → `-RepairComponentStore` | [0xC000021A][c21a] |
+| **0x000000EF** | CRITICAL_PROCESS_DIED | Critical system process missing/corrupt | `-RepairSystemFile <proc>.exe` → `-FixWinlogon` → `-RunSFC` → `-RepairComponentStore` | [Critical service failed][csf] |
+| **0x00000067** | CONFIG_INITIALIZATION_FAILED | Stale IMC hive entries in BCD | `-FixBoot` | [Boot errors][be] |
+| **0xC0000428** | "Windows cannot verify the digital signature" / Invalid Image Hash | Unsigned/corrupt boot driver, or HVCI/Secure Boot block | `-FixSecureBootCodeIntegrity` → `-DisableMemoryIntegrity` → `-RepairSystemFile <driver>` → `-EnableTestSigning` (temporary) | [Invalid image hash][cih], [Disabling Secure Boot][sb] |
+| **0xc0430001** | winload.efi Code Integrity error (Gen2) | Stale EFI boot manager / Code-Integrity policy payloads | `-FixSecureBootCodeIntegrity` (optionally `-CodeIntegrityPolicySourcePath`) | [Invalid image hash][cih] |
+| Directory Service init failure (DC) | "directory service initialization failure" | AD DS database (ntds.dit) / boot dependency | `-SysCheck` → `-RestoreRegistryFromRegBack` (DC database repair is out of scope) | [DS init failure][dsi] |
+
+## References — Microsoft Learn
+
+All links are public Microsoft documentation.
+
+- [Troubleshoot Azure VM boot errors (hub)][be]
+- [INACCESSIBLE_BOOT_DEVICE in an Azure VM][7b]
+- [Stop 0x7B after reconfiguring hardware devices][7bhw]
+- [Windows Server 2012 R2 startup failure after platform update][2012]
+- [Boot error 0xC000000F][c00f]
+- [Boot error 0xC0000011][c011]
+- [Boot error 0xc0000098][c098]
+- [Boot error 0xc0000359][c359]
+- [Stop error 0xC0000102 (Status File Corrupt)][c102]
+- [Windows boot error: an operating system wasn't found][osnf]
+- [Repair the boot configuration data (BCD)][bcd]
+- [Check-disk boot error ("checking file system")][chk]
+- [Data corruption and disk errors guidance][dsk]
+- [VM startup stuck at Windows update][upd]
+- [Stuck on "Getting Windows ready"][gwr]
+- [Windows reboot loop on an Azure VM][rbl]
+- [Fix registry hive corruption][hive]
+- [Bug Check 0xC0000218: STATUS_CANNOT_LOAD_REGISTRY_FILE][c218]
+- [Stop error 0xC000021A (Status System Process Terminated)][c21a]
+- [CRITICAL SERVICE FAILED blue screen][csf]
+- [Common blue screen errors when booting an Azure VM][bsod]
+- [Boot manager error 0xC0000428 (Invalid Image Hash)][cih]
+- [Disabling Secure Boot][sb]
+- [Directory service initialization failure][dsi]
+- [Can't connect via RDP to an Azure VM][rdp]
+- [Troubleshoot RDP connections][rdpc]
+- [Detailed RDP troubleshooting][rdpd]
+- [RDP internal error][rdpi]
+- [RDP general error][rdpg]
+- [Reset local Windows password offline][rpw]
+- [Reset Remote Desktop Services / admin password][reset]
+- [VMAccess extension for Windows][vma]
+- [Troubleshoot Azure Windows VM Agent issues][aga]
+- [VM assist (guest agent tool)][vmw]
+- [Slow VM start when extensions are failed][sext]
+- [Azure Serial Console overview][sac]
+- [Windows Server doesn't start after updates (disk corruption)][wsd]
+
+[be]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/boot-error-troubleshoot
+[7b]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/windows-boot-failure
+[7bhw]: https://learn.microsoft.com/troubleshoot/windows-server/performance/inaccessible-boot-device-stop-error
+[2012]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/windows-server-2012r2-boot-failure-platform-update
+[c00f]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/boot-error-0xc000000f
+[c011]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/boot-error-0xc0000011
+[c098]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/boot-error-0xc0000098
+[c359]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/boot-error-0xc0000359
+[c102]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/error-code-0xc0000102-status-file-corrupt
+[osnf]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/os-not-found
+[bcd]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/virtual-machines-windows-repair-boot-configuration-data
+[chk]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/troubleshoot-check-disk-boot-error
+[dsk]: https://learn.microsoft.com/troubleshoot/windows-server/backup-and-storage/troubleshoot-data-corruption-and-disk-errors
+[upd]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/troubleshoot-stuck-updating-boot-error
+[gwr]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/troubleshoot-vm-boot-configure-update
+[rbl]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/troubleshoot-reboot-loop
+[hive]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/virtual-machines-windows-fix-corrupted-hive
+[c218]: https://learn.microsoft.com/windows-hardware/drivers/debugger/bug-check-0xc0000218--status-cannot-load-registry-file
+[c21a]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/windows-stop-error-system-process-terminated
+[csf]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/troubleshoot-critical-service-failed-boot-error
+[bsod]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/troubleshoot-common-blue-screen-error
+[cih]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/windows-boot-error-invalid-image-hash
+[sb]: https://learn.microsoft.com/windows-hardware/manufacture/desktop/disabling-secure-boot
+[dsi]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/troubleshoot-directory-service-initialization-failure
+[rdp]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/cannot-connect-rdp-azure-vm
+[rdpc]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/troubleshoot-rdp-connection
+[rdpd]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/detailed-troubleshoot-rdp
+[rdpi]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/troubleshoot-rdp-internal-error
+[rdpg]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/troubleshoot-rdp-general-error
+[rpw]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/reset-local-password-without-agent
+[reset]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/reset-rdp
+[vma]: https://learn.microsoft.com/azure/virtual-machines/extensions/vmaccess-windows
+[aga]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/windows-azure-guest-agent
+[vmw]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/windows-azure-guest-agent-tools-vmassist
+[sext]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/slow-vm-start-extensions-troubleshooting
+[sac]: https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/serial-console-overview
+[wsd]: https://learn.microsoft.com/troubleshoot/windows-server/performance/disk-corruption-prevents-windows-server-update-restart
 
 ## Author
 
