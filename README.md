@@ -12,7 +12,8 @@ Repair-AzVMDisk attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM
 
 - Must be run **as Administrator** on the Hyper-V rescue VM.
 - The broken VM's OS disk must be attached to the rescue VM (either as a disk passthrough or via Hyper-V).
-- Tested on Windows Server 2016 / 2019 / 2022 rescue environments.
+- Rescue host: Windows 10/11 or Windows Server 2016 / 2019 / 2022 / 2025 with the Hyper-V role/feature enabled.
+- Supported target (broken) guest OS: Windows Server 2012 R2 and later (2012 R2 / 2016 / 2019 / 2022 / 2025) or Windows 10/11, including Server Core and Gen1/Gen2 disks.
 - PowerShell 5.1 or later.
 
 ## Quick Start
@@ -126,8 +127,8 @@ You can also target a Hyper-V VM by name instead of disk number:
 ### File System & Component Store Repair
 
 ```powershell
-# Run chkdsk on a specific partition (disk stays online for drive letter access)
-.\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixNTFS -DriveLetter H: -LeaveDiskOnline
+# Run chkdsk on a specific partition
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixFileSystem -DriveLetter H:
 
 # Run SFC (System File Checker) offline
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -RunSFC
@@ -357,7 +358,7 @@ Multiple switches can be combined in a single run:
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixBoot -FixRDP -DisableNLA
 
 # Full repair pass: chkdsk + SFC + DISM + BCD rebuild
-.\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixNTFS -DriveLetter H: -RunSFC -RepairComponentStore -FixBoot -LeaveDiskOnline
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixFileSystem -DriveLetter H: -RunSFC -RepairComponentStore -FixBoot
 ```
 
 ### Manually Loading Registry Hives

@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.4.17
+        Version: 0.5.0
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -37,7 +37,8 @@
         - The broken VM's OS disk must be attached to the rescue VM.
         - Rescue host: Windows 10/11 or Windows Server 2016/2019/2022/2025 with Desktop Experience
           and the Hyper-V role/feature enabled. Requires Windows PowerShell 5.1.
-        - Target (broken) VM may be any of the above, including Server Core variants.
+        - Target (broken) VM may be Windows Server 2012 R2 or later (2012 R2/2016/2019/2022/2025)
+          or Windows 10/11, including Server Core variants.
         - Use -LeaveDiskOnline to keep the disk online after repair.
 
     .PARAMETER DiskNumber
@@ -73,7 +74,9 @@
         PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixBootSector
 
     .EXAMPLE
-        # Run chkdsk on a specific partition
+        # Run chkdsk on a specific partition. The script auto-detects whether the volume needs a
+        # full chkdsk /F /X or a targeted chkdsk /spotfix (to clear a spot-verifier $corrupt 'Warning'
+        # health state, common on Windows Server 2012 R2) and runs the appropriate repair automatically.
         PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixFileSystem -DriveLetter H:
 
     .EXAMPLE
@@ -316,6 +319,29 @@ end {
         }
     }
 
+    function Get-BcdStoreItem {
+        param(
+            [Parameter(Mandatory = $true)][string]$StorePath
+        )
+
+        if ([string]::IsNullOrWhiteSpace($StorePath)) { return $null }
+
+        $item = Get-Item -LiteralPath $StorePath -ErrorAction SilentlyContinue
+        if ($item) { return $item }
+
+        # Windows Server 2012 R2 commonly marks the BCD store Hidden + System.
+        # Retry with -Force so healthy legacy stores are not treated as missing.
+        return Get-Item -LiteralPath $StorePath -Force -ErrorAction SilentlyContinue
+    }
+
+    function Test-BcdStorePath {
+        param(
+            [Parameter(Mandatory = $true)][string]$StorePath
+        )
+
+        return $null -ne (Get-BcdStoreItem -StorePath $StorePath)
+    }
+
     function Get-BcdTextSections {
         param(
             [Parameter(Mandatory = $true)][string]$Text
@@ -366,7 +392,7 @@ end {
             Loaders         = @()
         }
 
-        if (-not (Test-Path -LiteralPath $StorePath)) {
+        if (-not (Test-BcdStorePath -StorePath $StorePath)) {
             return [PSCustomObject]$inventory
         }
 
@@ -430,7 +456,7 @@ end {
             [Parameter(Mandatory = $true)][string]$StorePath
         )
 
-        if (-not (Test-Path -LiteralPath $StorePath)) {
+        if (-not (Test-BcdStorePath -StorePath $StorePath)) {
             return ''
         }
 
@@ -481,7 +507,7 @@ end {
             [Parameter(Mandatory = $true)][string]$Identifier
         )
 
-        if (-not (Test-Path -LiteralPath $StorePath)) {
+        if (-not (Test-BcdStorePath -StorePath $StorePath)) {
             return $null
         }
 
@@ -523,7 +549,7 @@ end {
         param(
             [Parameter(Mandatory = $true)][string]$StorePath
         )
-        if (-not (Test-Path -LiteralPath $StorePath)) {
+        if (-not (Test-BcdStorePath -StorePath $StorePath)) {
             Write-Warning "BCD not found at $StorePath."
             return $null
         }
@@ -1036,7 +1062,7 @@ $($htmlRows -join "`n")
         $efiPathBcd = Join-Path $AccessPath "EFI\Microsoft\Boot\BCD"
         $efiPathDir = Join-Path $AccessPath "EFI\Microsoft\Boot"
         $isEfiPartition = $PartitionInfo.Type -eq 'System'
-        if ($isEfiPartition -and (Test-Path $efiPathBcd)) {
+        if ($isEfiPartition -and (Test-BcdStorePath -StorePath $efiPathBcd)) {
             $role += "Boot (UEFI)"
         }
         elseif ($isEfiPartition -and (Test-Path $efiPathDir)) {
@@ -1050,7 +1076,7 @@ $($htmlRows -join "`n")
         $biosPathBcd = Join-Path $AccessPath "Boot\BCD"
         $biosPathDir = Join-Path $AccessPath "Boot"
         $isActivePartition = $PartitionInfo.IsActive
-        if ($isActivePartition -and (Test-Path $biosPathBcd)) {
+        if ($isActivePartition -and (Test-BcdStorePath -StorePath $biosPathBcd)) {
             $role += "Boot (BIOS)"
         }
         elseif ($isActivePartition -and (Test-Path $biosPathDir)) {
@@ -1292,9 +1318,24 @@ $($htmlRows -join "`n")
 
             Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal | Out-Null
 
+            # Record when we kick off the task so we can detect a genuine execution
+            # via LastRunTime. The task's LastTaskResult is unreliable here (it can
+            # report non-zero even on success), so completion is gated on State plus
+            # a LastRunTime that is at/after our start time, with a bounded timeout
+            # so a stuck task can never hang the script indefinitely.
+            $taskStart = Get-Date
             Start-ScheduledTask -TaskName $taskName
 
-            While ((Get-ScheduledTask -TaskName $taskName).State -eq "Running" -Or (Get-ScheduledTaskInfo -TaskName $taskName).LastRunTime -notmatch (Get-Date).ToString("yyyy")) {
+            $deadline = $taskStart.AddMinutes(5)
+            while ($true) {
+                $state = (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue).State
+                $lastRun = (Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue).LastRunTime
+                $hasRun = $lastRun -and ($lastRun -ge $taskStart.AddSeconds(-2))
+                if (($state -ne 'Running') -and $hasRun) { break }
+                if ((Get-Date) -ge $deadline) {
+                    Write-Warning "ExecuteAsSystem: task '$taskName' did not confirm completion within 5 minutes; continuing."
+                    break
+                }
                 Start-Sleep -Seconds 1
             }
 
@@ -1466,6 +1507,53 @@ $($htmlRows -join "`n")
             -replace '(?i)^"?[A-Z]:\\', "$drive\"
         if ($resolved -match '^(.+?\.(?:sys|exe|dll))') { $resolved = $Matches[1] }
         return $resolved
+    }
+
+    function Resolve-DriverBinaryCandidate {
+        param(
+            [Parameter(Mandatory = $true)][string]$Binary,
+            [string[]]$AlternatePatterns = @()
+        )
+
+        $driverRoot = Join-Path $script:WinDriveLetter 'Windows\System32\drivers'
+        $exactPath = Join-Path $driverRoot $Binary
+        $exactItem = Get-Item -LiteralPath $exactPath -Force -ErrorAction SilentlyContinue
+        if ($exactItem) {
+            return [PSCustomObject]@{
+                Name        = $exactItem.Name
+                Path        = $exactItem.FullName
+                Expected    = $Binary
+                Exists      = $true
+                Size        = $exactItem.Length
+                IsAlternate = $false
+            }
+        }
+
+        foreach ($pattern in @($AlternatePatterns | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+            $alternate = Get-ChildItem -LiteralPath $driverRoot -Filter $pattern -File -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -ine $Binary } |
+                Sort-Object @{ Expression = { if ($_.Length -gt 0) { 0 } else { 1 } } }, Name |
+                Select-Object -First 1
+            if ($alternate) {
+                return [PSCustomObject]@{
+                    Name        = $alternate.Name
+                    Path        = $alternate.FullName
+                    Expected    = $Binary
+                    Exists      = $true
+                    Size        = $alternate.Length
+                    IsAlternate = $true
+                }
+            }
+        }
+
+        return [PSCustomObject]@{
+            Name        = $Binary
+            Path        = $exactPath
+            Expected    = $Binary
+            Exists      = $false
+            Size        = 0
+            IsAlternate = $false
+        }
     }
 
     # Helper: Verify a binary on the offline disk carries a valid Microsoft Authenticode signature.
@@ -1698,12 +1786,29 @@ $($htmlRows -join "`n")
     }
 
     # Helper: Enable registry periodic backups (regback)
+    # On Windows 10 1803 / Server 2019 (build 17134) and later, periodic RegBack backups
+    # are OFF by default and re-enabled by the EnablePeriodicBackup DWORD. On earlier
+    # builds (Windows Server 2012 R2 = 9600, Server 2016 = 14393, and Windows 8.1/10 pre-1803)
+    # the RegBack folder is refreshed automatically by the '\Microsoft\Windows\Registry\
+    # RegIdleBackup' scheduled task during idle maintenance, NOT by this value - so writing
+    # it there has no effect. We still set it (harmless) but explain the real mechanism.
     function EnableRegBackup {
+        $guestBuild = 0
+        [void][int]::TryParse((Get-GuestCurrentVersion).CurrentBuildNumber, [ref]$guestBuild)
+
         Invoke-WithHive 'SYSTEM' {
             $SystemRoot = Get-SystemRootPath
 
             Write-Host "Enabling registry backup feature..." #https://learn.microsoft.com/en-us/troubleshoot/windows-client/installing-updates-features-roles/system-registry-no-backed-up-regback-folder
             Set-ItemProperty-Logged -Path "$SystemRoot\Control\Session Manager\Configuration Manager" -Name EnablePeriodicBackup -Value 1 -Type DWord -Force
+        }
+
+        if ($guestBuild -gt 0 -and $guestBuild -lt 17134) {
+            Write-Host ("Note: this guest is build $guestBuild (pre-1803). EnablePeriodicBackup only takes effect on " +
+                "Windows 10 1803 / Server 2019 (build 17134) and later.") -ForegroundColor Yellow
+            Write-Host ("On this OS the RegBack folder is refreshed by the '\Microsoft\Windows\Registry\RegIdleBackup' " +
+                "scheduled task during idle maintenance. An empty RegBack is normal until that task next runs inside the " +
+                "booted guest; it cannot be triggered from this offline rescue host.") -ForegroundColor DarkCyan
         }
     }
 
@@ -2037,15 +2142,195 @@ $($htmlRows -join "`n")
         return @($entries)
     }
 
+    # Returns the offline guest's OS version as a PSCustomObject
+    # (ProductName / CurrentBuildNumber / UBR). Prefers the already-selected
+    # Windows install so the SOFTWARE hive is not re-mounted on every caller;
+    # falls back to a single SOFTWARE-hive read when no install is selected yet.
+    function Get-GuestCurrentVersion {
+        if ($script:SelectedWindowsInstall -and $script:SelectedWindowsInstall.CurrentBuildNumber) {
+            return [PSCustomObject]@{
+                ProductName        = [string]$script:SelectedWindowsInstall.ProductName
+                CurrentBuildNumber = [string]$script:SelectedWindowsInstall.CurrentBuildNumber
+                UBR                = [string]$script:SelectedWindowsInstall.UBR
+            }
+        }
+
+        $info = $null
+        try {
+            $info = Invoke-WithHive 'SOFTWARE' {
+                $cv = Get-ItemProperty 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+                if ($cv) {
+                    [PSCustomObject]@{
+                        ProductName        = [string]$cv.ProductName
+                        CurrentBuildNumber = [string]$cv.CurrentBuildNumber
+                        UBR                = if ($null -ne $cv.UBR) { [string]$cv.UBR } else { '' }
+                    }
+                }
+            }
+        }
+        catch { <# best-effort: guest version is optional diagnostic context #> }
+
+        if ($info) {
+            return [PSCustomObject]@{
+                ProductName        = [string]$info.ProductName
+                CurrentBuildNumber = [string]$info.CurrentBuildNumber
+                UBR                = [string]$info.UBR
+            }
+        }
+
+        return [PSCustomObject]@{ ProductName = ''; CurrentBuildNumber = ''; UBR = '' }
+    }
+
+    # Formats a Windows build label as "<Build>.<UBR>" (or just "<Build>" when UBR
+    # is absent). Returns $Fallback when no build number is available. $Prefix is
+    # prepended to a non-fallback label (e.g. 'Build ').
+    function Format-WindowsBuildLabel {
+        param(
+            [string]$Build,
+            [string]$Ubr,
+            [string]$Prefix = '',
+            [string]$Fallback = ''
+        )
+        if ([string]::IsNullOrWhiteSpace($Build)) { return $Fallback }
+        $label = if (-not [string]::IsNullOrWhiteSpace($Ubr)) { "$Build.$Ubr" } else { "$Build" }
+        return "$Prefix$label"
+    }
+
+    # Helper: probe a currently-mounted volume for its NTFS dirty bit and spot-verifier
+    # ($corrupt) state. The volume must be online with a drive letter (e.g. 'F:').
+    # Returns a PSCustomObject:
+    #   .Letter      - normalised 'X:'
+    #   .DirtyBit    - $true if dirty, $false if not dirty, $null if undetermined
+    #   .DirtyRaw    - raw 'fsutil dirty query' text
+    #   .RepairState - 'healthy' | 'corrupt' | 'unknown' (parsed from 'fsutil repair state')
+    #   .RepairRaw   - raw 'fsutil repair state' text
+    function Get-OfflineVolumeFsState {
+        param([Parameter(Mandatory)][string]$Letter)
+
+        $norm = $Letter.TrimEnd('\')
+        $result = [PSCustomObject]@{ Letter = $norm; DirtyBit = $null; DirtyRaw = ''; RepairState = 'unknown'; RepairRaw = '' }
+        if ($norm -notmatch '^[A-Za-z]:$') { return $result }
+
+        # Classic dirty bit: definitive 'Volume - X: is [NOT] Dirty'. Check 'not dirty' first.
+        try {
+            $result.DirtyRaw = (& fsutil.exe dirty query $norm 2>&1 | Out-String).Trim()
+            if ($result.DirtyRaw -match '(?i)not\s+dirty') { $result.DirtyBit = $false }
+            elseif ($result.DirtyRaw -match '(?i)\bdirty\b') { $result.DirtyBit = $true }
+        }
+        catch {}
+
+        # Spot-verifier / self-heal state via 'fsutil repair state', which prints a line like:
+        #   Corruption State:  0x00 - Clean
+        #   Corruption State:  0x01 - Verifying
+        #   Corruption State:  0x02 - Corrupt
+        # Parse that specific line (NOT the bare word 'Corrupt', which also appears in the
+        # 'Corruption State:' label and would otherwise match a clean volume). 0x0* / Clean
+        # -> healthy; any other state value -> corrupt; unparseable -> unknown (callers then
+        # key off Get-Volume health).
+        try {
+            $result.RepairRaw = (& fsutil.exe repair state $norm 2>&1 | Out-String).Trim()
+            $stateMatch = [regex]::Match($result.RepairRaw, '(?im)^\s*Corruption State:\s*(0x[0-9a-fA-F]+)\s*-\s*(.+?)\s*$')
+            if ($stateMatch.Success) {
+                $stateValue = $stateMatch.Groups[1].Value
+                $stateLabel = $stateMatch.Groups[2].Value
+                if ($stateValue -match '^0x0+$' -or $stateLabel -match '(?i)clean') { $result.RepairState = 'healthy' }
+                else { $result.RepairState = 'corrupt' }
+            }
+            elseif ($result.RepairRaw -match '(?i)\bclean\b') { $result.RepairState = 'healthy' }
+        }
+        catch {}
+
+        return $result
+    }
+
     function FixDiskCorruption {
         param([string]$DriveLetter = '')
         $target = if ($DriveLetter) { $DriveLetter.TrimEnd('\') } else { $script:WinDriveLetter.TrimEnd('\') }
-        Write-Host "Running chkdsk on $target ..." -ForegroundColor Yellow
+
+        # Inline helper: run the requested chkdsk mode against $target.
+        $runChkdsk = {
+            param([ValidateSet('spotfix', 'full')][string]$Mode)
+            if ($Mode -eq 'spotfix') {
+                # chkdsk /spotfix briefly takes the volume offline and drains the $corrupt queue
+                # (the spot-verifier logged-corruption record that drives Get-Volume HealthStatus=Warning).
+                # This is the targeted fix that a full chkdsk /F does not reliably perform - common on
+                # Windows Server 2012 R2, whose proactive-scan model logs corruption that is retired by
+                # spotfix or boot-time/idle maintenance rather than by a one-shot /F pass.
+                Write-Host "Running chkdsk /spotfix on $target (drains the spot-verifier `$corrupt queue) ..." -ForegroundColor Yellow
+                & chkdsk $target /spotfix
+            }
+            else {
+                Write-Host "Running chkdsk /F /X on $target ..." -ForegroundColor Yellow
+                & chkdsk $target /F /X
+            }
+        }
+
+        # Inline helper: probe + print the current NTFS state for $target and report whether it is bad.
+        $reportState = {
+            param([string]$Phase)
+            $st = Get-OfflineVolumeFsState -Letter $target
+            $vl = Get-Volume -DriveLetter ($target.TrimEnd(':')) -ErrorAction SilentlyContinue
+            $dirtyLabel = if ($st.DirtyBit -eq $true) { 'DIRTY' } elseif ($st.DirtyBit -eq $false) { 'not dirty' } else { 'unknown' }
+            $health = if ($vl) { [string]$vl.HealthStatus } else { 'unknown' }
+            $bad = ($st.DirtyBit -eq $true) -or ($st.RepairState -eq 'corrupt') -or ($health -ne 'Healthy' -and $health -ne 'unknown')
+            $color = if ($bad) { 'Yellow' } else { 'Green' }
+            Write-Host "  $target $Phase : dirty bit=$dirtyLabel; spot-verifier (`$corrupt) state=$($st.RepairState); Get-Volume health=$health" -ForegroundColor $color
+            return [PSCustomObject]@{ State = $st; Health = $health; IsBad = $bad }
+        }
+
+        # Probe first and auto-select the correct repair (no -SpotFix switch needed):
+        #   - spot-verifier logged corruption ($corrupt) / Get-Volume Warning WITHOUT the classic
+        #     dirty bit          -> chkdsk /spotfix (the only thing that reliably clears it)
+        #   - dirty bit set, or state otherwise unclear/healthy -> full chkdsk /F /X
+        $before = & $reportState 'before repair'
+        $st = $before.State
+        $dirty = ($st.DirtyBit -eq $true)
+        $spotNeeded = (-not $dirty) -and (($st.RepairState -eq 'corrupt') -or ($before.Health -ne 'Healthy' -and $before.Health -ne 'unknown'))
+        $primaryMode = if ($spotNeeded) { 'spotfix' } else { 'full' }
+
+        $ranSpotfix = $false
+        $ranFull = $false
         try {
-            & chkdsk $target /F /X
+            & $runChkdsk $primaryMode
+            if ($primaryMode -eq 'spotfix') { $ranSpotfix = $true } else { $ranFull = $true }
         }
         catch {
             Write-Error "FixDiskCorruption failed: $_"
+            return
+        }
+
+        $after = & $reportState 'after repair '
+
+        # Follow-up: if the primary pass did not clear it, run the other mode once.
+        if ($after.IsBad) {
+            $followMode = if ($primaryMode -eq 'spotfix') { 'full' } else { 'spotfix' }
+            Write-Host "  Still not clean after chkdsk /$primaryMode - running chkdsk /$followMode as a follow-up ..." -ForegroundColor DarkCyan
+            try {
+                & $runChkdsk $followMode
+                if ($followMode -eq 'spotfix') { $ranSpotfix = $true } else { $ranFull = $true }
+            }
+            catch {
+                Write-Warning "Follow-up chkdsk /$followMode failed: $_"
+            }
+            $after = & $reportState 'after follow-up'
+        }
+
+        if ($after.IsBad) {
+            Write-Host "  $target is still not Healthy after offline repair. The corruption may only be retired by booting the guest (autochk / ProactiveScan maintenance), or it may be a genuine on-disk fault." -ForegroundColor Yellow
+        }
+
+        $modeList = [System.Collections.Generic.List[string]]::new()
+        if ($ranFull) { $modeList.Add('full (/F /X)') }
+        if ($ranSpotfix) { $modeList.Add('spotfix') }
+
+        Write-ActionLog -Event 'FixDiskCorruption' -Details @{
+            Target       = $target
+            Mode         = ($modeList -join ' + ')
+            DirtyBefore  = $before.State.DirtyBit
+            DirtyAfter   = $after.State.DirtyBit
+            RepairBefore = $before.State.RepairState
+            RepairAfter  = $after.State.RepairState
+            HealthAfter  = $after.Health
         }
     }
 
@@ -2057,15 +2342,7 @@ $($htmlRows -join "`n")
             if (-not (Test-Path "C:\temp")) { mkdir C:\temp | Out-Null }
 
             # Detect guest OS build to warn about version mismatch with host
-            $guestBuild = $null
-            try {
-                Invoke-WithHive 'SOFTWARE' {
-                    $cv = Get-ItemProperty 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
-                    if ($cv) { $script:_guestBuild = $cv.CurrentBuildNumber }
-                }
-                $guestBuild = $script:_guestBuild
-            }
-            catch {}
+            $guestBuild = (Get-GuestCurrentVersion).CurrentBuildNumber
             $hostBuild = [System.Environment]::OSVersion.Version.Build
 
             # Determine repair source
@@ -2201,21 +2478,20 @@ $($htmlRows -join "`n")
 
     function RevertLKGC {
         Invoke-WithHive 'SYSTEM' {
-            & {
-                $CurrentBoot = (Get-ItemProperty -Path "HKLM:\BROKENSYSTEM\Select" -Name Current).Current
-                Write-Host "Current HKLM: $CurrentBoot" -ForegroundColor Green
+            $CurrentBoot = (Get-ItemProperty -Path "HKLM:\BROKENSYSTEM\Select" -Name Current).Current
+            Write-Host "Current HKLM: $CurrentBoot" -ForegroundColor Green
 
-                $NextSetting = Get-ChildItem 'HKLM:\BROKENSYSTEM' |
+            # Pick a control set other than the current one. Parse the numeric suffix
+            # robustly (strip all non-digits) so ControlSet010+ is handled correctly;
+            # the old 'ControlSet00' trim produced wrong numbers / parse errors for those.
+            $NextSetting = Get-ChildItem 'HKLM:\BROKENSYSTEM' |
                 Where-Object { $_.PSChildName -like 'ControlSet*' } |
-                ForEach-Object {
-                    [int]($_.PSChildName -replace 'ControlSet00', '')
-                } |
+                ForEach-Object { [int]($_.PSChildName -replace '\D', '') } |
                 Where-Object { $_ -ne $CurrentBoot } |
                 Select-Object -First 1
 
-                Write-Host "`r`nSetting boot registry to: $NextSetting" -ForegroundColor Yellow
-                Set-ItemProperty-Logged -Path "HKLM:\BROKENSYSTEM\Select" -Name Current -Value $NextSetting -Type DWord -Force
-            }
+            Write-Host "`r`nSetting boot registry to: $NextSetting" -ForegroundColor Yellow
+            Set-ItemProperty-Logged -Path "HKLM:\BROKENSYSTEM\Select" -Name Current -Value $NextSetting -Type DWord -Force
         }
     }
 
@@ -2311,15 +2587,7 @@ $($htmlRows -join "`n")
 
                 # Check whether the host can supply a matching copy before reporting an error
                 $hostTemplate = "$env:SystemRoot\System32\config\BCD-Template"
-                $guestBuildNum = $null
-                try {
-                    Invoke-WithHive 'SOFTWARE' {
-                        $cv = Get-ItemProperty 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
-                        if ($cv) { $script:_guestBuild = $cv.CurrentBuildNumber }
-                    }
-                    $guestBuildNum = $script:_guestBuild
-                }
-                catch {}
+                $guestBuildNum = (Get-GuestCurrentVersion).CurrentBuildNumber
                 $hostBuildNum = [System.Environment]::OSVersion.Version.Build.ToString()
                 $buildsMatch = $guestBuildNum -and ($guestBuildNum -eq $hostBuildNum)
 
@@ -2407,12 +2675,7 @@ The script will copy it to the guest before running bcdboot, then proceed with -
             $originalSetupLoaders = @($originalLoaders | Where-Object { $_.IsSetupEntry })
             $hideBootMenu = ($originalLoaders.Count -gt 1) -or ($originalSetupLoaders.Count -gt 0) -or ($script:WindowsInstallCandidates.Count -gt 1)
             if ($script:SelectedWindowsInstall) {
-                $selectedBuild = if ($script:SelectedWindowsInstall.CurrentBuildNumber) {
-                    if ($script:SelectedWindowsInstall.UBR) { "$($script:SelectedWindowsInstall.CurrentBuildNumber).$($script:SelectedWindowsInstall.UBR)" } else { $script:SelectedWindowsInstall.CurrentBuildNumber }
-                }
-                else {
-                    'unknown'
-                }
+                $selectedBuild = Format-WindowsBuildLabel -Build $script:SelectedWindowsInstall.CurrentBuildNumber -Ubr $script:SelectedWindowsInstall.UBR -Fallback 'unknown'
                 Write-Host "Selected Windows install for BCD rebuild: $($script:SelectedWindowsInstall.Drive) ($($script:SelectedWindowsInstall.ProductName), build $selectedBuild)" -ForegroundColor Cyan
             }
             if ($originalSetupLoaders.Count -gt 0) {
@@ -3215,6 +3478,7 @@ Version=1
 "@
 
         $FixAzureVM = @"
+@echo off
 net user Username "Password" /add /Y
 net localgroup administrators Username /add
 net localgroup "Remote Desktop Users" Username /add
@@ -3592,14 +3856,19 @@ Remove-Item -Path C:\temp\rds.pfx -Force
 '@
 
             Ensure-GuestTempDir
-            $guestName = (Get-ItemProperty "$SystemRoot\Control\ComputerName\ComputerName").ComputerName
+            $guestName = if ($script:GuestComputerName) { $script:GuestComputerName } else { (Get-ItemProperty "$SystemRoot\Control\ComputerName\ComputerName").ComputerName }
 
             Write-Host "Generating new certificate to guest $guestname locally..." -ForegroundColor Green
             $cert = New-SelfSignedCertificate -Type Custom -KeySpec Signature -Subject "CN=$($guestName)" -KeyExportPolicy Exportable -HashAlgorithm sha256 -KeyLength 2048 `
                 -CertStoreLocation "Cert:\LocalMachine\My" -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.1") -NotAfter (Get-Date).AddYears(5)
 
-            # Generate a cryptographically random one-time PFX transport password (never hardcoded)
-            $rngBytes = [System.Security.Cryptography.RandomNumberGenerator]::GetBytes(24)
+            # Generate a cryptographically random one-time PFX transport password (never hardcoded).
+            # Use the RandomNumberGenerator instance API (Create().GetBytes([byte[]])) rather than the
+            # static GetBytes(int) overload, which only exists on .NET 6+ and is unavailable on the
+            # Windows PowerShell 5.1 / .NET Framework 4.x host used to repair downlevel guests.
+            $rngBytes = New-Object 'byte[]' 24
+            $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+            try { $rng.GetBytes($rngBytes) } finally { $rng.Dispose() }
             $PfxPassword = [System.Convert]::ToBase64String($rngBytes) -replace '[^A-Za-z0-9]', 'x'
             $certpwd = ConvertTo-SecureString $PfxPassword -AsPlainText -Force
 
@@ -3663,7 +3932,7 @@ Removes pending update packages found by DISM /Get-Packages.
 Removes TxR and SMI transaction log files (.blf/.regtrans-ms).
 Renames pending.xml in WinSxS.
 Clears CBS registry keys (PackagesPending, RebootPending, SessionsPending).
-Runs DISM /StartComponentCleanup to reclaim disk space from superseded components.
+Runs DISM /StartComponentCleanup only if no pending servicing markers remain.
 "@)) { return }
 
         $OfflineWindowsPath = Join-Path $WinDriveLetter "Windows"
@@ -3786,8 +4055,38 @@ Runs DISM /StartComponentCleanup to reclaim disk space from superseded component
             Remove-Item-Logged -Path (Join-Path $CbsSoftwareReg "SessionsPending") -Recurse -Force
         }
 
-        Write-Host "Running DISM /Cleanup-Image /StartComponentCleanup (reclaim space from superseded components)" -ForegroundColor Yellow
-        & dism /Image:$WinDriveLetter /Cleanup-Image /StartComponentCleanup
+        $remainingPendingMarkers = [System.Collections.Generic.List[string]]::new()
+        if (Test-Path $pendingXmlPath) { $remainingPendingMarkers.Add('WinSxS\pending.xml') | Out-Null }
+        Invoke-WithHive 'SOFTWARE', 'COMPONENTS' {
+            $ComponentsReg = "HKLM:\BROKENCOMPONENTS"
+            $CbsSoftwareReg = "HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing"
+
+            $componentProps = Get-ItemProperty $ComponentsReg -ErrorAction SilentlyContinue
+            foreach ($propName in @('ExecutionState', 'PendingXmlIdentifier', 'NextQueueEntryIndex', 'NextQueueEntryIndexBCDB', 'AdvancedInstallersNeedResolving', 'StoreDirty')) {
+                $propValue = if ($componentProps) { $componentProps.$propName } else { $null }
+                if ($null -ne $propValue -and $propValue -ne 0 -and $propValue -ne '') {
+                    $remainingPendingMarkers.Add("COMPONENTS\$propName=$propValue") | Out-Null
+                }
+            }
+
+            foreach ($keyName in @('PackagesPending', 'RebootPending', 'SessionsPending')) {
+                if (Test-Path (Join-Path $CbsSoftwareReg $keyName)) {
+                    $remainingPendingMarkers.Add("CBS\$keyName") | Out-Null
+                }
+            }
+        }
+
+        if ($remainingPendingMarkers.Count -gt 0) {
+            Write-Warning "Skipping DISM /StartComponentCleanup because pending servicing markers are still present: $($remainingPendingMarkers -join ', ')"
+            Write-Host "  This is expected when DISM still reports pending operations. Boot once or rerun -FixPendingUpdates, then run -RepairComponentStore if component cleanup/repair is still needed." -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "Running DISM /Cleanup-Image /StartComponentCleanup (best-effort reclaim of superseded components)" -ForegroundColor Yellow
+            & dism /Image:$WinDriveLetter /Cleanup-Image /StartComponentCleanup /ScratchDir:C:\Temp
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "DISM /StartComponentCleanup exited with code $LASTEXITCODE. Pending-update cleanup steps already completed; component cleanup is best-effort and can be retried later."
+            }
+        }
 
         Write-Host "You may want to run SFC and Dism /RestoreHealth with script parameters: -RunSFC -RepairComponentStore." -ForegroundColor Green
     }
@@ -3834,11 +4133,16 @@ Restart-Service -Name WinRM -Force
 '@
 
             Ensure-GuestTempDir
-            $guestName = (Get-ItemProperty "$SystemRoot\Control\ComputerName\ComputerName").ComputerName
+            $guestName = if ($script:GuestComputerName) { $script:GuestComputerName } else { (Get-ItemProperty "$SystemRoot\Control\ComputerName\ComputerName").ComputerName }
 
             $cert = New-SelfSignedCertificate -DnsName $guestName -CertStoreLocation 'Cert:\LocalMachine\My' -KeyExportPolicy Exportable
-            # Generate a cryptographically random one-time PFX transport password (never hardcoded)
-            $rngBytes = [System.Security.Cryptography.RandomNumberGenerator]::GetBytes(24)
+            # Generate a cryptographically random one-time PFX transport password (never hardcoded).
+            # Use the RandomNumberGenerator instance API (Create().GetBytes([byte[]])) rather than the
+            # static GetBytes(int) overload, which only exists on .NET 6+ and is unavailable on the
+            # Windows PowerShell 5.1 / .NET Framework 4.x host used to repair downlevel guests.
+            $rngBytes = New-Object 'byte[]' 24
+            $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+            try { $rng.GetBytes($rngBytes) } finally { $rng.Dispose() }
             $PfxPassword = [System.Convert]::ToBase64String($rngBytes) -replace '[^A-Za-z0-9]', 'x'
             $certpwd = ConvertTo-SecureString $PfxPassword -AsPlainText -Force
 
@@ -5215,6 +5519,22 @@ complete recovery.
             $winVer = Get-ItemProperty "HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue
             $editionId = $winVer.EditionID
             $productName = $winVer.ProductName
+
+            # ----------------------------------------------------------------
+            # Safety gate 2a: Credential Guard requires Windows 10 / Windows
+            # Server 2016 (build 14393) or later. It does not exist on Windows
+            # Server 2012 R2 (9600) or 2012 (9200); writing the flags there is
+            # meaningless and the VBS/Secure Boot prerequisites cannot be met,
+            # so block it to avoid a confusing no-op or no-boot scenario.
+            # ----------------------------------------------------------------
+            $cgBuild = 0
+            [void][int]::TryParse([string]$winVer.CurrentBuildNumber, [ref]$cgBuild)
+            if ($cgBuild -gt 0 -and $cgBuild -lt 14393) {
+                Write-Error ("BLOCKED: Credential Guard requires Windows 10 / Windows Server 2016 (build 14393) or later. " +
+                    "This guest is build $cgBuild ($productName), which does not support Credential Guard. Aborting.")
+                return
+            }
+
             $unsupportedEditions = @('Home', 'Pro', 'CoreSingleLanguage', 'Core', 'ProWorkstation', 'ProfessionalWorkstation')
             $editionBlocked = $unsupportedEditions | Where-Object { $editionId -match $_ }
             if ($editionBlocked) {
@@ -5649,13 +5969,32 @@ complete recovery.
         # Shared metadata for device class UpperFilters/LowerFilters checks.
         # SafeFilters are known Windows inbox / Azure-expected filter names (case-insensitive).
         # AllowVendors are additional binary CompanyName substrings beyond Microsoft.
+        $selectedBuild = 0
+        $isWindowsServer2012R2 = $false
+        if ($script:SelectedWindowsInstall -and [int]::TryParse([string]$script:SelectedWindowsInstall.CurrentBuildNumber, [ref]$selectedBuild)) {
+            $isWindowsServer2012R2 = ($selectedBuild -eq 9600)
+        }
+        if (-not $isWindowsServer2012R2 -and -not [string]::IsNullOrWhiteSpace($script:WinDriveLetter)) {
+            $kernelPath = Join-Path $script:WinDriveLetter 'Windows\System32\ntoskrnl.exe'
+            $kernelItem = Get-Item -LiteralPath $kernelPath -Force -ErrorAction SilentlyContinue
+            $versionText = if ($kernelItem) { "$($kernelItem.VersionInfo.ProductVersion) $($kernelItem.VersionInfo.FileVersion)" } else { '' }
+            $isWindowsServer2012R2 = ($versionText -match '(?i)\b6\.3\.9600\b|\b9600\b')
+        }
+
+        $diskDriveSafeFilters = [string[]]@('partmgr', 'fvevol', 'iorate', 'storqosflt', 'wcifs', 'ehstorclass')
+        if ($isWindowsServer2012R2) {
+            # Windows Server 2012 R2 Azure/Hyper-V images can legitimately carry storflt
+            # as a DiskDrive LowerFilters entry. Treat it as expected for build 9600 only.
+            $diskDriveSafeFilters += 'storflt'
+        }
+
         return @(
             [PSCustomObject]@{
                 GUID         = '{4d36e967-e325-11ce-bfc1-08002be10318}'
                 Name         = 'DiskDrive'
                 Risk         = 'CRITICAL'
                 Description  = 'Extra filters in this class can contribute to stop error 0x7B (INACCESSIBLE_BOOT_DEVICE) on boot'
-                SafeFilters  = [string[]]@('partmgr', 'fvevol', 'iorate', 'storqosflt', 'wcifs', 'ehstorclass')
+                SafeFilters  = $diskDriveSafeFilters
                 AllowVendors = [string[]]@()
             }
             [PSCustomObject]@{
@@ -5663,7 +6002,7 @@ complete recovery.
                 Name         = 'HDC'
                 Risk         = 'CRITICAL'
                 Description  = 'Extra filters on IDE ATA/ATAPI controllers can contribute to stop error 0x7B (INACCESSIBLE_BOOT_DEVICE)'
-                SafeFilters  = [string[]]@('iasf', 'iastorf')
+                SafeFilters  = [string[]]@('iasf', 'iastorf', 'iaStorAV')
                 AllowVendors = [string[]]@()
             }
             [PSCustomObject]@{
@@ -5671,7 +6010,7 @@ complete recovery.
                 Name         = 'SCSIAdapter'
                 Risk         = 'CRITICAL'
                 Description  = 'Extra filters on SCSI adapters can contribute to stop error 0x7B (INACCESSIBLE_BOOT_DEVICE)'
-                SafeFilters  = [string[]]@()
+                SafeFilters  = [string[]]@('iaStorAV')
                 AllowVendors = [string[]]@()
             }
             [PSCustomObject]@{
@@ -6474,7 +6813,9 @@ complete recovery.
         # Disk & Filesystem
         $sevDiskHealth = 2   # Disk HealthStatus is not Healthy
         $sevDiskRawFs = 2   # Partition has RAW filesystem (unreadable)
-        $sevDiskFsHealth = 1   # Partition filesystem is unhealthy
+        $sevDiskFsHealth = 1   # Partition filesystem is unhealthy (non-NTFS or undetermined)
+        $sevDiskDirtyBit = 1   # NTFS volume dirty bit is set (autochk runs chkdsk at next boot)
+        $sevDiskSpotFix = 1   # NTFS spot-verifier logged corruption ($corrupt) - needs chkdsk /spotfix
 
         # Crash & Boot artefacts
         $sevCrashMinidumps = 1   # Minidump (.dmp) files found
@@ -6574,7 +6915,7 @@ complete recovery.
 
         # Windows Update
         $sevUpdateWuDisabled = 0   # WU services (wuauserv/UsoSvc/WaaSMedicSvc) disabled
-        $sevCbsPendingWarn = 1   # CBS RebootPending/PackagesPending/exclusive SessionsPending
+        $sevCbsPendingWarn = 1   # CBS RebootPending/PackagesPending, or SessionsPending interrupted WITH a queued pending.xml
 
         # ACPI
         $sevACPISettings = 0   # Hyper-V ACPI entries (MSFT1000/MSFT1002) missing
@@ -6639,9 +6980,11 @@ complete recovery.
         # Critical boot files (on-disk binary presence checks)
         $sevCriticalBootFileMissing = 2   # Core boot binary (winload/bootmgr/hal/ntdll/kernel32) missing or 0-byte
         $sevBcdTemplateMissing = 2   # BCD-Template hive missing - bcdboot fails with c000000f if absent
-        $sevSyntheticDriverBroken = 2   # Azure synthetic driver (vmbus/storvsc/netvsc) wrong Start value or binary missing
+        $sevSyntheticDriverBroken = 2   # Boot-critical Azure synthetic driver (vmbus/storvsc) wrong Start value or binary missing
+        $sevSyntheticNetworkBroken = 1  # Azure synthetic network driver (netvsc) broken; affects connectivity, not early boot storage
         $sevSessionInitMissing = 2   # Session init executable (smss/wininit/services/lsass/winlogon/logonui) missing or 0-byte
         $sevBinarySignatureBad = 2   # Critical boot/session binary is not Microsoft-signed (possible tampering)
+        $sevThirdPartyBootSystemDriver = 1 # Validly signed third-party Boot/System driver; investigate before treating as boot blocker
 
         # Hyper-V integration services
         $sevIntegrationSvcMissing = 1  # Hyper-V integration service key missing from registry
@@ -6671,15 +7014,38 @@ complete recovery.
             }
             foreach ($p in (Get-Partition -DiskNumber $script:DiskNumber -ErrorAction SilentlyContinue)) {
                 $vol = Get-Volume -Partition $p -ErrorAction SilentlyContinue
-                if ($vol) {
-                    $fs = $vol.FileSystemType
-                    $pLetter = if ($p.DriveLetter -and $p.DriveLetter -ne "`0") { "$($p.DriveLetter):" } else { $script:WinDriveLetter.TrimEnd('\') }
-                    if ([string]::IsNullOrEmpty($fs) -or $fs -eq 'Unknown') {
-                        & $emit 'Disk' (& $toSev $sevDiskRawFs) "Partition $($p.PartitionNumber) ($pLetter): RAW filesystem - data may be inaccessible" "-FixFileSystem -DriveLetter $pLetter"
-                    }
-                    elseif ($vol.HealthStatus -ne 'Healthy') {
-                        & $emit 'Disk' (& $toSev $sevDiskFsHealth) "Partition $($p.PartitionNumber) ($pLetter) ($fs): health=$($vol.HealthStatus)" "-FixFileSystem -DriveLetter $pLetter"
-                    }
+                if (-not $vol) { continue }
+
+                $fs = $vol.FileSystemType
+                $hasLetter = ($p.DriveLetter -and $p.DriveLetter -ne "`0")
+                $pLetter = if ($hasLetter) { "$($p.DriveLetter):" } else { $script:WinDriveLetter.TrimEnd('\') }
+
+                if ([string]::IsNullOrEmpty($fs) -or $fs -eq 'Unknown') {
+                    & $emit 'Disk' (& $toSev $sevDiskRawFs) "Partition $($p.PartitionNumber) ($pLetter): RAW filesystem - data may be inaccessible" "-FixFileSystem -DriveLetter $pLetter"
+                    continue
+                }
+
+                # NTFS dirty-bit vs spot-verifier ($corrupt) discrimination.
+                # On NTFS, a Get-Volume HealthStatus=Warning is usually the spot-verifier
+                # corruption record ($corrupt), which a plain chkdsk /F does NOT reliably clear -
+                # the targeted fix is chkdsk /spotfix. The classic dirty bit (fsutil dirty) is a
+                # separate flag, cleared by autochk at the next guest boot or by a full chkdsk /F.
+                # This split matters on Windows Server 2012 R2, whose proactive-scan model leaves a
+                # persistent Warning that a one-shot /F does not retire.
+                $fsState = if ($hasLetter -and $fs -eq 'NTFS') { Get-OfflineVolumeFsState -Letter $pLetter } else { $null }
+                $isUnhealthy = ($vol.HealthStatus -ne 'Healthy')
+                $isDirty = ($fsState -and $fsState.DirtyBit -eq $true)
+                $isSpotCorrupt = ($fsState -and $fsState.RepairState -eq 'corrupt')
+
+                if ($isDirty) {
+                    & $emit 'Disk' (& $toSev $sevDiskDirtyBit) "Partition $($p.PartitionNumber) ($pLetter) ($fs): NTFS dirty bit is SET - autochk runs chkdsk at the next guest boot; -FixFileSystem clears it now" "-FixFileSystem -DriveLetter $pLetter"
+                }
+                elseif ($fs -eq 'NTFS' -and ($isSpotCorrupt -or $isUnhealthy)) {
+                    $reason = if ($isSpotCorrupt) { "spot-verifier logged corruption (`$corrupt)" } else { "health=$($vol.HealthStatus)" }
+                    & $emit 'Disk' (& $toSev $sevDiskSpotFix) "Partition $($p.PartitionNumber) ($pLetter) ($fs): $reason - a plain chkdsk /F may not clear this; -FixFileSystem auto-runs chkdsk /spotfix" "-FixFileSystem -DriveLetter $pLetter"
+                }
+                elseif ($isUnhealthy) {
+                    & $emit 'Disk' (& $toSev $sevDiskFsHealth) "Partition $($p.PartitionNumber) ($pLetter) ($fs): health=$($vol.HealthStatus)" "-FixFileSystem -DriveLetter $pLetter"
                 }
             }
         }
@@ -6837,12 +7203,7 @@ complete recovery.
             }
             if ($selectedInstall) {
                 $selected = $selectedInstall[0]
-                $selectedBuild = if ($selected.CurrentBuildNumber) {
-                    if ($selected.UBR) { "$($selected.CurrentBuildNumber).$($selected.UBR)" } else { $selected.CurrentBuildNumber }
-                }
-                else {
-                    'unknown'
-                }
+                $selectedBuild = Format-WindowsBuildLabel -Build $selected.CurrentBuildNumber -Ubr $selected.UBR -Fallback 'unknown'
                 & $emit 'Windows' 'INFO' "Selected Windows install: $($selected.Drive) ($($selected.ProductName), build $selectedBuild, score=$($selected.Score))"
                 if ($selected.SetupEvidence) {
                     & $emit 'Windows' (& $toSev $sevWindowsInstallSetupState) "Selected Windows install still shows setup/upgrade markers: $($selected.SetupEvidence)" '-AnalyzeServicingState'
@@ -6850,12 +7211,7 @@ complete recovery.
             }
             if ($installCandidates.Count -gt 1) {
                 $candidateSummary = ($installCandidates | ForEach-Object {
-                    $build = if ($_.CurrentBuildNumber) {
-                        if ($_.UBR) { "$($_.CurrentBuildNumber).$($_.UBR)" } else { $_.CurrentBuildNumber }
-                    }
-                    else {
-                        'unknown'
-                    }
+                    $build = Format-WindowsBuildLabel -Build $_.CurrentBuildNumber -Ubr $_.UBR -Fallback 'unknown'
                     $name = if ($_.ProductName) { $_.ProductName } else { 'Unknown Windows install' }
                     "$($_.Drive)=$name build $build score=$($_.Score)"
                 }) -join '; '
@@ -6867,38 +7223,40 @@ complete recovery.
         }
 
         $bcdPath = Get-BcdStorePath -Generation $script:VMGen -BootDrive $script:BootDriveLetter.TrimEnd('\')
-        if (-not (Test-Path $bcdPath)) {
+        $bcdItem = Get-BcdStoreItem -StorePath $bcdPath
+        if (-not $bcdItem) {
             & $emit 'BCD' (& $toSev $sevBcdMissing) "BCD store not found at $bcdPath - VM will fail to boot" $bcdFix
         }
-        elseif ((Get-Item -LiteralPath $bcdPath -ErrorAction SilentlyContinue).Length -eq 0) {
-            & $emit 'BCD' (& $toSev $sevBcdMissing) "BCD store is 0 bytes (corrupt) at $bcdPath - VM will fail to boot" $bcdFix
-        }
         else {
-            & $emit 'BCD' 'OK' "BCD store present: $bcdPath"
-            try {
-                $bcdInventory = Get-BcdInventory -StorePath $bcdPath
-                $bcdText = $bcdInventory.RawText
-                $preferredLoaderId = Get-BcdBootLoaderId -StorePath $bcdPath
-                $preferredLoaderDetails = if ($preferredLoaderId) { Get-BcdLoaderDetails -StorePath $bcdPath -Identifier $preferredLoaderId } else { $null }
-                $startupRepairConfigured = [bool]($preferredLoaderDetails -and $preferredLoaderDetails.RawText -match '(?im)^\s*recoverysequence\s+\{[^\r\n]+\}\s*$')
-                if (@($bcdInventory.Loaders).Count -eq 0) {
-                    & $emit 'BCD' (& $toSev $sevBcdNoBootLoader) 'No Windows Boot Loader entry found in BCD' "-FixBoot"
-                }
-                else {
-                    & $emit 'BCD' 'OK' "Windows Boot Loader entries present: $(@($bcdInventory.Loaders).Count)"
-                    if (@($bcdInventory.Loaders).Count -gt 1) {
-                        $loaderSummary = ($bcdInventory.Loaders | ForEach-Object {
-                            $desc = if ($_.Description) { $_.Description } else { $_.Identifier }
-                            if ($_.PartitionDrive) { "$desc@$($_.PartitionDrive)" } else { $desc }
-                        }) -join '; '
-                        & $emit 'BCD' (& $toSev $sevBcdMultipleLoaders) "Multiple Windows Boot Loader entries found: $loaderSummary" '-FixBoot'
+            if ($bcdItem.Length -eq 0) {
+                & $emit 'BCD' (& $toSev $sevBcdMissing) "BCD store is 0 bytes (corrupt) at $bcdPath - VM will fail to boot" $bcdFix
+            }
+            else {
+                & $emit 'BCD' 'OK' "BCD store present: $bcdPath"
+                try {
+                    $bcdInventory = Get-BcdInventory -StorePath $bcdPath
+                    $bcdText = $bcdInventory.RawText
+                    $preferredLoaderId = Get-BcdBootLoaderId -StorePath $bcdPath
+                    $preferredLoaderDetails = if ($preferredLoaderId) { Get-BcdLoaderDetails -StorePath $bcdPath -Identifier $preferredLoaderId } else { $null }
+                    $startupRepairConfigured = [bool]($preferredLoaderDetails -and $preferredLoaderDetails.RawText -match '(?im)^\s*recoverysequence\s+\{[^\r\n]+\}\s*$')
+                    if (@($bcdInventory.Loaders).Count -eq 0) {
+                        & $emit 'BCD' (& $toSev $sevBcdNoBootLoader) 'No Windows Boot Loader entry found in BCD' "-FixBoot"
                     }
-                    $setupLoaders = @($bcdInventory.Loaders | Where-Object { $_.IsSetupEntry })
-                    if ($setupLoaders.Count -gt 0) {
-                        $setupSummary = ($setupLoaders | ForEach-Object { if ($_.Description) { $_.Description } else { $_.Identifier } }) -join '; '
-                        & $emit 'BCD' (& $toSev $sevBcdSetupEntry) "BCD contains setup/stale loader entries: $setupSummary" '-FixBoot'
+                    else {
+                        & $emit 'BCD' 'OK' "Windows Boot Loader entries present: $(@($bcdInventory.Loaders).Count)"
+                        if (@($bcdInventory.Loaders).Count -gt 1) {
+                            $loaderSummary = ($bcdInventory.Loaders | ForEach-Object {
+                                $desc = if ($_.Description) { $_.Description } else { $_.Identifier }
+                                if ($_.PartitionDrive) { "$desc@$($_.PartitionDrive)" } else { $desc }
+                            }) -join '; '
+                            & $emit 'BCD' (& $toSev $sevBcdMultipleLoaders) "Multiple Windows Boot Loader entries found: $loaderSummary" '-FixBoot'
+                        }
+                        $setupLoaders = @($bcdInventory.Loaders | Where-Object { $_.IsSetupEntry })
+                        if ($setupLoaders.Count -gt 0) {
+                            $setupSummary = ($setupLoaders | ForEach-Object { if ($_.Description) { $_.Description } else { $_.Identifier } }) -join '; '
+                            & $emit 'BCD' (& $toSev $sevBcdSetupEntry) "BCD contains setup/stale loader entries: $setupSummary" '-FixBoot'
+                        }
                     }
-                }
                 if ($bcdText -match 'safeboot\s+(\S+)') {
                     & $emit 'BCD' (& $toSev $sevBcdSafeMode) "Safe Mode boot flag is active (safeboot $($Matches[1])) - VM will boot into Safe Mode" "-RemoveSafeModeFlag"
                 }
@@ -6950,6 +7308,7 @@ complete recovery.
                 }
             }
             catch { & $emit 'BCD' 'WARN' "Could not enumerate BCD: $_" }
+            }
         }
 
         # Gen2 UEFI: verify EFI System Partition boot files
@@ -7128,18 +7487,36 @@ complete recovery.
                 }
 
                 # RegBack
+                # On Windows 10 1803 / Server 2019 (build 17134)+ the RegBack auto-backup is OFF by
+                # default and -EnableRegBackup (EnablePeriodicBackup) re-enables it. On earlier builds
+                # (Server 2012 R2 = 9600, Server 2016 = 14393) RegBack is maintained by the RegIdleBackup
+                # scheduled task and an empty RegBack is normal, so -EnableRegBackup is not the remedy there.
+                $regBackGuestBuild = 0
+                [void][int]::TryParse((Get-GuestCurrentVersion).CurrentBuildNumber, [ref]$regBackGuestBuild)
+                $regBackTaskDriven = ($regBackGuestBuild -gt 0 -and $regBackGuestBuild -lt 17134)
                 $rbSystem = Join-Path $script:WinDriveLetter 'Windows\System32\config\RegBack\SYSTEM'
-                if (Test-Path $rbSystem) {
-                    $rbSize = (Get-Item $rbSystem).Length
+                $rbSystemItem = Get-Item -LiteralPath $rbSystem -Force -ErrorAction SilentlyContinue
+                if ($rbSystemItem) {
+                    $rbSize = $rbSystemItem.Length
                     if ($rbSize -eq 0) {
-                        & $emit 'Registry' (& $toSev $sevRegBackEmpty) 'RegBack\SYSTEM is 0 bytes - no registry backup is available' "-EnableRegBackup"
+                        if ($regBackTaskDriven) {
+                            & $emit 'Registry' 'INFO' "RegBack\SYSTEM is 0 bytes - normal on build $regBackGuestBuild; RegBack is refreshed by the RegIdleBackup scheduled task inside the running guest, not by -EnableRegBackup"
+                        }
+                        else {
+                            & $emit 'Registry' (& $toSev $sevRegBackEmpty) 'RegBack\SYSTEM is 0 bytes - no registry backup is available' "-EnableRegBackup"
+                        }
                     }
                     else {
                         & $emit 'Registry' 'OK' "RegBack\SYSTEM is $([math]::Round($rbSize/1MB, 1)) MB"
                     }
                 }
                 else {
-                    & $emit 'Registry' (& $toSev $sevRegBackMissing) 'RegBack\SYSTEM not found - registry backups not configured' "-EnableRegBackup"
+                    if ($regBackTaskDriven) {
+                        & $emit 'Registry' 'INFO' "RegBack\SYSTEM not found - on build $regBackGuestBuild RegBack is populated by the RegIdleBackup scheduled task inside the running guest (not -EnableRegBackup)"
+                    }
+                    else {
+                        & $emit 'Registry' (& $toSev $sevRegBackMissing) 'RegBack\SYSTEM not found - registry backups not configured' "-EnableRegBackup"
+                    }
                 }
 
                 # Pending Setup CmdLine
@@ -7184,12 +7561,14 @@ complete recovery.
                 # -- Azure/Hyper-V synthetic drivers ---------------------------------
                 $synBad = 0
                 foreach ($sd in (Get-SyntheticDriverSpec)) {
+                    $sdSeverity = if ($null -ne $sd.Severity) { [int]$sd.Severity } else { $sevSyntheticDriverBroken }
                     $sdSvcPath = "$svcRoot\$($sd.Name)"
                     $sdExists = Test-Path $sdSvcPath
                     $sdStart = if ($sdExists) { (Get-ItemProperty $sdSvcPath -ErrorAction SilentlyContinue).Start } else { $null }
-                    $sdBinPath = Join-Path $script:WinDriveLetter "Windows\System32\drivers\$($sd.Bin)"
-                    $sdBinExists = Test-Path -LiteralPath $sdBinPath
-                    $sdBinZero = $sdBinExists -and (Get-Item -LiteralPath $sdBinPath -Force -ErrorAction SilentlyContinue).Length -eq 0
+                    $sdBin = Resolve-DriverBinaryCandidate -Binary $sd.Bin -AlternatePatterns $sd.AlternateBinPatterns
+                    $sdBinExists = [bool]$sdBin.Exists
+                    $sdBinZero = $sdBinExists -and $sdBin.Size -eq 0
+                    $sdBinName = if ($sdBinExists) { $sdBin.Name } else { $sd.Bin }
                     if (-not $sdExists) {
                         $sdFix = if (-not $sdBinExists -or $sdBinZero) {
                             "-RepairSystemFile $($sd.Bin), then restore the $($sd.Name) service key from a matching Windows image or registry backup"
@@ -7197,23 +7576,25 @@ complete recovery.
                         else {
                             "Restore the $($sd.Name) service key from a matching Windows image or registry backup, then run -EnsureSyntheticDriversEnabled"
                         }
-                        & $emit 'Drivers' (& $toSev $sevSyntheticDriverBroken) "$($sd.Name) service key missing - $($sd.Desc) will not load" $sdFix
+                        & $emit 'Drivers' (& $toSev $sdSeverity) "$($sd.Name) service key missing - $($sd.Desc) will not load" $sdFix
                         $synBad++
                     }
                     elseif (-not $sdBinExists -or $sdBinZero) {
                         $state = if (-not $sdBinExists) { 'missing' } else { '0-byte' }
-                        & $emit 'Drivers' (& $toSev $sevSyntheticDriverBroken) "$($sd.Name) binary $($sd.Bin) is $state - $($sd.Desc)" "-RepairSystemFile $($sd.Bin)"
+                        & $emit 'Drivers' (& $toSev $sdSeverity) "$($sd.Name) binary $($sd.Bin) is $state - $($sd.Desc)" "-RepairSystemFile $($sd.Bin)"
                         $synBad++
                     }
                     elseif ($null -ne $sdStart -and [int]$sdStart -ne [int]$sd.Start) {
-                        & $emit 'Drivers' (& $toSev $sevSyntheticDriverBroken) "$($sd.Name) Start=$sdStart (expected $($sd.Start)) - $($sd.Desc)" "-EnsureSyntheticDriversEnabled"
+                        & $emit 'Drivers' (& $toSev $sdSeverity) "$($sd.Name) Start=$sdStart (expected $($sd.Start)) - $($sd.Desc)" "-EnsureSyntheticDriversEnabled"
                         $synBad++
                     }
                     else {
                         # Binary exists, non-zero, start value correct  -  verify signature
-                        $sdSig = Test-MicrosoftSignature -FilePath $sdBinPath
+                        $sdSig = Test-MicrosoftSignature -FilePath $sdBin.Path
                         if (-not $sdSig.IsMicrosoft) {
-                            & $emit 'Security' (& $toSev $sevBinarySignatureBad) "$($sd.Bin) is NOT Microsoft-signed (status=$($sdSig.Status), subject='$($sdSig.Subject)') - possible tampering" "-RepairSystemFile $($sd.Bin)"
+                            $sigSeverity = if ($sdSig.Status -eq 'Valid') { $sevThirdPartyBootSystemDriver } else { $sdSeverity }
+                            $sigReason = if ($sdSig.Status -eq 'Valid') { 'validly signed by a non-Microsoft publisher' } else { 'possible tampering' }
+                            & $emit 'Security' (& $toSev $sigSeverity) "$sdBinName is NOT Microsoft-signed (status=$($sdSig.Status), subject='$($sdSig.Subject)') - $sigReason" "-RepairSystemFile $sdBinName"
                             $synBad++
                         }
                     }
@@ -7509,20 +7890,34 @@ complete recovery.
                 # Use -DisableThirdPartyDrivers to intentionally suppress all non-MS
                 # drivers when troubleshooting a clean-boot scenario.
                 $missingDrivers = [System.Collections.Generic.List[string]]::new()
-                $unsignedDrivers = [System.Collections.Generic.List[string]]::new()
+                $thirdPartyBootSystemDrivers = [System.Collections.Generic.List[string]]::new()
+                $badSignatureDrivers = [System.Collections.Generic.List[string]]::new()
+                $knownSafeBootSystemDriverNames = [string[]]@()
+                foreach ($safeDriverSpec in (Get-DeviceClassFilterSpec | Where-Object { $_.Name -in @('HDC', 'SCSIAdapter') })) {
+                    foreach ($safeDriverName in @($safeDriverSpec.SafeFilters | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+                        if ($knownSafeBootSystemDriverNames -inotcontains $safeDriverName) {
+                            $knownSafeBootSystemDriverNames += $safeDriverName
+                        }
+                    }
+                }
                 Get-ChildItem $svcRoot -ErrorAction SilentlyContinue | ForEach-Object {
                     $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
                     # Only kernel/filesystem drivers (Type 1/2) at Boot(0) or System(1) start
                     if ($p.Type -notin @(1, 2) -or $p.Start -notin @(0, 1) -or -not $p.ImagePath) { return }
+                    $svcName = $_.PSChildName
                     $imgR = Resolve-GuestImagePath $p.ImagePath
                     # Flag if binary is missing or 0 bytes (corrupt/truncated)
-                    if (-not (Test-Path $imgR)) { $missingDrivers.Add("$($_.PSChildName) ($($p.ImagePath))") }
-                    elseif ((Get-Item -LiteralPath $imgR -ErrorAction SilentlyContinue).Length -eq 0) { $missingDrivers.Add("$($_.PSChildName) ($($p.ImagePath)) [0 bytes]") }
+                    if (-not (Test-Path $imgR)) { $missingDrivers.Add("$svcName ($($p.ImagePath))") }
+                    elseif ((Get-Item -LiteralPath $imgR -ErrorAction SilentlyContinue).Length -eq 0) { $missingDrivers.Add("$svcName ($($p.ImagePath)) [0 bytes]") }
                     else {
                         # Verify Microsoft signature on present boot/system drivers
                         $drvSig = Test-MicrosoftSignature -FilePath $imgR
                         if (-not $drvSig.IsMicrosoft) {
-                            $unsignedDrivers.Add("$($_.PSChildName) ($($p.ImagePath)) [status=$($drvSig.Status)]")
+                            $driverSummary = "$svcName ($($p.ImagePath)) [status=$($drvSig.Status)]"
+                            $isKnownSafeBootSystemDriver = ($drvSig.Status -eq 'Valid' -and $knownSafeBootSystemDriverNames -icontains $svcName -and ([IO.Path]::GetFileName($imgR) -ieq "$svcName.sys"))
+                            if ($isKnownSafeBootSystemDriver) { return }
+                            elseif ($drvSig.Status -eq 'Valid') { $thirdPartyBootSystemDrivers.Add($driverSummary) }
+                            else { $badSignatureDrivers.Add($driverSummary) }
                         }
                     }
                 }
@@ -7532,8 +7927,11 @@ complete recovery.
                 else {
                     & $emit 'Drivers' 'OK' 'All Boot/System drivers have binaries present on disk'
                 }
-                if ($unsignedDrivers.Count -gt 0) {
-                    & $emit 'Security' (& $toSev $sevBinarySignatureBad) "$($unsignedDrivers.Count) Boot/System driver(s) NOT Microsoft-signed (possible tampering or third-party): $($unsignedDrivers -join ', ')" "-GetServicesReport -IssuesOnly"
+                if ($badSignatureDrivers.Count -gt 0) {
+                    & $emit 'Security' (& $toSev $sevBinarySignatureBad) "$($badSignatureDrivers.Count) Boot/System driver(s) have invalid or unverifiable non-Microsoft signatures (possible tampering): $($badSignatureDrivers -join ', ')" "-GetServicesReport -IssuesOnly"
+                }
+                if ($thirdPartyBootSystemDrivers.Count -gt 0) {
+                    & $emit 'Security' (& $toSev $sevThirdPartyBootSystemDriver) "$($thirdPartyBootSystemDrivers.Count) Boot/System driver(s) are validly signed by non-Microsoft publishers: $($thirdPartyBootSystemDrivers -join ', ')" "-GetServicesReport -IssuesOnly"
                 }
 
                 # -- Device class filters ---------------------------------------------
@@ -7946,7 +8344,7 @@ complete recovery.
                 # OS edition & build
                 $ntCv = Get-ItemProperty 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
                 if ($ntCv) {
-                    $build = if ($ntCv.CurrentBuildNumber) { "Build $($ntCv.CurrentBuildNumber).$($ntCv.UBR)" } else { '' }
+                    $build = Format-WindowsBuildLabel -Build $ntCv.CurrentBuildNumber -Ubr $ntCv.UBR -Prefix 'Build '
                     & $emit 'OS' 'INFO' "$($ntCv.ProductName)  |  Edition: $($ntCv.EditionID)  |  $build"
                 }
 
@@ -8037,8 +8435,17 @@ complete recovery.
                 }
 
                 # CBS / Component Based Servicing pending state
+                # The genuine "Configuring Windows Updates" boot loop is driven by a queued
+                # WinSxS\pending.xml that CBS replays on boot. A leftover SessionsPending session
+                # record is only a SYMPTOM and is frequently benign: CBS keeps the last *completed*
+                # exclusive session (Successful=1) as history until the next servicing run prunes
+                # it, so flagging "Exclusive != 0" alone produces false positives on healthy,
+                # fully-serviced VMs. We therefore classify each session and correlate it with the
+                # authoritative pending.xml marker before deciding WARN vs INFO.
                 $cbsBase = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing'
+                $cbsPendingXml = Test-Path -LiteralPath (Join-Path $script:WinDriveLetter 'Windows\WinSxS\pending.xml')
                 $cbsIssues = [System.Collections.Generic.List[string]]::new()
+                $cbsInfos = [System.Collections.Generic.List[string]]::new()
                 $cbsPendingKeyFound = $false
                 foreach ($cbsKey in @('RebootPending', 'PackagesPending', 'SessionsPending')) {
                     $cbsKeyPath = "$cbsBase\$cbsKey"
@@ -8050,42 +8457,59 @@ complete recovery.
                     $vals = Get-ItemProperty $cbsKeyPath -ErrorAction SilentlyContinue
                     $valNames = @($vals.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' } | Select-Object -ExpandProperty Name)
 
-                    $detail = switch ($cbsKey) {
+                    switch ($cbsKey) {
                         'RebootPending' {
-                            # Values here are package names pending reboot
-                            if ($valNames.Count -gt 0) { "pending package(s): $($valNames[0..([Math]::Min(2,$valNames.Count-1))] -join ', ')$(if ($valNames.Count -gt 3){ " (+$($valNames.Count-3) more)" })" }
-                            else { 'key exists (no values)' }
+                            # Values here are package names pending reboot - a genuine pending marker.
+                            $rp = if ($valNames.Count -gt 0) { "pending package(s): $($valNames[0..([Math]::Min(2,$valNames.Count-1))] -join ', ')$(if ($valNames.Count -gt 3){ " (+$($valNames.Count-3) more)" })" } else { 'key exists (no values)' }
+                            $cbsIssues.Add("RebootPending ($rp) - may cause 'Configuring Windows Updates' boot loop")
                         }
                         'PackagesPending' {
-                            # Subkeys are package names
-                            if ($subkeys.Count -gt 0) { "$($subkeys.Count) package(s) pending: $($subkeys[0..([Math]::Min(1,$subkeys.Count-1))] -join ', ')$(if ($subkeys.Count -gt 2){ " (+$($subkeys.Count-2) more)" })" }
-                            else { 'key exists (no subkeys)' }
+                            # Subkeys are package names queued for install - a genuine pending marker.
+                            $pp = if ($subkeys.Count -gt 0) { "$($subkeys.Count) package(s) pending: $($subkeys[0..([Math]::Min(1,$subkeys.Count-1))] -join ', ')$(if ($subkeys.Count -gt 2){ " (+$($subkeys.Count-2) more)" })" } else { 'key exists (no subkeys)' }
+                            $cbsIssues.Add("PackagesPending ($pp) - may cause 'Configuring Windows Updates' boot loop")
                         }
                         'SessionsPending' {
-                            # Each subkey is a CBS session; the Exclusive value indicates a locked session
-                            $exclusive = @($subkeys | Where-Object {
-                                    $sv = (Get-ItemProperty "$cbsKeyPath\$_" -ErrorAction SilentlyContinue).Exclusive
-                                    $null -ne $sv -and $sv -ne 0
-                                })
-                            if ($exclusive.Count -gt 0) {
-                                "EXCLUSIVE session lock(s) present - a CBS operation was interrupted mid-flight; session ID(s): $($exclusive -join ', ')"
+                            # Classify each session record. An exclusive session that did NOT finish
+                            # is "interrupted"; one CBS has marked finished is completed history.
+                            # Finished is signalled by Complete=1 (Server 2012 R2 / 2016 servicing
+                            # stack) or Successful=1 (newer stacks). Only an interrupted exclusive
+                            # session combined with a queued pending.xml is a real boot-loop candidate.
+                            # Sessions with no Exclusive value are non-exclusive history and ignored.
+                            $interrupted = [System.Collections.Generic.List[string]]::new()
+                            $completed = [System.Collections.Generic.List[string]]::new()
+                            foreach ($s in $subkeys) {
+                                $sp = Get-ItemProperty "$cbsKeyPath\$s" -ErrorAction SilentlyContinue
+                                if ($null -eq $sp -or $null -eq $sp.Exclusive -or [int]$sp.Exclusive -eq 0) { continue }
+                                $sessionDone = ($null -ne $sp.Complete -and [int]$sp.Complete -eq 1) -or ($null -ne $sp.Successful -and [int]$sp.Successful -eq 1)
+                                if ($sessionDone) { $completed.Add($s) }
+                                else { $interrupted.Add($s) }
                             }
-                            else {
-                                # Non-exclusive SessionsPending entries are common stale CBS history on healthy systems.
-                                # Suppress them from -SysCheck so they do not inflate INFO/WARN counts.
-                                $null
+                            if ($interrupted.Count -gt 0 -and $cbsPendingXml) {
+                                $cbsIssues.Add("SessionsPending (EXCLUSIVE session interrupted mid-flight AND a queued WinSxS\pending.xml is present - genuine 'Configuring Windows Updates' boot-loop risk; session ID(s): $($interrupted -join ', '))")
                             }
+                            elseif ($interrupted.Count -gt 0) {
+                                $cbsInfos.Add("CBS SessionsPending: stale exclusive session ($($interrupted -join ', ')), no pending.xml - not a boot-loop risk")
+                            }
+                            elseif ($completed.Count -gt 0) {
+                                $cbsInfos.Add("CBS SessionsPending: completed session history ($($completed -join ', ')) - normal, not pending")
+                            }
+                            # else: only non-exclusive session entries -> stale history, suppress entirely
                         }
                     }
-                    if ($detail) { $cbsIssues.Add("$cbsKey ($detail)") }
                 }
-                if ($cbsIssues.Count -gt 0) {
-                    foreach ($issue in $cbsIssues) {
-                        & $emit 'WindowsUpdate' (& $toSev $sevCbsPendingWarn) "CBS pending state: $issue - may cause 'Configuring Windows Updates' boot loop" '-FixPendingUpdates'
+                foreach ($issue in $cbsIssues) {
+                    & $emit 'WindowsUpdate' (& $toSev $sevCbsPendingWarn) "CBS pending state: $issue" '-FixPendingUpdates'
+                }
+                foreach ($info in $cbsInfos) {
+                    & $emit 'WindowsUpdate' 'INFO' $info
+                }
+                if ($cbsIssues.Count -eq 0 -and $cbsInfos.Count -eq 0) {
+                    if (-not $cbsPendingKeyFound) {
+                        & $emit 'WindowsUpdate' 'OK' 'No CBS pending state keys detected'
                     }
-                }
-                elseif (-not $cbsPendingKeyFound) {
-                    & $emit 'WindowsUpdate' 'OK' 'No CBS pending state keys detected'
+                    else {
+                        & $emit 'WindowsUpdate' 'OK' 'CBS pending keys exist but contain only stale, non-actionable session history'
+                    }
                 }
 
                 # -- Winlogon Shell / Userinit ----------------------------------------
@@ -8316,13 +8740,17 @@ complete recovery.
         Write-Host "  System Check Summary  -  $($crits.Count) critical  /  $($warns.Count) warnings  /  $($infos.Count) info  /  $($oks.Count) ok" -ForegroundColor Cyan
         Write-Host "===================================================================" -ForegroundColor Cyan
 
+        # Echo back the same target form the user invoked with (-VMName <name> or
+        # -DiskNumber <n>); fall back to the resolved disk number if not captured.
+        $targetArg = if ($script:InvocationTarget) { $script:InvocationTarget } else { "-DiskNumber $script:DiskNumber" }
+
         if ($crits.Count -gt 0) {
             Write-Host "`nCRITICAL - likely preventing boot or connectivity:" -ForegroundColor Red
             foreach ($f in $crits) {
                 Write-Host "  [$($f.Category)] $($f.Description)" -ForegroundColor Red
                 if ($f.Fix) {
                     if ($f.Fix.TrimStart().StartsWith('-')) {
-                        Write-Host "    > .\$scriptFile -DiskNumber $script:DiskNumber $($f.Fix)" -ForegroundColor DarkCyan
+                        Write-Host "    > .\$scriptFile $targetArg $($f.Fix)" -ForegroundColor DarkCyan
                     }
                     else {
                         Write-Host "    $($f.Fix)" -ForegroundColor DarkCyan
@@ -8336,7 +8764,7 @@ complete recovery.
                 Write-Host "  [$($f.Category)] $($f.Description)" -ForegroundColor Yellow
                 if ($f.Fix) {
                     if ($f.Fix.TrimStart().StartsWith('-')) {
-                        Write-Host "    > .\$scriptFile -DiskNumber $script:DiskNumber $($f.Fix)" -ForegroundColor DarkCyan
+                        Write-Host "    > .\$scriptFile $targetArg $($f.Fix)" -ForegroundColor DarkCyan
                     }
                     else {
                         Write-Host "    $($f.Fix)" -ForegroundColor DarkCyan
@@ -8458,13 +8886,14 @@ The current hives and their transaction log files (.LOG/.LOG1/.LOG2) are renamed
         foreach ($hive in $hives) {
             $backupFile = Join-Path $regBackPath $hive
             $liveFile = Join-Path $configPath  $hive
+            $backupItem = Get-Item -LiteralPath $backupFile -Force -ErrorAction SilentlyContinue
 
-            if (-not (Test-Path $backupFile)) {
+            if (-not $backupItem) {
                 Write-Warning "  RegBack copy of $hive not found - skipping."
                 continue
             }
 
-            $backupSize = (Get-Item $backupFile).Length
+            $backupSize = $backupItem.Length
             if ($backupSize -lt 1MB) {
                 Write-Warning "  RegBack $hive is suspiciously small ($backupSize bytes) - skipping to avoid overwriting with empty hive."
                 continue
@@ -9431,10 +9860,12 @@ to .disabled extension. Does NOT remove them; they can be re-enabled by renaming
         $azureCriticalDrivers = @(
             @{ Name = 'vmbus.sys';    Desc = 'Hyper-V VMBus' }
             @{ Name = 'storvsc.sys';  Desc = 'Hyper-V Storage' }
-            @{ Name = 'netvsc.sys';   Desc = 'Hyper-V Network' }
+            @{ Name = 'netvsc.sys';   Desc = 'Hyper-V Network'; AlternateBinPatterns = @('netvsc*.sys') }
         )
         foreach ($drv in $azureCriticalDrivers) {
-            $checks += @{ Name = $drv.Name; Path = (Join-Path $script:WinDriveLetter "Windows\System32\drivers\$($drv.Name)"); Category = "Azure Driver ($($drv.Desc))" }
+            $bin = Resolve-DriverBinaryCandidate -Binary $drv.Name -AlternatePatterns $drv.AlternateBinPatterns
+            $name = if ($bin.Exists) { $bin.Name } else { $drv.Name }
+            $checks += @{ Name = $name; Path = $bin.Path; Category = "Azure Driver ($($drv.Desc))" }
         }
 
         $rows = foreach ($c in $checks) {
@@ -9817,9 +10248,9 @@ instead of preserving ACLs that may have been modified during troubleshooting.
 
     function Get-SyntheticDriverSpec {
         @(
-            @{ Name = 'vmbus'; Start = 0; Bin = 'vmbus.sys'; Desc = 'Hyper-V VMBus' }
-            @{ Name = 'storvsc'; Start = 0; Bin = 'storvsc.sys'; Desc = 'Hyper-V StorVSC (synthetic storage)' }
-            @{ Name = 'netvsc'; Start = 3; Bin = 'netvsc.sys'; Desc = 'Hyper-V NetVSC (synthetic network)' }
+            @{ Name = 'vmbus'; Start = 0; Bin = 'vmbus.sys'; Desc = 'Hyper-V VMBus'; Severity = 2 }
+            @{ Name = 'storvsc'; Start = 0; Bin = 'storvsc.sys'; Desc = 'Hyper-V StorVSC (synthetic storage)'; Severity = 2 }
+            @{ Name = 'netvsc'; Start = 3; Bin = 'netvsc.sys'; AlternateBinPatterns = @('netvsc*.sys'); Desc = 'Hyper-V NetVSC (synthetic network)'; Severity = 1 }
         )
     }
 
@@ -9831,15 +10262,15 @@ instead of preserving ACLs that may have been modified during troubleshooting.
                 $svcPath = "$sysRoot\Services\$($d.Name)"
                 $exists = Test-Path $svcPath
                 $start = if ($exists) { (Get-ItemProperty $svcPath -ErrorAction SilentlyContinue).Start } else { $null }
-                $binPath = Join-Path $script:WinDriveLetter "Windows\System32\drivers\$($d.Bin)"
-                $binExists = Test-Path -LiteralPath $binPath
+                $bin = Resolve-DriverBinaryCandidate -Binary $d.Bin -AlternatePatterns $d.AlternateBinPatterns
                 [PSCustomObject]@{
                     Driver       = $d.Name
                     Expected     = $d.Start
                     CurrentStart = if ($null -ne $start) { $start } else { 'MissingKey' }
-                    BinaryExists = $binExists
-                    Healthy      = ($exists -and $binExists -and [int]$start -eq [int]$d.Start)
-                    Notes        = $d.Desc
+                    Binary       = if ($bin.Exists) { $bin.Name } else { $d.Bin }
+                    BinaryExists = $bin.Exists
+                    Healthy      = ($exists -and $bin.Exists -and $bin.Size -gt 0 -and [int]$start -eq [int]$d.Start)
+                    Notes        = if ($bin.IsAlternate) { "$($d.Desc); using $($bin.Name)" } else { $d.Desc }
                 }
             }
             $rows | Format-Table -AutoSize
@@ -9864,13 +10295,13 @@ Skips entries if service key or driver binary is missing.
             $sysRoot = Get-SystemRootPath
             foreach ($d in (Get-SyntheticDriverSpec)) {
                 $svcPath = "$sysRoot\Services\$($d.Name)"
-                $binPath = Join-Path $script:WinDriveLetter "Windows\System32\drivers\$($d.Bin)"
+                $bin = Resolve-DriverBinaryCandidate -Binary $d.Bin -AlternatePatterns $d.AlternateBinPatterns
                 if (-not (Test-Path $svcPath)) {
                     Write-Host "  $($d.Name): service key missing, skipped." -ForegroundColor Yellow
                     continue
                 }
-                if (-not (Test-Path -LiteralPath $binPath)) {
-                    Write-Host "  $($d.Name): binary missing ($($d.Bin)), skipped." -ForegroundColor Yellow
+                if (-not $bin.Exists -or $bin.Size -eq 0) {
+                    Write-Host "  $($d.Name): binary missing or 0 bytes ($($d.Bin)), skipped." -ForegroundColor Yellow
                     continue
                 }
                 $cur = (Get-ItemProperty $svcPath -ErrorAction SilentlyContinue).Start
@@ -10280,12 +10711,7 @@ Use this when stale proxy/PAC settings prevent WinRM/RDP reachability after migr
             }
             if ($selectedInstall) {
                 $selected = $selectedInstall[0]
-                $buildLabel = if ($selected.CurrentBuildNumber) {
-                    if ($selected.UBR) { "$($selected.CurrentBuildNumber).$($selected.UBR)" } else { $selected.CurrentBuildNumber }
-                }
-                else {
-                    'unknown'
-                }
+                $buildLabel = Format-WindowsBuildLabel -Build $selected.CurrentBuildNumber -Ubr $selected.UBR -Fallback 'unknown'
                 Write-ChainItem -Label "Selected Windows install: $($selected.Drive) ($($selected.ProductName), build $buildLabel, score=$($selected.Score))" -Status 'INFO'
                 if ($selected.SetupEvidence) {
                     Write-ChainItem -Label 'Selected install has setup markers' -Status 'WARN' -Detail $selected.SetupEvidence
@@ -11097,12 +11523,7 @@ Use this when stale proxy/PAC settings prevent WinRM/RDP reachability after migr
 
         if ($script:SelectedWindowsInstall) {
             $selected = $script:SelectedWindowsInstall
-            $selectedBuild = if ($selected.CurrentBuildNumber) {
-                if ($selected.UBR) { "$($selected.CurrentBuildNumber).$($selected.UBR)" } else { $selected.CurrentBuildNumber }
-            }
-            else {
-                'unknown'
-            }
+            $selectedBuild = Format-WindowsBuildLabel -Build $selected.CurrentBuildNumber -Ubr $selected.UBR -Fallback 'unknown'
             Write-Host "Selected Windows install: $($selected.Drive) ($($selected.ProductName), build $selectedBuild, score=$($selected.Score))" -ForegroundColor Cyan
             if ($selected.SetupEvidence) {
                 Write-Warning "Selected install still shows setup/upgrade markers: $($selected.SetupEvidence)"
@@ -11161,24 +11582,12 @@ Use this when stale proxy/PAC settings prevent WinRM/RDP reachability after migr
         }
 
         # Detect guest OS version for context
-        $guestBuild = $null
-        $guestProduct = $null
-        try {
-            Invoke-WithHive 'SOFTWARE' {
-                $cv = Get-ItemProperty 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
-                if ($cv) {
-                    $script:_guestBuild = $cv.CurrentBuildNumber
-                    $script:_guestUBR = $cv.UBR
-                    $script:_guestProduct = $cv.ProductName
-                }
-            }
-            $guestBuild = $script:_guestBuild
-            $guestUBR = $script:_guestUBR
-            $guestProduct = $script:_guestProduct
-        }
-        catch {}
+        $guestVersion = Get-GuestCurrentVersion
+        $guestBuild = $guestVersion.CurrentBuildNumber
+        $guestUBR = $guestVersion.UBR
+        $guestProduct = $guestVersion.ProductName
 
-        $fullBuild = if ($guestBuild -and $guestUBR) { "$guestBuild.$guestUBR" } elseif ($guestBuild) { $guestBuild } else { 'unknown' }
+        $fullBuild = Format-WindowsBuildLabel -Build $guestBuild -Ubr $guestUBR -Fallback 'unknown'
         Write-Host "Guest OS: $guestProduct (Build $fullBuild)" -ForegroundColor Cyan
 
         $hostBuild = [System.Environment]::OSVersion.Version.Build
@@ -11277,23 +11686,27 @@ Use this when stale proxy/PAC settings prevent WinRM/RDP reachability after migr
             # Try to help identify the KB
             if ($parts[2] -match '^\d+$') {
                 $buildNum = [int]$parts[2]
+                # NOTE: PowerShell 'switch' runs the body of EVERY matching clause unless
+                # 'break' is used. Each clause below ends in 'break' so the FIRST (highest)
+                # matching threshold wins; without it every build collapsed to the lowest
+                # match (e.g. 9600 was mislabelled 'Server 2012' instead of '2012 R2').
                 $osName = switch ($buildNum) {
-                    { $_ -ge 26100 } { 'Windows Server 2025 / Windows 11 24H2' }
-                    { $_ -ge 22631 } { 'Windows 11 23H2' }
-                    { $_ -ge 22621 } { 'Windows 11 22H2' }
-                    { $_ -ge 22000 } { 'Windows 11 21H2' }
-                    { $_ -ge 20348 } { 'Windows Server 2022' }
-                    { $_ -ge 19045 } { 'Windows 10 22H2' }
-                    { $_ -ge 19044 } { 'Windows 10 21H2' }
-                    { $_ -ge 19041 } { 'Windows 10 2004+' }
-                    { $_ -ge 17763 } { 'Windows Server 2019 / Windows 10 1809' }
-                    { $_ -ge 17134 } { 'Windows 10 1803' }
-                    { $_ -ge 16299 } { 'Windows 10 1709' }
-                    { $_ -ge 15063 } { 'Windows 10 1703' }
-                    { $_ -ge 14393 } { 'Windows Server 2016 / Windows 10 1607' }
-                    { $_ -ge 10240 } { 'Windows 10 1507' }
-                    { $_ -ge 9600 } { 'Windows Server 2012 R2 / Windows 8.1' }
-                    { $_ -ge 9200 } { 'Windows Server 2012 / Windows 8' }
+                    { $_ -ge 26100 } { 'Windows Server 2025 / Windows 11 24H2'; break }
+                    { $_ -ge 22631 } { 'Windows 11 23H2'; break }
+                    { $_ -ge 22621 } { 'Windows 11 22H2'; break }
+                    { $_ -ge 22000 } { 'Windows 11 21H2'; break }
+                    { $_ -ge 20348 } { 'Windows Server 2022'; break }
+                    { $_ -ge 19045 } { 'Windows 10 22H2'; break }
+                    { $_ -ge 19044 } { 'Windows 10 21H2'; break }
+                    { $_ -ge 19041 } { 'Windows 10 2004+'; break }
+                    { $_ -ge 17763 } { 'Windows Server 2019 / Windows 10 1809'; break }
+                    { $_ -ge 17134 } { 'Windows 10 1803'; break }
+                    { $_ -ge 16299 } { 'Windows 10 1709'; break }
+                    { $_ -ge 15063 } { 'Windows 10 1703'; break }
+                    { $_ -ge 14393 } { 'Windows Server 2016 / Windows 10 1607'; break }
+                    { $_ -ge 10240 } { 'Windows 10 1507'; break }
+                    { $_ -ge 9600 } { 'Windows Server 2012 R2 / Windows 8.1'; break }
+                    { $_ -ge 9200 } { 'Windows Server 2012 / Windows 8'; break }
                     default { 'Unknown OS' }
                 }
                 Write-Host "  OS:      $osName" -ForegroundColor DarkGray
@@ -11893,6 +12306,8 @@ public static class RepairAzVmDiskRegistryLastWrite {
         )
 
         $windowsRoot = Join-Path $script:WinDriveLetter 'Windows'
+        $netvscCandidate = Resolve-DriverBinaryCandidate -Binary 'netvsc.sys' -AlternatePatterns @('netvsc*.sys')
+        $netvscName = if ($netvscCandidate.Exists) { $netvscCandidate.Name } else { 'netvsc.sys' }
         $criticalFiles = @(
             @{ Name = 'BCD store'; Path = (Get-BcdStorePath -BootDrive $script:BootDriveLetter -Generation $script:VMGen); Category = 'BootFiles'; Signed = $false }
             @{ Name = 'winload'; Path = (Join-Path $script:WinDriveLetter $(if ($script:VMGen -eq 2) { 'Windows\System32\winload.efi' } else { 'Windows\System32\winload.exe' })); Category = 'BootFiles'; Signed = $true }
@@ -11906,7 +12321,7 @@ public static class RepairAzVmDiskRegistryLastWrite {
             @{ Name = 'winlogon.exe'; Path = (Join-Path $windowsRoot 'System32\winlogon.exe'); Category = 'LogonFiles'; Signed = $true }
             @{ Name = 'vmbus.sys'; Path = (Join-Path $windowsRoot 'System32\drivers\vmbus.sys'); Category = 'DriverFiles'; Signed = $true }
             @{ Name = 'storvsc.sys'; Path = (Join-Path $windowsRoot 'System32\drivers\storvsc.sys'); Category = 'DriverFiles'; Signed = $true }
-            @{ Name = 'netvsc.sys'; Path = (Join-Path $windowsRoot 'System32\drivers\netvsc.sys'); Category = 'DriverFiles'; Signed = $true }
+            @{ Name = $netvscName; Path = $netvscCandidate.Path; Category = 'DriverFiles'; Signed = $true }
         )
 
         foreach ($fileSpec in $criticalFiles) {
@@ -12211,7 +12626,7 @@ public static class RepairAzVmDiskRegistryLastWrite {
             Invoke-WithHive 'SYSTEM', 'SOFTWARE' {
                 $currentVersion = Get-ItemProperty 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
                 if ($currentVersion) {
-                    $buildText = if ($currentVersion.CurrentBuildNumber) { "$($currentVersion.CurrentBuildNumber).$($currentVersion.UBR)" } else { 'unknown' }
+                    $buildText = Format-WindowsBuildLabel -Build $currentVersion.CurrentBuildNumber -Ubr $currentVersion.UBR -Fallback 'unknown'
                     Write-Host "Guest OS: $($currentVersion.ProductName) build $buildText" -ForegroundColor Cyan
                 }
 
@@ -12553,7 +12968,7 @@ No destructive file or registry cleanup is performed.
 
                 if ($script:VMGen -eq 1) {
                     # Active MBR partition with Boot\BCD present
-                    if ($part.IsActive -and (Test-Path (Join-Path $accessPath "Boot\BCD")) -and -not $bootDrive) {
+                    if ($part.IsActive -and (Test-BcdStorePath -StorePath (Join-Path $accessPath "Boot\BCD")) -and -not $bootDrive) {
                         $bootDrive = $accessPath
                     }
                     # Fallback: active MBR partition even without BCD (BCD missing/corrupted)
@@ -12564,7 +12979,7 @@ No destructive file or registry cleanup is performed.
                 }
                 elseif ($script:VMGen -eq 2) {
                     # GPT System partition with EFI\Microsoft\Boot\BCD present
-                    if ($part.Type -eq 'System' -and (Test-Path (Join-Path $accessPath "EFI\Microsoft\Boot\BCD")) -and -not $bootDrive) {
+                    if ($part.Type -eq 'System' -and (Test-BcdStorePath -StorePath (Join-Path $accessPath "EFI\Microsoft\Boot\BCD")) -and -not $bootDrive) {
                         $bootDrive = $accessPath
                     }
                     # Fallback 1: GPT System partition with EFI\Microsoft\Boot folder (BCD deleted)
@@ -12629,6 +13044,17 @@ No destructive file or registry cleanup is performed.
         $script:BootDriveLetter = $bootDrive
         $script:DiskNumber = $DiskNumber
 
+        # Capture the target parameter the user actually invoked with, so -SysCheck
+        # fix suggestions echo the same form: -VMName <name> when a VM was resolved,
+        # otherwise -DiskNumber <n>. Quote the VM name if it contains whitespace.
+        if (-not [string]::IsNullOrWhiteSpace($VMName)) {
+            $targetName = if ($VMName -match '\s') { '"' + $VMName + '"' } else { $VMName }
+            $script:InvocationTarget = "-VMName $targetName"
+        }
+        else {
+            $script:InvocationTarget = "-DiskNumber $DiskNumber"
+        }
+
         Write-Host ""
         Write-Host "[OK] Windows drive : $script:WinDriveLetter"  -ForegroundColor Green
         Write-Host "[OK] Boot drive    : $script:BootDriveLetter" -ForegroundColor Green
@@ -12637,12 +13063,7 @@ No destructive file or registry cleanup is performed.
             Write-Host "[INFO] Windows installs detected: $($script:WindowsInstallCandidates.Count)" -ForegroundColor Cyan
             foreach ($candidate in $script:WindowsInstallCandidates) {
                 $marker = if ($candidate.Selected) { '[selected]' } else { '          ' }
-                $buildLabel = if ($candidate.CurrentBuildNumber) {
-                    if ($candidate.UBR) { "Build $($candidate.CurrentBuildNumber).$($candidate.UBR)" } else { "Build $($candidate.CurrentBuildNumber)" }
-                }
-                else {
-                    'Build unknown'
-                }
+                $buildLabel = Format-WindowsBuildLabel -Build $candidate.CurrentBuildNumber -Ubr $candidate.UBR -Prefix 'Build ' -Fallback 'Build unknown'
                 $productLabel = if ($candidate.ProductName) { $candidate.ProductName } else { 'Unknown Windows install' }
                 $stateLabel = if ($candidate.SetupInProgress) { 'setup-state' } else { 'normal-state' }
                 Write-Host "  $marker $($candidate.Drive) Part$($candidate.PartitionNumber) | $productLabel | $buildLabel | $stateLabel | score=$($candidate.Score)" -ForegroundColor $(if ($candidate.Selected) { 'Green' } else { 'DarkCyan' })
