@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.5.0
+        Version: 0.5.1
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -3126,6 +3126,19 @@ The script will copy it to the guest before running bcdboot, then proceed with -
             $targetDir = Split-Path -Parent $targetPath
             if (-not (Test-Path -LiteralPath $targetDir)) {
                 New-Item-Logged -Path $targetDir -ItemType Directory -Force
+            }
+
+            if ($targetItem -and $spec.FileName -ieq 'Driver.stl') {
+                Write-Host "  Taking ownership of Driver.stl and granting Administrators Full Control..." -ForegroundColor DarkGray
+                & takeown.exe /F $targetPath /A | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    throw "takeown failed for $targetPath (exit code $LASTEXITCODE)."
+                }
+
+                & icacls.exe $targetPath /grant '*S-1-5-32-544:(F)' | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    throw "icacls failed to grant Administrators Full Control on $targetPath (exit code $LASTEXITCODE)."
+                }
             }
 
             Invoke-Logged -Description "Replace $($spec.FileName)" -Details @{ Source = $best.Path; Destination = $targetPath; SourceType = $best.Source; ComponentVersion = $best.ComponentVersion } -ScriptBlock {
