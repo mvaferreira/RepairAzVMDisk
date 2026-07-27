@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.5.1
+        Version: 0.5.2
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -3128,30 +3128,45 @@ The script will copy it to the guest before running bcdboot, then proceed with -
                 New-Item-Logged -Path $targetDir -ItemType Directory -Force
             }
 
-            if ($targetItem -and $spec.FileName -ieq 'Driver.stl') {
-                Write-Host "  Taking ownership of Driver.stl and granting Administrators Full Control..." -ForegroundColor DarkGray
-                & takeown.exe /F $targetPath /A | Out-Null
-                if ($LASTEXITCODE -ne 0) {
-                    throw "takeown failed for $targetPath (exit code $LASTEXITCODE)."
-                }
-
-                & icacls.exe $targetPath /grant '*S-1-5-32-544:(F)' | Out-Null
-                if ($LASTEXITCODE -ne 0) {
-                    throw "icacls failed to grant Administrators Full Control on $targetPath (exit code $LASTEXITCODE)."
-                }
-            }
-
-            Invoke-Logged -Description "Replace $($spec.FileName)" -Details @{ Source = $best.Path; Destination = $targetPath; SourceType = $best.Source; ComponentVersion = $best.ComponentVersion } -ScriptBlock {
-                Copy-Item -LiteralPath $best.Path -Destination $targetPath -Force -ErrorAction Stop
-            }
-
+            $restoreProtectedAcl = $false
             try {
-                $protectedAcl = New-ProtectedSystemFileAcl
-                Set-Acl -LiteralPath $targetPath -AclObject $protectedAcl -ErrorAction Stop
-                Write-Host "  [OK] Applied protected Windows system-file ACL/owner baseline." -ForegroundColor Green
+                try {
+                    Invoke-Logged -Description "Replace $($spec.FileName)" -Details @{ Source = $best.Path; Destination = $targetPath; SourceType = $best.Source; ComponentVersion = $best.ComponentVersion } -ScriptBlock {
+                        Copy-Item -LiteralPath $best.Path -Destination $targetPath -Force -ErrorAction Stop
+                    }
+                    $restoreProtectedAcl = $true
+                }
+                catch [System.UnauthorizedAccessException] {
+                    if (-not (Test-Path -LiteralPath $targetPath)) { throw }
+
+                    Write-Warning "  Access denied replacing $($spec.FileName). Taking ownership and granting Administrators Full Control, then retrying once."
+                    $restoreProtectedAcl = $true
+                    & takeown.exe /F $targetPath /A | Out-Null
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "takeown failed for $targetPath (exit code $LASTEXITCODE)."
+                    }
+
+                    & icacls.exe $targetPath /grant '*S-1-5-32-544:(F)' | Out-Null
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "icacls failed to grant Administrators Full Control on $targetPath (exit code $LASTEXITCODE)."
+                    }
+
+                    Invoke-Logged -Description "Retry replace $($spec.FileName) after access grant" -Details @{ Source = $best.Path; Destination = $targetPath; SourceType = $best.Source; ComponentVersion = $best.ComponentVersion } -ScriptBlock {
+                        Copy-Item -LiteralPath $best.Path -Destination $targetPath -Force -ErrorAction Stop
+                    }
+                }
             }
-            catch {
-                Write-Warning "  Replaced $($spec.FileName), but could not apply protected system-file ACL/owner: $_"
+            finally {
+                if ($restoreProtectedAcl -and (Test-Path -LiteralPath $targetPath)) {
+                    try {
+                        $protectedAcl = New-ProtectedSystemFileAcl
+                        Set-Acl -LiteralPath $targetPath -AclObject $protectedAcl -ErrorAction Stop
+                        Write-Host "  [OK] Applied protected Windows system-file ACL/owner baseline." -ForegroundColor Green
+                    }
+                    catch {
+                        Write-Warning "  Could not apply protected Windows system-file ACL/owner to $($spec.FileName): $_"
+                    }
+                }
             }
 
             $newItem = Get-Item -LiteralPath $targetPath -Force -ErrorAction Stop
