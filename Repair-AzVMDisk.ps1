@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.5.2
+        Version: 0.5.3
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -47,9 +47,21 @@
     .PARAMETER VMName
         Name of the Hyper-V VM whose disk should be attached automatically. Use instead of -DiskNumber.
 
+    .PARAMETER FixFirewallDebugLoopbackApps
+        Renames the active offline ControlSet value
+        Services\mpssvc\Parameters\AppCs\DebugedLoopbackApps to DebugedLoopbackApps_.
+        Use this to mitigate the Windows Defender Firewall start/stop loop and error 0x45b
+        detected by -SysCheck when duplicate loopback-app SIDs accumulate. The protected
+        value is inspected and renamed through the script's existing SYSTEM scheduled-task
+        helper, so the original AppCs owner and ACL remain unchanged.
+
     .EXAMPLE
         # Run a full diagnostic check on disk 3
         PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -SysCheck
+
+    .EXAMPLE
+        # Preserve and disable the duplicated Windows Firewall loopback-app value
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixFirewallDebugLoopbackApps
 
     .EXAMPLE
         # Rebuild BCD and fix RDP settings on disk 3
@@ -188,6 +200,7 @@ param (
     [Parameter(ParameterSetName = 'Repair')][switch]$ListStartupPrograms,
     [Parameter(ParameterSetName = 'Repair')][switch]$DisableStartupPrograms,
     [Parameter(ParameterSetName = 'Repair')][switch]$DisableFirewall,
+    [Parameter(ParameterSetName = 'Repair')][switch]$FixFirewallDebugLoopbackApps,
     [Parameter(ParameterSetName = 'Repair')][switch]$LeaveDiskOnline,
     [Parameter(ParameterSetName = 'Repair')][ValidateSet('SYSTEM', 'SOFTWARE', 'COMPONENTS', 'SAM', 'SECURITY')][string[]]$LoadHive = @(),
     [Parameter(ParameterSetName = 'Repair')][ValidateSet('SYSTEM', 'SOFTWARE', 'COMPONENTS', 'SAM', 'SECURITY')][string[]]$UnloadHive = @(),
@@ -1304,8 +1317,13 @@ $($htmlRows -join "`n")
         }
 
     # Helper: Executes a PowerShell command as the SYSTEM account using a temporary scheduled task.
-    function ExecuteAsSystem($cmd) {
-        Write-Host "  [exec] ExecuteAsSystem: $cmd" -ForegroundColor DarkGray
+    function ExecuteAsSystem {
+        param(
+            [Parameter(Mandatory = $true)][string]$cmd,
+            [string]$Description = ''
+        )
+        $display = if ($Description) { $Description } else { $cmd }
+        Write-Host "  [exec] ExecuteAsSystem: $display" -ForegroundColor DarkGray
         Try {
             $taskName = "TempSystemTask_$([guid]::NewGuid().ToString())"
             # Encode the command as Base64 and use -EncodedCommand so that special
@@ -1872,6 +1890,158 @@ $($htmlRows -join "`n")
 
     function Get-CurrentOfflineControlSetName {
         return (Split-Path -Path (Get-SystemRootPath) -Leaf)
+    }
+
+    function Invoke-FirewallDebugLoopbackAppsAsSystem {
+        param(
+            [Parameter(Mandatory = $true)][string]$AppCsPath,
+            [ValidateSet('Inspect', 'Rename')][string]$Operation = 'Inspect'
+        )
+
+        $registryPath = $AppCsPath -replace '^HKLM:\\', 'Registry::HKEY_LOCAL_MACHINE\'
+        $escapedRegistryPath = $registryPath.Replace("'", "''")
+        $resultPath = Join-Path $env:windir ("Temp\RepairAzVMDisk-FirewallAppCs-{0}.json" -f [guid]::NewGuid().ToString('N'))
+        $escapedResultPath = $resultPath.Replace("'", "''")
+        $stateFunctionBody = (Get-Command Get-FirewallDebugLoopbackAppsState -CommandType Function -ErrorAction Stop).Definition
+
+        $systemCommand = @"
+`$ErrorActionPreference = 'Stop'
+function Get-FirewallDebugLoopbackAppsState {
+$stateFunctionBody
+}
+`$result = [ordered]@{ Success = `$false; State = `$null; Error = '' }
+try {
+    `$path = '$escapedRegistryPath'
+    `$beforeState = Get-FirewallDebugLoopbackAppsState -AppCsPath `$path
+    if ('$Operation' -eq 'Rename') {
+        if (-not `$beforeState.PathExists) {
+            throw "Windows Firewall AppCs key not found: `$path"
+        }
+        if (-not `$beforeState.ActiveValueExists) {
+            throw 'DebugedLoopbackApps is not present.'
+        }
+        if (`$beforeState.RenamedValueExists) {
+            throw 'DebugedLoopbackApps_ already exists; no value was overwritten.'
+        }
+
+        `$beforeProperties = Get-ItemProperty -LiteralPath `$path -ErrorAction Stop
+        `$beforeValue = `$beforeProperties.PSObject.Properties['DebugedLoopbackApps'].Value
+        `$beforeSerialized = ConvertTo-Json -InputObject @(`$beforeValue) -Compress
+        `$registryKey = Get-Item -LiteralPath `$path -ErrorAction Stop
+        try { `$beforeKind = [string]`$registryKey.GetValueKind('DebugedLoopbackApps') }
+        finally { `$registryKey.Close() }
+
+        Rename-ItemProperty -LiteralPath `$path -Name 'DebugedLoopbackApps' -NewName 'DebugedLoopbackApps_' -ErrorAction Stop
+
+        `$afterState = Get-FirewallDebugLoopbackAppsState -AppCsPath `$path
+        if (`$afterState.ActiveValueExists -or -not `$afterState.RenamedValueExists) {
+            throw 'The registry value rename could not be verified.'
+        }
+        `$afterProperties = Get-ItemProperty -LiteralPath `$path -ErrorAction Stop
+        `$afterValue = `$afterProperties.PSObject.Properties['DebugedLoopbackApps_'].Value
+        `$afterSerialized = ConvertTo-Json -InputObject @(`$afterValue) -Compress
+        `$registryKey = Get-Item -LiteralPath `$path -ErrorAction Stop
+        try { `$afterKind = [string]`$registryKey.GetValueKind('DebugedLoopbackApps_') }
+        finally { `$registryKey.Close() }
+        if (`$beforeSerialized -ne `$afterSerialized -or `$beforeKind -ne `$afterKind) {
+            throw 'The renamed registry value did not preserve its original data and type.'
+        }
+        `$result.State = `$afterState
+    }
+    else {
+        `$result.State = `$beforeState
+    }
+    `$result.Success = `$true
+}
+catch {
+    `$result.Error = `$_.Exception.Message
+}
+`$result | ConvertTo-Json -Depth 8 -Compress | Set-Content -LiteralPath '$escapedResultPath' -Encoding UTF8
+"@
+
+        try {
+            $description = if ($Operation -eq 'Rename') {
+                'Rename protected mpssvc DebugedLoopbackApps registry value'
+            }
+            else {
+                'Inspect protected mpssvc DebugedLoopbackApps registry value'
+            }
+            ExecuteAsSystem -cmd $systemCommand -Description $description
+            if (-not (Test-Path -LiteralPath $resultPath)) {
+                throw "SYSTEM did not return a Windows Firewall AppCs result for $AppCsPath."
+            }
+            $result = Get-Content -LiteralPath $resultPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        }
+        finally {
+            if (Test-Path -LiteralPath $resultPath) {
+                Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        if (-not $result.Success) {
+            throw "Unable to $($Operation.ToLowerInvariant()) $AppCsPath as SYSTEM: $($result.Error)"
+        }
+        return $result.State
+    }
+
+    function Get-FirewallDebugLoopbackAppsState {
+        param(
+            [Parameter(Mandatory = $true)][string]$AppCsPath
+        )
+
+        $activeValueName = 'DebugedLoopbackApps'
+        $renamedValueName = 'DebugedLoopbackApps_'
+        $pathExists = Test-Path -LiteralPath $AppCsPath -ErrorAction Stop
+        $activeValueExists = $false
+        $renamedValueExists = $false
+        $entries = @()
+        $sidEntries = @()
+        $duplicateGroups = @()
+
+        if ($pathExists) {
+            $properties = Get-ItemProperty -LiteralPath $AppCsPath -ErrorAction Stop
+            if ($properties) {
+                $activeProperty = $properties.PSObject.Properties[$activeValueName]
+                $renamedProperty = $properties.PSObject.Properties[$renamedValueName]
+                $activeValueExists = $null -ne $activeProperty
+                $renamedValueExists = $null -ne $renamedProperty
+
+                if ($activeValueExists) {
+                    $parsedEntries = [System.Collections.Generic.List[string]]::new()
+                    foreach ($rawItem in @($activeProperty.Value)) {
+                        if ($null -eq $rawItem) { continue }
+                        foreach ($part in ([string]$rawItem -split '[,\r\n]+')) {
+                            $entry = $part.Trim().Trim('"')
+                            if (-not [string]::IsNullOrWhiteSpace($entry)) {
+                                $parsedEntries.Add($entry)
+                            }
+                        }
+                    }
+                    $entries = @($parsedEntries)
+                    $sidEntries = @($entries | Where-Object { $_ -match '^S-\d-\d+(?:-\d+)+$' })
+                    $duplicateGroups = @($sidEntries | Group-Object | Where-Object Count -gt 1)
+                }
+            }
+        }
+
+        $duplicateEntryCount = 0
+        foreach ($group in $duplicateGroups) {
+            $duplicateEntryCount += ($group.Count - 1)
+        }
+
+        return [PSCustomObject]@{
+            Path                 = $AppCsPath
+            PathExists           = $pathExists
+            ActiveValueExists    = $activeValueExists
+            RenamedValueExists   = $renamedValueExists
+            EntryCount           = $entries.Count
+            SidCount             = $sidEntries.Count
+            NonSidEntryCount     = $entries.Count - $sidEntries.Count
+            UniqueSidCount       = @($sidEntries | Sort-Object -Unique).Count
+            DuplicateSidCount    = $duplicateGroups.Count
+            DuplicateEntryCount  = $duplicateEntryCount
+            DuplicateSids        = [string[]]@($duplicateGroups | ForEach-Object Name)
+        }
     }
 
     # Returns Current/Default/LKGC control sets for explicit multi-control-set diagnostics or repairs.
@@ -6966,6 +7136,9 @@ complete recovery.
         # Firewall
         $sevFirewallEnabled = 0   # Firewall is enabled (normal; INFO only)
         $sevFirewallRdpBlocked = 1   # No inbound RDP rule enabled in firewall
+        $sevFirewallLoopbackAccess = 1   # Protected AppCs value could not be inspected as SYSTEM
+        $sevFirewallLoopbackDuplicates = 1   # Duplicate SIDs in mpssvc DebugedLoopbackApps
+        $sevFirewallLoopbackSaturation = 2   # Duplicate SID list reached the observed ~683-entry 0x45b failure point
 
         # Image File Execution Options (IFEO)
         $sevIFEODebugger = 2   # IFEO Debugger set on critical service binary (prevents service from starting)
@@ -7503,8 +7676,9 @@ complete recovery.
                 $lkgcSet = $sel.LastKnownGood
                 $defSet = $sel.Default
                 $csName = Get-CurrentOfflineControlSetName
-                $svcRoot = "HKLM:\BROKENSYSTEM\$csName\Services"
-                $ctrlRoot = "HKLM:\BROKENSYSTEM\$csName\Control"
+                $SystemRoot = "HKLM:\BROKENSYSTEM\$csName"
+                $svcRoot = "$SystemRoot\Services"
+                $ctrlRoot = "$SystemRoot\Control"
 
                 # ControlSet mismatch
                 if ($null -ne $curSet -and $null -ne $defSet -and $curSet -ne $defSet) {
@@ -8066,6 +8240,48 @@ complete recovery.
                 }
                 else {
                     & $emit 'Firewall' 'OK' 'Windows Firewall is disabled on all profiles'
+                }
+
+                # Duplicate package SIDs can grow this value to hundreds of entries and
+                # leave mpssvc cycling between Starting and Stopping with error 0x45b.
+                $appCsPath = "$svcRoot\mpssvc\Parameters\AppCs"
+                $loopbackState = $null
+                try {
+                    $loopbackState = Invoke-FirewallDebugLoopbackAppsAsSystem -AppCsPath $appCsPath -Operation Inspect
+                }
+                catch {
+                    & $emit 'Firewall' (& $toSev $sevFirewallLoopbackAccess) "Unable to inspect protected mpssvc DebugedLoopbackApps as SYSTEM: $($_.Exception.Message)"
+                }
+                if ($loopbackState) {
+                    if ($loopbackState.ActiveValueExists) {
+                        if ($loopbackState.DuplicateSidCount -gt 0) {
+                            $loopbackSeverity = if ($loopbackState.EntryCount -ge 683) {
+                                & $toSev $sevFirewallLoopbackSaturation
+                            }
+                            else {
+                                & $toSev $sevFirewallLoopbackDuplicates
+                            }
+                            $duplicatePreview = @($loopbackState.DuplicateSids | Select-Object -First 5)
+                            $previewText = if ($duplicatePreview.Count -gt 0) {
+                                $suffix = if ($loopbackState.DuplicateSidCount -gt $duplicatePreview.Count) { ', ...' } else { '' }
+                                "; duplicate examples: $($duplicatePreview -join ', ')$suffix"
+                            }
+                            else { '' }
+                            & $emit 'Firewall' $loopbackSeverity "mpssvc DebugedLoopbackApps contains $($loopbackState.EntryCount) entries with $($loopbackState.DuplicateSidCount) duplicated SID(s) and $($loopbackState.DuplicateEntryCount) extra duplicate occurrence(s)$previewText - known Windows Defender Firewall start/stop loop and error 0x45b risk" "-FixFirewallDebugLoopbackApps"
+                        }
+                        elseif ($loopbackState.EntryCount -ge 683) {
+                            & $emit 'Firewall' (& $toSev $sevFirewallLoopbackDuplicates) "mpssvc DebugedLoopbackApps contains $($loopbackState.EntryCount) entries, at the observed error 0x45b failure scale, although no exact duplicate SID was detected" "-FixFirewallDebugLoopbackApps"
+                        }
+                        else {
+                            & $emit 'Firewall' 'OK' "mpssvc DebugedLoopbackApps contains $($loopbackState.EntryCount) entries with no duplicate SIDs"
+                        }
+                    }
+                    elseif ($loopbackState.RenamedValueExists) {
+                        & $emit 'Firewall' 'OK' 'mpssvc DebugedLoopbackApps is already renamed to DebugedLoopbackApps_ (0x45b mitigation present)'
+                    }
+                    else {
+                        & $emit 'Firewall' 'OK' 'mpssvc DebugedLoopbackApps value not present'
+                    }
                 }
 
                 # -- Gen2 UEFI / Trusted Launch security (registry-based) ------------
@@ -9845,6 +10061,70 @@ to .disabled extension. Does NOT remove them; they can be re-enabled by renaming
             Write-Host "`nWindows Firewall disabled for all profiles." -ForegroundColor Green
             Write-Warning "Remember to re-enable the firewall after recovery:"
             Write-Warning "  Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True"
+        }
+    }
+
+    function FixFirewallDebugLoopbackApps {
+        Write-Host "Checking the offline Windows Firewall loopback-app registry value..." -ForegroundColor Yellow
+        Invoke-WithHive 'SYSTEM' {
+            & {
+                $systemRoot = Get-SystemRootPath
+                $appCsPath = "$systemRoot\Services\mpssvc\Parameters\AppCs"
+                $activeValueName = 'DebugedLoopbackApps'
+                $renamedValueName = 'DebugedLoopbackApps_'
+                $state = Invoke-FirewallDebugLoopbackAppsAsSystem -AppCsPath $appCsPath -Operation Inspect
+
+                if (-not $state.PathExists) {
+                    Write-Warning "Windows Firewall AppCs key not found in the active offline ControlSet: $appCsPath"
+                    return
+                }
+                if (-not $state.ActiveValueExists) {
+                    if ($state.RenamedValueExists) {
+                        Write-Host "  [OK] $activeValueName is already renamed to $renamedValueName. No changes needed." -ForegroundColor Green
+                    }
+                    else {
+                        Write-Warning "Registry value $activeValueName was not found at $appCsPath. No changes were made."
+                    }
+                    return
+                }
+                if ($state.RenamedValueExists) {
+                    Write-Error "Cannot rename $activeValueName because $renamedValueName already exists at $appCsPath. No values were overwritten."
+                    return
+                }
+
+                $duplicateSummary = if ($state.DuplicateSidCount -gt 0) {
+                    "$($state.DuplicateSidCount) duplicated SID(s), $($state.DuplicateEntryCount) extra duplicate occurrence(s)"
+                }
+                else {
+                    'no exact duplicate SIDs detected'
+                }
+                if (-not (Confirm-CriticalOperation -Operation 'Fix Windows Firewall loopback-app SID accumulation (-FixFirewallDebugLoopbackApps)' -Details @"
+Renames one registry value in the active offline ControlSet:
+  $appCsPath
+  $activeValueName -> $renamedValueName
+
+Current value: $($state.EntryCount) entries; $duplicateSummary.
+The original data is preserved under the new value name.
+Default and LastKnownGood control sets are not modified.
+"@)) { return }
+
+                $afterState = Invoke-FirewallDebugLoopbackAppsAsSystem -AppCsPath $appCsPath -Operation Rename
+                if ($afterState.ActiveValueExists -or -not $afterState.RenamedValueExists) {
+                    throw "Failed to rename $activeValueName to $renamedValueName at $appCsPath. The original value was not confirmed as preserved under the new name."
+                }
+
+                Write-Host "  [OK] Renamed $activeValueName to $renamedValueName in $(Get-CurrentOfflineControlSetName)." -ForegroundColor Green
+                Write-Warning "Restart the repaired guest so the Windows Defender Firewall service can rebuild its loopback-app state."
+                Write-ActionLog -Event 'FixFirewallDebugLoopbackApps' -Details @{
+                    Path                 = $appCsPath
+                    OldName              = $activeValueName
+                    NewName              = $renamedValueName
+                    EntryCount           = $state.EntryCount
+                    DuplicateSidCount    = $state.DuplicateSidCount
+                    DuplicateEntryCount  = $state.DuplicateEntryCount
+                    ExecutedAsSystem      = $true
+                }
+            }
         }
     }
 
@@ -13220,6 +13500,7 @@ No destructive file or registry cleanup is performed.
             [switch]$ListStartupPrograms,
             [switch]$DisableStartupPrograms,
             [switch]$DisableFirewall,
+            [switch]$FixFirewallDebugLoopbackApps,
             [switch]$LeaveDiskOnline,
             [ValidateSet('SYSTEM', 'SOFTWARE', 'COMPONENTS', 'SAM', 'SECURITY')][string[]]$LoadHive = @(),
             [ValidateSet('SYSTEM', 'SOFTWARE', 'COMPONENTS', 'SAM', 'SECURITY')][string[]]$UnloadHive = @(),
@@ -13331,6 +13612,9 @@ PARAMETERS:
   -DisableBFE            Disable Base Filtering Engine service
   -DisableFirewall       Disable Windows Firewall for all profiles (Domain/Private/Public)
   -EnableBFE             Re-enable Base Filtering Engine service
+  -FixFirewallDebugLoopbackApps  Rename mpssvc DebugedLoopbackApps to DebugedLoopbackApps_
+                                  when duplicate SIDs risk the Firewall error 0x45b start/stop loop;
+                                  runs as SYSTEM and leaves the protected AppCs ACL unchanged
   -FixNetBindings        Remove orphaned third-party network binding components (missing binary; prevents NDIS init failure)
   -ResetNetworkStack     Reset TCP/IP stack, Winsock, firewall and DNS at next boot (also clears static DNS offline)
   -ResetInterfacesToDHCP Reset interface IPv4 settings to DHCP and clear static DNS/gateway values
@@ -13563,6 +13847,7 @@ AVAILABLE DISKS:
             if ($ListStartupPrograms) { ListStartupPrograms }
             if ($DisableStartupPrograms) { DisableStartupPrograms }
             if ($DisableFirewall) { DisableFirewall }
+            if ($FixFirewallDebugLoopbackApps) { FixFirewallDebugLoopbackApps }
 
             # -LoadHive: mount requested hives and leave them loaded for manual inspection
             foreach ($hive in $LoadHive) {
