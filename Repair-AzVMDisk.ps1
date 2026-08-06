@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.5.7
+        Version: 0.5.8
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -7697,7 +7697,6 @@ complete recovery.
         $sevProfileTempFlag = 1   # Profile has temporary flag set
 
         # Firewall
-        $sevFirewallEnabled = 0   # Firewall is enabled (normal; INFO only)
         $sevFirewallRdpBlocked = 1   # No inbound RDP rule enabled in firewall
         $sevFirewallLoopbackAccess = 1   # Protected AppCs value could not be inspected as SYSTEM
         # Image File Execution Options (IFEO)
@@ -8795,10 +8794,7 @@ complete recovery.
                         if ($fwEnabled -ne 0) { $fwAllDisabled = $false }
                     }
                 }
-                if (-not $fwAllDisabled) {
-                    & $emit 'Firewall' (& $toSev $sevFirewallEnabled) 'Windows Firewall is enabled - verify RDP (TCP 3389) is allowed inbound; use -DisableFirewall to disable for troubleshooting' "-DisableFirewall"
-                }
-                else {
+                if ($fwAllDisabled) {
                     & $emit 'Firewall' 'OK' 'Windows Firewall is disabled on all profiles'
                 }
 
