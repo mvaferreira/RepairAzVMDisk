@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.5.3
+        Version: 0.5.4
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -53,7 +53,8 @@
         Use this to mitigate the Windows Defender Firewall start/stop loop and error 0x45b
         detected by -SysCheck when duplicate loopback-app SIDs accumulate. The protected
         value is inspected and renamed through the script's existing SYSTEM scheduled-task
-        helper, so the original AppCs owner and ACL remain unchanged.
+        helper. If access is denied, SYSTEM takes ownership of AppCs and grants FullControl
+        to SYSTEM and BUILTIN\Administrators before retrying the read or rename.
 
     .EXAMPLE
         # Run a full diagnostic check on disk 3
@@ -1900,19 +1901,246 @@ $($htmlRows -join "`n")
 
         $registryPath = $AppCsPath -replace '^HKLM:\\', 'Registry::HKEY_LOCAL_MACHINE\'
         $escapedRegistryPath = $registryPath.Replace("'", "''")
+        if ($registryPath -match '^Registry::HKEY_LOCAL_MACHINE\\(?<SubKey>.+)$') {
+            $registryRootName = 'LocalMachine'
+            $nativeSubKey = $Matches.SubKey
+        }
+        elseif ($registryPath -match '^Registry::HKEY_CURRENT_USER\\(?<SubKey>.+)$') {
+            $registryRootName = 'CurrentUser'
+            $nativeSubKey = $Matches.SubKey
+        }
+        else {
+            throw "Unsupported registry path for protected access: $registryPath"
+        }
+        $escapedNativeSubKey = $nativeSubKey.Replace("'", "''")
         $resultPath = Join-Path $env:windir ("Temp\RepairAzVMDisk-FirewallAppCs-{0}.json" -f [guid]::NewGuid().ToString('N'))
         $escapedResultPath = $resultPath.Replace("'", "''")
         $stateFunctionBody = (Get-Command Get-FirewallDebugLoopbackAppsState -CommandType Function -ErrorAction Stop).Definition
+        $registryAccessSource = @'
+using System;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using Microsoft.Win32;
+using Microsoft.Win32.SafeHandles;
+
+public static class RepairAzVmDiskProtectedRegistry
+{
+    private const UInt32 TOKEN_ADJUST_PRIVILEGES = 0x0020;
+    private const UInt32 TOKEN_QUERY = 0x0008;
+    private const UInt32 SE_PRIVILEGE_ENABLED = 0x00000002;
+    private const Int32 ERROR_NOT_ALL_ASSIGNED = 1300;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LUID
+    {
+        public UInt32 LowPart;
+        public Int32 HighPart;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TOKEN_PRIVILEGES
+    {
+        public UInt32 PrivilegeCount;
+        public LUID Luid;
+        public UInt32 Attributes;
+    }
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool OpenProcessToken(
+        IntPtr ProcessHandle,
+        UInt32 DesiredAccess,
+        out IntPtr TokenHandle);
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool LookupPrivilegeValue(
+        string lpSystemName,
+        string lpName,
+        out LUID lpLuid);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool AdjustTokenPrivileges(
+        IntPtr TokenHandle,
+        bool DisableAllPrivileges,
+        ref TOKEN_PRIVILEGES NewState,
+        UInt32 BufferLength,
+        IntPtr PreviousState,
+        IntPtr ReturnLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
+    private static void TryEnablePrivilege(string privilegeName)
+    {
+        IntPtr token;
+        if (!OpenProcessToken(
+            Process.GetCurrentProcess().Handle,
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            out token))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "OpenProcessToken failed.");
+        }
+
+        try
+        {
+            LUID luid;
+            if (!LookupPrivilegeValue(null, privilegeName, out luid))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "LookupPrivilegeValue failed.");
+            }
+
+            TOKEN_PRIVILEGES privileges = new TOKEN_PRIVILEGES();
+            privileges.PrivilegeCount = 1;
+            privileges.Luid = luid;
+            privileges.Attributes = SE_PRIVILEGE_ENABLED;
+            if (!AdjustTokenPrivileges(
+                token,
+                false,
+                ref privileges,
+                0,
+                IntPtr.Zero,
+                IntPtr.Zero))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "AdjustTokenPrivileges failed.");
+            }
+
+            int error = Marshal.GetLastWin32Error();
+            if (error != 0 && error != ERROR_NOT_ALL_ASSIGNED)
+            {
+                throw new Win32Exception(error, "AdjustTokenPrivileges failed.");
+            }
+        }
+        finally
+        {
+            CloseHandle(token);
+        }
+    }
+
+    private static RegistryKey GetRoot(string rootName)
+    {
+        if (String.Equals(rootName, "LocalMachine", StringComparison.OrdinalIgnoreCase))
+        {
+            return Registry.LocalMachine;
+        }
+        if (String.Equals(rootName, "CurrentUser", StringComparison.OrdinalIgnoreCase))
+        {
+            return Registry.CurrentUser;
+        }
+        throw new ArgumentException("Unsupported registry root: " + rootName, "rootName");
+    }
+
+    public static void TakeOwnershipAndGrantAccess(string rootName, string subKey)
+    {
+        RegistryKey root = GetRoot(rootName);
+        SecurityIdentifier currentIdentity = WindowsIdentity.GetCurrent().User;
+        SecurityIdentifier administrators =
+            new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+        bool alreadyOwner = false;
+        try
+        {
+            using (RegistryKey ownerCheck = root.OpenSubKey(
+                subKey,
+                RegistryKeyPermissionCheck.ReadSubTree,
+                RegistryRights.ReadPermissions))
+            {
+                if (ownerCheck != null)
+                {
+                    IdentityReference owner = ownerCheck.GetAccessControl(
+                        AccessControlSections.Owner).GetOwner(
+                            typeof(SecurityIdentifier));
+                    if (currentIdentity.Equals(owner))
+                    {
+                        alreadyOwner = true;
+                    }
+                }
+            }
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+
+        if (!alreadyOwner)
+        {
+            TryEnablePrivilege("SeTakeOwnershipPrivilege");
+            using (RegistryKey ownershipKey = root.OpenSubKey(
+                subKey,
+                RegistryKeyPermissionCheck.ReadWriteSubTree,
+                RegistryRights.TakeOwnership))
+            {
+                if (ownershipKey == null)
+                {
+                    throw new InvalidOperationException("Unable to open the registry key for ownership.");
+                }
+                RegistrySecurity ownerSecurity = new RegistrySecurity();
+                ownerSecurity.SetOwner(currentIdentity);
+                ownershipKey.SetAccessControl(ownerSecurity);
+            }
+        }
+
+        RegistryRights securityRights =
+            RegistryRights.ReadPermissions |
+            RegistryRights.ChangePermissions;
+        using (RegistryKey securityKey = root.OpenSubKey(
+            subKey,
+            RegistryKeyPermissionCheck.ReadWriteSubTree,
+            securityRights))
+        {
+            if (securityKey == null)
+            {
+                throw new InvalidOperationException("Unable to open the owned registry key security.");
+            }
+            RegistrySecurity security = securityKey.GetAccessControl(
+                AccessControlSections.Access |
+                AccessControlSections.Owner |
+                AccessControlSections.Group);
+            security.SetAccessRule(new RegistryAccessRule(
+                currentIdentity,
+                RegistryRights.FullControl,
+                InheritanceFlags.None,
+                PropagationFlags.None,
+                AccessControlType.Allow));
+            security.SetAccessRule(new RegistryAccessRule(
+                administrators,
+                RegistryRights.FullControl,
+                InheritanceFlags.None,
+                PropagationFlags.None,
+                AccessControlType.Allow));
+            securityKey.SetAccessControl(security);
+        }
+    }
+}
+'@
+        $registryAccessSourceBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($registryAccessSource))
 
         $systemCommand = @"
 `$ErrorActionPreference = 'Stop'
 function Get-FirewallDebugLoopbackAppsState {
 $stateFunctionBody
 }
-`$result = [ordered]@{ Success = `$false; State = `$null; Error = '' }
+`$result = [ordered]@{ Success = `$false; State = `$null; PermissionsAdjusted = `$false; Error = '' }
 try {
     `$path = '$escapedRegistryPath'
-    `$beforeState = Get-FirewallDebugLoopbackAppsState -AppCsPath `$path
+    try {
+        `$beforeState = Get-FirewallDebugLoopbackAppsState -AppCsPath `$path
+    }
+    catch {
+        `$accessError = `$_.Exception.Message
+        `$isAccessDenied = (`$_.Exception -is [UnauthorizedAccessException]) -or
+            (`$_.Exception -is [System.Security.SecurityException]) -or
+            (`$accessError -match '(?i)requested registry access|access.*denied|access.*not allowed')
+        if (-not `$isAccessDenied) { throw }
+
+        `$registryAccessSource = [Text.Encoding]::UTF8.GetString(
+            [Convert]::FromBase64String('$registryAccessSourceBase64'))
+        Add-Type -TypeDefinition `$registryAccessSource -ErrorAction Stop
+        [RepairAzVmDiskProtectedRegistry]::TakeOwnershipAndGrantAccess(
+            '$registryRootName',
+            '$escapedNativeSubKey')
+        `$result.PermissionsAdjusted = `$true
+        `$beforeState = Get-FirewallDebugLoopbackAppsState -AppCsPath `$path
+    }
     if ('$Operation' -eq 'Rename') {
         if (-not `$beforeState.PathExists) {
             throw "Windows Firewall AppCs key not found: `$path"
@@ -1954,7 +2182,7 @@ try {
     `$result.Success = `$true
 }
 catch {
-    `$result.Error = `$_.Exception.Message
+    `$result.Error = "`$(`$_.Exception.Message) | `$(`$_.ScriptStackTrace)"
 }
 `$result | ConvertTo-Json -Depth 8 -Compress | Set-Content -LiteralPath '$escapedResultPath' -Encoding UTF8
 "@
@@ -1981,6 +2209,7 @@ catch {
         if (-not $result.Success) {
             throw "Unable to $($Operation.ToLowerInvariant()) $AppCsPath as SYSTEM: $($result.Error)"
         }
+        $result.State | Add-Member -NotePropertyName PermissionsAdjusted -NotePropertyValue ([bool]$result.PermissionsAdjusted) -Force
         return $result.State
     }
 
@@ -6975,9 +7204,11 @@ complete recovery.
         # Read-only offline health scan. Checks BCD, registry, services, device
         # filters, networking, RDP, Azure Agent, security settings, crash
         # artifacts and Gen2 UEFI/Trusted Launch readiness (Secure Boot, vTPM,
-        # VBS/HVCI, BitLocker, EarlyLaunch). No changes are made. At the end a
-        # prioritised summary is printed with the exact -Parameter to run for
-        # each finding.
+        # VBS/HVCI, BitLocker, EarlyLaunch). At the end a prioritised summary is
+        # printed with the exact -Parameter to run for each finding. The only
+        # access repair made by this scan is for the protected mpssvc AppCs key:
+        # if required to inspect DebugedLoopbackApps, SYSTEM takes ownership and
+        # grants SYSTEM and Administrators FullControl.
         # -------------------------------------------------------------------------
 
         # Reuse guest computer name resolved earlier (stored in $script:GuestComputerName)
@@ -8253,6 +8484,9 @@ complete recovery.
                     & $emit 'Firewall' (& $toSev $sevFirewallLoopbackAccess) "Unable to inspect protected mpssvc DebugedLoopbackApps as SYSTEM: $($_.Exception.Message)"
                 }
                 if ($loopbackState) {
+                    if ($loopbackState.PermissionsAdjusted) {
+                        & $emit 'Firewall' 'INFO' 'mpssvc AppCs denied access; ownership was assigned to SYSTEM and FullControl was granted to SYSTEM and BUILTIN\Administrators'
+                    }
                     if ($loopbackState.ActiveValueExists) {
                         if ($loopbackState.DuplicateSidCount -gt 0) {
                             $loopbackSeverity = if ($loopbackState.EntryCount -ge 683) {
@@ -10073,6 +10307,9 @@ to .disabled extension. Does NOT remove them; they can be re-enabled by renaming
                 $activeValueName = 'DebugedLoopbackApps'
                 $renamedValueName = 'DebugedLoopbackApps_'
                 $state = Invoke-FirewallDebugLoopbackAppsAsSystem -AppCsPath $appCsPath -Operation Inspect
+                if ($state.PermissionsAdjusted) {
+                    Write-Host "  [OK] Took ownership of AppCs and granted SYSTEM/Administrators FullControl." -ForegroundColor Green
+                }
 
                 if (-not $state.PathExists) {
                     Write-Warning "Windows Firewall AppCs key not found in the active offline ControlSet: $appCsPath"
@@ -10122,6 +10359,7 @@ Default and LastKnownGood control sets are not modified.
                     EntryCount           = $state.EntryCount
                     DuplicateSidCount    = $state.DuplicateSidCount
                     DuplicateEntryCount  = $state.DuplicateEntryCount
+                    PermissionsAdjusted  = [bool]$state.PermissionsAdjusted
                     ExecutedAsSystem      = $true
                 }
             }
@@ -13614,7 +13852,7 @@ PARAMETERS:
   -EnableBFE             Re-enable Base Filtering Engine service
   -FixFirewallDebugLoopbackApps  Rename mpssvc DebugedLoopbackApps to DebugedLoopbackApps_
                                   when duplicate SIDs risk the Firewall error 0x45b start/stop loop;
-                                  runs as SYSTEM and leaves the protected AppCs ACL unchanged
+                                  if denied, takes ownership and grants SYSTEM/Administrators FullControl
   -FixNetBindings        Remove orphaned third-party network binding components (missing binary; prevents NDIS init failure)
   -ResetNetworkStack     Reset TCP/IP stack, Winsock, firewall and DNS at next boot (also clears static DNS offline)
   -ResetInterfacesToDHCP Reset interface IPv4 settings to DHCP and clear static DNS/gateway values
