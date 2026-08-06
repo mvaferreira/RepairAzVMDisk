@@ -2571,7 +2571,7 @@ finally {
             [ValidateRange(0, [int]::MaxValue)][int]$EntryCount
         )
 
-        if ($EntryCount -gt 680) { return 'CRIT' }
+        if ($EntryCount -ge 683) { return 'CRIT' }
         if ($EntryCount -gt 600) { return 'WARN' }
         return 'OK'
     }
@@ -8803,7 +8803,7 @@ complete recovery.
                         }
 
                         if ($loopbackSeverity -eq 'CRIT') {
-                            & $emit 'Firewall' 'CRIT' "mpssvc DebugedLoopbackApps contains $($loopbackState.EntryCount) entries$duplicateText, above the critical 680-entry threshold - known Windows Defender Firewall start/stop loop and error 0x45b risk" "-FixFirewallDebugLoopbackApps"
+                            & $emit 'Firewall' 'CRIT' "mpssvc DebugedLoopbackApps contains $($loopbackState.EntryCount) entries$duplicateText, at or above the documented 683-entry failure scale - known Windows Defender Firewall start/stop loop and error 0x45b risk" "-FixFirewallDebugLoopbackApps"
                         }
                         elseif ($loopbackSeverity -eq 'WARN') {
                             & $emit 'Firewall' 'WARN' "mpssvc DebugedLoopbackApps contains $($loopbackState.EntryCount) entries$duplicateText, above the 600-entry warning threshold - approaching the observed Windows Defender Firewall error 0x45b failure scale" "-FixFirewallDebugLoopbackApps"
