@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.5.4
+        Version: 0.5.5
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -1325,17 +1325,52 @@ $($htmlRows -join "`n")
         )
         $display = if ($Description) { $Description } else { $cmd }
         Write-Host "  [exec] ExecuteAsSystem: $display" -ForegroundColor DarkGray
+        $taskName = "TempSystemTask_$([guid]::NewGuid().ToString())"
+        $taskRegistered = $false
+        $taskScriptPath = $null
         Try {
-            $taskName = "TempSystemTask_$([guid]::NewGuid().ToString())"
             # Encode the command as Base64 and use -EncodedCommand so that special
             # characters in the command string (e.g. quotes, spaces in paths) cannot
-            # break out of the argument and inject arbitrary code.
+            # break out of the argument and inject arbitrary code. Task Scheduler
+            # command lines are limited to 32,767 characters, so oversized payloads
+            # are written to a secured temporary script instead.
             $encodedCmd = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
-            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -EncodedCommand $encodedCmd"
+            $encodedArguments = "-NoProfile -WindowStyle Hidden -EncodedCommand $encodedCmd"
+            if ($encodedArguments.Length -le 30000) {
+                $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $encodedArguments
+            }
+            else {
+                $taskScriptPath = Join-Path $env:windir ("Temp\RepairAzVMDisk-SystemTask-{0}.ps1" -f [guid]::NewGuid().ToString('N'))
+                [IO.File]::WriteAllText($taskScriptPath, $cmd, [Text.UTF8Encoding]::new($false))
+
+                $scriptAcl = [System.Security.AccessControl.FileSecurity]::new()
+                $scriptAcl.SetAccessRuleProtection($true, $false)
+                $systemSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+                $administratorsSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+                $currentUserSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+                $scriptAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+                    $systemSid,
+                    [System.Security.AccessControl.FileSystemRights]::FullControl,
+                    [System.Security.AccessControl.AccessControlType]::Allow))
+                $scriptAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+                    $administratorsSid,
+                    [System.Security.AccessControl.FileSystemRights]::FullControl,
+                    [System.Security.AccessControl.AccessControlType]::Allow))
+                $scriptAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+                    $currentUserSid,
+                    [System.Security.AccessControl.FileSystemRights]::FullControl,
+                    [System.Security.AccessControl.AccessControlType]::Allow))
+                Set-Acl -LiteralPath $taskScriptPath -AclObject $scriptAcl -ErrorAction Stop
+
+                $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument (
+                    "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$taskScriptPath`""
+                )
+            }
             $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
             $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
 
             Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal | Out-Null
+            $taskRegistered = $true
 
             # Record when we kick off the task so we can detect a genuine execution
             # via LastRunTime. The task's LastTaskResult is unreliable here (it can
@@ -1357,11 +1392,17 @@ $($htmlRows -join "`n")
                 }
                 Start-Sleep -Seconds 1
             }
-
-            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false | Out-Null
         }
         Catch {
             Write-Error "Failed to execute command as SYSTEM: $_"
+        }
+        Finally {
+            if ($taskRegistered) {
+                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+            }
+            if ($taskScriptPath -and (Test-Path -LiteralPath $taskScriptPath)) {
+                Remove-Item -LiteralPath $taskScriptPath -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 
