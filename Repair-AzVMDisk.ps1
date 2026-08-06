@@ -1962,6 +1962,7 @@ using System;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Security;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using Microsoft.Win32;
@@ -1973,6 +1974,13 @@ public static class RepairAzVmDiskProtectedRegistry
     private const UInt32 TOKEN_QUERY = 0x0008;
     private const UInt32 SE_PRIVILEGE_ENABLED = 0x00000002;
     private const Int32 ERROR_NOT_ALL_ASSIGNED = 1300;
+    private const Int32 ERROR_INSUFFICIENT_BUFFER = 122;
+    private const Int32 REG_OPTION_BACKUP_RESTORE = 0x00000004;
+    private const UInt32 OWNER_SECURITY_INFORMATION = 0x00000001;
+    private const UInt32 DACL_SECURITY_INFORMATION = 0x00000004;
+    private const UInt32 RESTORED_SECURITY_INFORMATION =
+        OWNER_SECURITY_INFORMATION |
+        DACL_SECURITY_INFORMATION;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct LUID
@@ -2012,6 +2020,30 @@ public static class RepairAzVmDiskProtectedRegistry
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr hObject);
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+    private static extern Int32 RegOpenKeyEx(
+        UIntPtr hKey,
+        string lpSubKey,
+        Int32 ulOptions,
+        Int32 samDesired,
+        out IntPtr phkResult);
+
+    [DllImport("advapi32.dll")]
+    private static extern Int32 RegGetKeySecurity(
+        IntPtr hKey,
+        UInt32 SecurityInformation,
+        [Out] byte[] pSecurityDescriptor,
+        ref Int32 lpcbSecurityDescriptor);
+
+    [DllImport("advapi32.dll")]
+    private static extern Int32 RegSetKeySecurity(
+        IntPtr hKey,
+        UInt32 SecurityInformation,
+        byte[] pSecurityDescriptor);
+
+    [DllImport("advapi32.dll")]
+    private static extern Int32 RegCloseKey(IntPtr hKey);
 
     private static void TryEnablePrivilege(string privilegeName)
     {
@@ -2070,6 +2102,194 @@ public static class RepairAzVmDiskProtectedRegistry
             return Registry.CurrentUser;
         }
         throw new ArgumentException("Unsupported registry root: " + rootName, "rootName");
+    }
+
+    private static UIntPtr GetNativeRoot(string rootName)
+    {
+        if (String.Equals(rootName, "LocalMachine", StringComparison.OrdinalIgnoreCase))
+        {
+            return new UIntPtr(0x80000002u);
+        }
+        if (String.Equals(rootName, "CurrentUser", StringComparison.OrdinalIgnoreCase))
+        {
+            return new UIntPtr(0x80000001u);
+        }
+        throw new ArgumentException("Unsupported registry root: " + rootName, "rootName");
+    }
+
+    public static byte[] CaptureSecurityDescriptor(string rootName, string subKey)
+    {
+        RegistryKey root = GetRoot(rootName);
+        try
+        {
+            using (RegistryKey key = root.OpenSubKey(
+                subKey,
+                RegistryKeyPermissionCheck.ReadSubTree,
+                RegistryRights.ReadPermissions))
+            {
+                if (key != null)
+                {
+                    return key.GetAccessControl(
+                        AccessControlSections.Access |
+                        AccessControlSections.Owner).GetSecurityDescriptorBinaryForm();
+                }
+            }
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+        catch (SecurityException)
+        {
+        }
+
+        TryEnablePrivilege("SeBackupPrivilege");
+        IntPtr keyHandle;
+        Int32 error = RegOpenKeyEx(
+            GetNativeRoot(rootName),
+            subKey,
+            REG_OPTION_BACKUP_RESTORE,
+            0,
+            out keyHandle);
+        if (error != 0)
+        {
+            throw new Win32Exception(error, "Unable to open the registry key for security backup.");
+        }
+
+        try
+        {
+            Int32 length = 0;
+            error = RegGetKeySecurity(
+                keyHandle,
+                RESTORED_SECURITY_INFORMATION,
+                null,
+                ref length);
+            if (error != ERROR_INSUFFICIENT_BUFFER)
+            {
+                throw new Win32Exception(error, "Unable to size the registry security descriptor.");
+            }
+
+            byte[] descriptor = new byte[length];
+            error = RegGetKeySecurity(
+                keyHandle,
+                RESTORED_SECURITY_INFORMATION,
+                descriptor,
+                ref length);
+            if (error != 0)
+            {
+                throw new Win32Exception(error, "Unable to read the registry security descriptor.");
+            }
+            return descriptor;
+        }
+        finally
+        {
+            RegCloseKey(keyHandle);
+        }
+    }
+
+    public static void RestoreSecurityDescriptor(
+        string rootName,
+        string subKey,
+        byte[] descriptor)
+    {
+        if (descriptor == null || descriptor.Length == 0)
+        {
+            throw new ArgumentException("The original registry security descriptor is empty.", "descriptor");
+        }
+
+        TryEnablePrivilege("SeRestorePrivilege");
+        RegistryKey root = GetRoot(rootName);
+        try
+        {
+            RegistrySecurity originalSecurity = new RegistrySecurity();
+            originalSecurity.SetSecurityDescriptorBinaryForm(
+                descriptor,
+                AccessControlSections.Access | AccessControlSections.Owner);
+            SecurityIdentifier originalOwner = (SecurityIdentifier)originalSecurity.GetOwner(
+                typeof(SecurityIdentifier));
+
+            SecurityIdentifier currentOwner;
+            using (RegistryKey ownerCheck = root.OpenSubKey(
+                subKey,
+                RegistryKeyPermissionCheck.ReadSubTree,
+                RegistryRights.ReadPermissions))
+            {
+                if (ownerCheck == null)
+                {
+                    throw new InvalidOperationException("Unable to read the temporary registry owner.");
+                }
+                currentOwner = (SecurityIdentifier)ownerCheck.GetAccessControl(
+                    AccessControlSections.Owner).GetOwner(
+                        typeof(SecurityIdentifier));
+            }
+
+            if (!originalOwner.Equals(currentOwner))
+            {
+                using (RegistryKey ownerKey = root.OpenSubKey(
+                    subKey,
+                    RegistryKeyPermissionCheck.ReadWriteSubTree,
+                    RegistryRights.TakeOwnership))
+                {
+                    if (ownerKey == null)
+                    {
+                        throw new InvalidOperationException("Unable to open the registry key to restore its owner.");
+                    }
+                    RegistrySecurity ownerSecurity = new RegistrySecurity();
+                    ownerSecurity.SetOwner(originalOwner);
+                    ownerKey.SetAccessControl(ownerSecurity);
+                }
+            }
+
+            using (RegistryKey accessKey = root.OpenSubKey(
+                subKey,
+                RegistryKeyPermissionCheck.ReadWriteSubTree,
+                RegistryRights.ChangePermissions))
+            {
+                if (accessKey == null)
+                {
+                    throw new InvalidOperationException("Unable to open the registry key to restore its DACL.");
+                }
+                RegistrySecurity accessSecurity = new RegistrySecurity();
+                accessSecurity.SetSecurityDescriptorBinaryForm(
+                    descriptor,
+                    AccessControlSections.Access);
+                accessKey.SetAccessControl(accessSecurity);
+            }
+            return;
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+        catch (SecurityException)
+        {
+        }
+
+        IntPtr keyHandle;
+        Int32 error = RegOpenKeyEx(
+            GetNativeRoot(rootName),
+            subKey,
+            REG_OPTION_BACKUP_RESTORE,
+            0,
+            out keyHandle);
+        if (error != 0)
+        {
+            throw new Win32Exception(error, "Unable to open the registry key for security restoration.");
+        }
+
+        try
+        {
+            error = RegSetKeySecurity(
+                keyHandle,
+                RESTORED_SECURITY_INFORMATION,
+                descriptor);
+            if (error != 0)
+            {
+                throw new Win32Exception(error, "Unable to restore the registry security descriptor.");
+            }
+        }
+        finally
+        {
+            RegCloseKey(keyHandle);
+        }
     }
 
     public static void TakeOwnershipAndGrantAccess(string rootName, string subKey)
@@ -2160,7 +2380,14 @@ public static class RepairAzVmDiskProtectedRegistry
 function Get-FirewallDebugLoopbackAppsState {
 $stateFunctionBody
 }
-`$result = [ordered]@{ Success = `$false; State = `$null; PermissionsAdjusted = `$false; Error = '' }
+`$result = [ordered]@{
+    Success = `$false
+    State = `$null
+    PermissionsAdjusted = `$false
+    PermissionsRestored = `$false
+    Error = ''
+}
+`$originalSecurityDescriptor = `$null
 try {
     `$path = '$escapedRegistryPath'
     try {
@@ -2176,6 +2403,9 @@ try {
         `$registryAccessSource = [Text.Encoding]::UTF8.GetString(
             [Convert]::FromBase64String('$registryAccessSourceBase64'))
         Add-Type -TypeDefinition `$registryAccessSource -ErrorAction Stop
+        `$originalSecurityDescriptor = [RepairAzVmDiskProtectedRegistry]::CaptureSecurityDescriptor(
+            '$registryRootName',
+            '$escapedNativeSubKey')
         [RepairAzVmDiskProtectedRegistry]::TakeOwnershipAndGrantAccess(
             '$registryRootName',
             '$escapedNativeSubKey')
@@ -2225,6 +2455,27 @@ try {
 catch {
     `$result.Error = "`$(`$_.Exception.Message) | `$(`$_.ScriptStackTrace)"
 }
+finally {
+    if (`$result.PermissionsAdjusted) {
+        try {
+            [RepairAzVmDiskProtectedRegistry]::RestoreSecurityDescriptor(
+                '$registryRootName',
+                '$escapedNativeSubKey',
+                `$originalSecurityDescriptor)
+            `$result.PermissionsRestored = `$true
+        }
+        catch {
+            `$restoreError = "Unable to restore the original AppCs owner and DACL: `$(`$_.Exception.Message)"
+            `$result.Success = `$false
+            if (`$result.Error) {
+                `$result.Error = "`$(`$result.Error) | `$restoreError"
+            }
+            else {
+                `$result.Error = `$restoreError
+            }
+        }
+    }
+}
 `$result | ConvertTo-Json -Depth 8 -Compress | Set-Content -LiteralPath '$escapedResultPath' -Encoding UTF8
 "@
 
@@ -2251,6 +2502,7 @@ catch {
             throw "Unable to $($Operation.ToLowerInvariant()) $AppCsPath as SYSTEM: $($result.Error)"
         }
         $result.State | Add-Member -NotePropertyName PermissionsAdjusted -NotePropertyValue ([bool]$result.PermissionsAdjusted) -Force
+        $result.State | Add-Member -NotePropertyName PermissionsRestored -NotePropertyValue ([bool]$result.PermissionsRestored) -Force
         return $result.State
     }
 
@@ -8533,7 +8785,7 @@ complete recovery.
                 }
                 if ($loopbackState) {
                     if ($loopbackState.PermissionsAdjusted) {
-                        & $emit 'Firewall' 'INFO' 'mpssvc AppCs denied access; ownership was assigned to SYSTEM and FullControl was granted to SYSTEM and BUILTIN\Administrators'
+                        & $emit 'Firewall' 'INFO' 'mpssvc AppCs denied access; SYSTEM temporarily took ownership and FullControl, then restored the original owner and DACL'
                     }
                     if ($loopbackState.ActiveValueExists) {
                         $loopbackSeverity = Get-FirewallDebugLoopbackAppsEntrySeverity -EntryCount $loopbackState.EntryCount
@@ -10358,7 +10610,7 @@ to .disabled extension. Does NOT remove them; they can be re-enabled by renaming
                 $renamedValueName = 'DebugedLoopbackApps_'
                 $state = Invoke-FirewallDebugLoopbackAppsAsSystem -AppCsPath $appCsPath -Operation Inspect
                 if ($state.PermissionsAdjusted) {
-                    Write-Host "  [OK] Took ownership of AppCs and granted SYSTEM/Administrators FullControl." -ForegroundColor Green
+                    Write-Host "  [OK] Temporarily took ownership of AppCs and restored its original owner and DACL after inspection." -ForegroundColor Green
                 }
 
                 if (-not $state.PathExists) {
@@ -10410,6 +10662,7 @@ Default and LastKnownGood control sets are not modified.
                     DuplicateSidCount    = $state.DuplicateSidCount
                     DuplicateEntryCount  = $state.DuplicateEntryCount
                     PermissionsAdjusted  = [bool]$state.PermissionsAdjusted
+                    PermissionsRestored  = [bool]$afterState.PermissionsRestored
                     ExecutedAsSystem      = $true
                 }
             }
