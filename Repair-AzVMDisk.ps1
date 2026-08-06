@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.5.5
+        Version: 0.5.6
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -2312,6 +2312,16 @@ catch {
             DuplicateEntryCount  = $duplicateEntryCount
             DuplicateSids        = [string[]]@($duplicateGroups | ForEach-Object Name)
         }
+    }
+
+    function Get-FirewallDebugLoopbackAppsEntrySeverity {
+        param(
+            [ValidateRange(0, [int]::MaxValue)][int]$EntryCount
+        )
+
+        if ($EntryCount -gt 680) { return 'CRIT' }
+        if ($EntryCount -gt 600) { return 'WARN' }
+        return 'OK'
     }
 
     # Returns Current/Default/LKGC control sets for explicit multi-control-set diagnostics or repairs.
@@ -7409,9 +7419,6 @@ complete recovery.
         $sevFirewallEnabled = 0   # Firewall is enabled (normal; INFO only)
         $sevFirewallRdpBlocked = 1   # No inbound RDP rule enabled in firewall
         $sevFirewallLoopbackAccess = 1   # Protected AppCs value could not be inspected as SYSTEM
-        $sevFirewallLoopbackDuplicates = 1   # Duplicate SIDs in mpssvc DebugedLoopbackApps
-        $sevFirewallLoopbackSaturation = 2   # Duplicate SID list reached the observed ~683-entry 0x45b failure point
-
         # Image File Execution Options (IFEO)
         $sevIFEODebugger = 2   # IFEO Debugger set on critical service binary (prevents service from starting)
         $sevIFEODebuggerNonCritical = 1   # IFEO Debugger set on non-critical executable
@@ -8529,26 +8536,28 @@ complete recovery.
                         & $emit 'Firewall' 'INFO' 'mpssvc AppCs denied access; ownership was assigned to SYSTEM and FullControl was granted to SYSTEM and BUILTIN\Administrators'
                     }
                     if ($loopbackState.ActiveValueExists) {
-                        if ($loopbackState.DuplicateSidCount -gt 0) {
-                            $loopbackSeverity = if ($loopbackState.EntryCount -ge 683) {
-                                & $toSev $sevFirewallLoopbackSaturation
-                            }
-                            else {
-                                & $toSev $sevFirewallLoopbackDuplicates
-                            }
-                            $duplicatePreview = @($loopbackState.DuplicateSids | Select-Object -First 5)
-                            $previewText = if ($duplicatePreview.Count -gt 0) {
-                                $suffix = if ($loopbackState.DuplicateSidCount -gt $duplicatePreview.Count) { ', ...' } else { '' }
-                                "; duplicate examples: $($duplicatePreview -join ', ')$suffix"
-                            }
-                            else { '' }
-                            & $emit 'Firewall' $loopbackSeverity "mpssvc DebugedLoopbackApps contains $($loopbackState.EntryCount) entries with $($loopbackState.DuplicateSidCount) duplicated SID(s) and $($loopbackState.DuplicateEntryCount) extra duplicate occurrence(s)$previewText - known Windows Defender Firewall start/stop loop and error 0x45b risk" "-FixFirewallDebugLoopbackApps"
+                        $loopbackSeverity = Get-FirewallDebugLoopbackAppsEntrySeverity -EntryCount $loopbackState.EntryCount
+                        $duplicatePreview = @($loopbackState.DuplicateSids | Select-Object -First 5)
+                        $previewText = if ($duplicatePreview.Count -gt 0) {
+                            $suffix = if ($loopbackState.DuplicateSidCount -gt $duplicatePreview.Count) { ', ...' } else { '' }
+                            "; duplicate examples: $($duplicatePreview -join ', ')$suffix"
                         }
-                        elseif ($loopbackState.EntryCount -ge 683) {
-                            & $emit 'Firewall' (& $toSev $sevFirewallLoopbackDuplicates) "mpssvc DebugedLoopbackApps contains $($loopbackState.EntryCount) entries, at the observed error 0x45b failure scale, although no exact duplicate SID was detected" "-FixFirewallDebugLoopbackApps"
+                        else { '' }
+                        $duplicateText = if ($loopbackState.DuplicateSidCount -gt 0) {
+                            " with $($loopbackState.DuplicateSidCount) duplicated SID(s) and $($loopbackState.DuplicateEntryCount) extra duplicate occurrence(s)$previewText"
                         }
                         else {
-                            & $emit 'Firewall' 'OK' "mpssvc DebugedLoopbackApps contains $($loopbackState.EntryCount) entries with no duplicate SIDs"
+                            ' with no duplicate SIDs'
+                        }
+
+                        if ($loopbackSeverity -eq 'CRIT') {
+                            & $emit 'Firewall' 'CRIT' "mpssvc DebugedLoopbackApps contains $($loopbackState.EntryCount) entries$duplicateText, above the critical 680-entry threshold - known Windows Defender Firewall start/stop loop and error 0x45b risk" "-FixFirewallDebugLoopbackApps"
+                        }
+                        elseif ($loopbackSeverity -eq 'WARN') {
+                            & $emit 'Firewall' 'WARN' "mpssvc DebugedLoopbackApps contains $($loopbackState.EntryCount) entries$duplicateText, above the 600-entry warning threshold - approaching the observed Windows Defender Firewall error 0x45b failure scale" "-FixFirewallDebugLoopbackApps"
+                        }
+                        else {
+                            & $emit 'Firewall' 'OK' "mpssvc DebugedLoopbackApps contains $($loopbackState.EntryCount) entries$duplicateText (normal; warning threshold is above 600 entries)"
                         }
                     }
                     elseif ($loopbackState.RenamedValueExists) {
