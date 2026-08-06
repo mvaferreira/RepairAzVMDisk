@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.5.8
+        Version: 0.5.9
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -2388,6 +2388,7 @@ $stateFunctionBody
     RenamePerformed = `$false
     ReplacedExistingRenamed = `$false
     OriginalMissing = `$false
+    EmptyValueCreated = `$false
     Error = ''
 }
 `$originalSecurityDescriptor = `$null
@@ -2420,8 +2421,50 @@ try {
             throw "Windows Firewall AppCs key not found: `$path"
         }
         if (-not `$beforeState.ActiveValueExists) {
-            `$result.State = `$beforeState
-            `$result.OriginalMissing = `$true
+            if (`$beforeState.RenamedValueExists) {
+                `$registryKey = Get-Item -LiteralPath `$path -ErrorAction Stop
+                try { `$renamedKind = [string]`$registryKey.GetValueKind('DebugedLoopbackApps_') }
+                finally { `$registryKey.Close() }
+                `$registryKind = [Enum]::Parse(
+                    [Microsoft.Win32.RegistryValueKind],
+                    `$renamedKind)
+                if (`$renamedKind -eq 'MultiString') { `$emptyValue = [string[]]::new(0) }
+                elseif (`$renamedKind -eq 'String') { `$emptyValue = [string]'' }
+                elseif (`$renamedKind -eq 'ExpandString') { `$emptyValue = [string]'' }
+                elseif (`$renamedKind -eq 'Binary') { `$emptyValue = [byte[]]::new(0) }
+                elseif (`$renamedKind -eq 'DWord') { `$emptyValue = [int]0 }
+                elseif (`$renamedKind -eq 'QWord') { `$emptyValue = [long]0 }
+                else { throw "Unsupported DebugedLoopbackApps_ registry type: `$renamedKind" }
+                `$registryRoot = if ('$registryRootName' -eq 'LocalMachine') {
+                    [Microsoft.Win32.Registry]::LocalMachine
+                }
+                else {
+                    [Microsoft.Win32.Registry]::CurrentUser
+                }
+                `$registryKey = `$registryRoot.OpenSubKey('$escapedNativeSubKey', `$true)
+                if (-not `$registryKey) {
+                    throw 'Unable to open AppCs for recreating DebugedLoopbackApps.'
+                }
+                try {
+                    `$registryKey.SetValue(
+                        'DebugedLoopbackApps',
+                        `$emptyValue,
+                        `$registryKind)
+                }
+                finally { `$registryKey.Close() }
+                `$afterState = Get-FirewallDebugLoopbackAppsState -AppCsPath `$path
+                if (-not `$afterState.ActiveValueExists -or
+                    -not `$afterState.RenamedValueExists -or
+                    `$afterState.EntryCount -ne 0) {
+                    throw 'The missing empty DebugedLoopbackApps value could not be recreated.'
+                }
+                `$result.State = `$afterState
+                `$result.EmptyValueCreated = `$true
+            }
+            else {
+                `$result.State = `$beforeState
+                `$result.OriginalMissing = `$true
+            }
         }
         else {
             `$beforeProperties = Get-ItemProperty -LiteralPath `$path -ErrorAction Stop
@@ -2442,35 +2485,90 @@ try {
                 `$result.ReplacedExistingRenamed = `$true
             }
 
+            `$currentValueRenamed = `$false
             try {
                 Rename-ItemProperty -LiteralPath `$path -Name 'DebugedLoopbackApps' -NewName 'DebugedLoopbackApps_' -ErrorAction Stop
+                `$currentValueRenamed = `$true
+
+                `$renamedState = Get-FirewallDebugLoopbackAppsState -AppCsPath `$path
+                if (`$renamedState.ActiveValueExists -or -not `$renamedState.RenamedValueExists) {
+                    throw 'The registry value rename could not be verified.'
+                }
+                `$renamedProperties = Get-ItemProperty -LiteralPath `$path -ErrorAction Stop
+                `$renamedValue = `$renamedProperties.PSObject.Properties['DebugedLoopbackApps_'].Value
+                `$renamedSerialized = ConvertTo-Json -InputObject @(`$renamedValue) -Compress
+                `$registryKey = Get-Item -LiteralPath `$path -ErrorAction Stop
+                try { `$renamedKind = [string]`$registryKey.GetValueKind('DebugedLoopbackApps_') }
+                finally { `$registryKey.Close() }
+                if (`$beforeSerialized -ne `$renamedSerialized -or `$beforeKind -ne `$renamedKind) {
+                    throw 'The renamed registry value did not preserve its original data and type.'
+                }
+
+                `$registryKind = [Enum]::Parse(
+                    [Microsoft.Win32.RegistryValueKind],
+                    `$beforeKind)
+                if (`$beforeKind -eq 'MultiString') { `$emptyValue = [string[]]::new(0) }
+                elseif (`$beforeKind -eq 'String') { `$emptyValue = [string]'' }
+                elseif (`$beforeKind -eq 'ExpandString') { `$emptyValue = [string]'' }
+                elseif (`$beforeKind -eq 'Binary') { `$emptyValue = [byte[]]::new(0) }
+                elseif (`$beforeKind -eq 'DWord') { `$emptyValue = [int]0 }
+                elseif (`$beforeKind -eq 'QWord') { `$emptyValue = [long]0 }
+                else { throw "Unsupported DebugedLoopbackApps registry type: `$beforeKind" }
+                `$registryRoot = if ('$registryRootName' -eq 'LocalMachine') {
+                    [Microsoft.Win32.Registry]::LocalMachine
+                }
+                else {
+                    [Microsoft.Win32.Registry]::CurrentUser
+                }
+                `$registryKey = `$registryRoot.OpenSubKey('$escapedNativeSubKey', `$true)
+                if (-not `$registryKey) {
+                    throw 'Unable to open AppCs for recreating DebugedLoopbackApps.'
+                }
+                try {
+                    `$registryKey.SetValue(
+                        'DebugedLoopbackApps',
+                        `$emptyValue,
+                        `$registryKind)
+                }
+                finally { `$registryKey.Close() }
+
+                `$afterState = Get-FirewallDebugLoopbackAppsState -AppCsPath `$path
+                if (-not `$afterState.ActiveValueExists -or
+                    -not `$afterState.RenamedValueExists -or
+                    `$afterState.EntryCount -ne 0) {
+                    throw 'The empty DebugedLoopbackApps value could not be verified.'
+                }
+                `$registryKey = Get-Item -LiteralPath `$path -ErrorAction Stop
+                try { `$emptyKind = [string]`$registryKey.GetValueKind('DebugedLoopbackApps') }
+                finally { `$registryKey.Close() }
+                if (`$emptyKind -ne `$beforeKind) {
+                    throw 'The empty DebugedLoopbackApps value did not preserve the original registry type.'
+                }
+
+                `$result.State = `$afterState
+                `$result.RenamePerformed = `$true
+                `$result.EmptyValueCreated = `$true
             }
             catch {
-                `$renameError = `$_
-                if (`$result.ReplacedExistingRenamed) {
+                `$repairError = `$_
+                try {
                     `$rollbackState = Get-FirewallDebugLoopbackAppsState -AppCsPath `$path
-                    if (-not `$rollbackState.RenamedValueExists) {
+                    if (`$currentValueRenamed -and `$rollbackState.RenamedValueExists) {
+                        if (`$rollbackState.ActiveValueExists) {
+                            Remove-ItemProperty -LiteralPath `$path -Name 'DebugedLoopbackApps' -ErrorAction Stop
+                        }
+                        Rename-ItemProperty -LiteralPath `$path -Name 'DebugedLoopbackApps_' -NewName 'DebugedLoopbackApps' -ErrorAction Stop
+                    }
+                    `$rollbackState = Get-FirewallDebugLoopbackAppsState -AppCsPath `$path
+                    if (`$result.ReplacedExistingRenamed -and -not `$rollbackState.RenamedValueExists) {
                         New-ItemProperty -Path `$path -Name 'DebugedLoopbackApps_' -PropertyType `$previousRenamedKind -Value `$previousRenamedValue -Force -ErrorAction Stop | Out-Null
                     }
                 }
-                throw `$renameError
+                catch {
+                    throw "Firewall loopback repair failed and rollback was incomplete: `$(`$repairError.Exception.Message) | Rollback: `$(`$_.Exception.Message)"
+                }
+                throw `$repairError
             }
-
-            `$afterState = Get-FirewallDebugLoopbackAppsState -AppCsPath `$path
-            if (`$afterState.ActiveValueExists -or -not `$afterState.RenamedValueExists) {
-                throw 'The registry value rename could not be verified.'
-            }
-            `$afterProperties = Get-ItemProperty -LiteralPath `$path -ErrorAction Stop
-            `$afterValue = `$afterProperties.PSObject.Properties['DebugedLoopbackApps_'].Value
-            `$afterSerialized = ConvertTo-Json -InputObject @(`$afterValue) -Compress
-            `$registryKey = Get-Item -LiteralPath `$path -ErrorAction Stop
-            try { `$afterKind = [string]`$registryKey.GetValueKind('DebugedLoopbackApps_') }
-            finally { `$registryKey.Close() }
-            if (`$beforeSerialized -ne `$afterSerialized -or `$beforeKind -ne `$afterKind) {
-                throw 'The renamed registry value did not preserve its original data and type.'
-            }
-            `$result.State = `$afterState
-            `$result.RenamePerformed = `$true
         }
     }
     else {
@@ -2532,6 +2630,7 @@ finally {
         $result.State | Add-Member -NotePropertyName RenamePerformed -NotePropertyValue ([bool]$result.RenamePerformed) -Force
         $result.State | Add-Member -NotePropertyName ReplacedExistingRenamed -NotePropertyValue ([bool]$result.ReplacedExistingRenamed) -Force
         $result.State | Add-Member -NotePropertyName OriginalMissing -NotePropertyValue ([bool]$result.OriginalMissing) -Force
+        $result.State | Add-Member -NotePropertyName EmptyValueCreated -NotePropertyValue ([bool]$result.EmptyValueCreated) -Force
         return $result.State
     }
 
@@ -10643,13 +10742,10 @@ to .disabled extension. Does NOT remove them; they can be re-enabled by renaming
                     return
                 }
                 if (-not $state.ActiveValueExists) {
-                    if ($state.RenamedValueExists) {
-                        Write-Host "  [OK] $activeValueName is not present; the prior $renamedValueName value was left unchanged." -ForegroundColor Green
-                    }
-                    else {
+                    if (-not $state.RenamedValueExists) {
                         Write-Warning "Registry value $activeValueName was not found at $appCsPath. No changes were made."
+                        return
                     }
-                    return
                 }
                 $duplicateSummary = if ($state.DuplicateSidCount -gt 0) {
                     "$($state.DuplicateSidCount) duplicated SID(s), $($state.DuplicateEntryCount) extra duplicate occurrence(s)"
@@ -10657,35 +10753,59 @@ to .disabled extension. Does NOT remove them; they can be re-enabled by renaming
                 else {
                     'no exact duplicate SIDs detected'
                 }
-                if (-not (Confirm-CriticalOperation -Operation 'Fix Windows Firewall loopback-app SID accumulation (-FixFirewallDebugLoopbackApps)' -Details @"
-Renames one registry value in the active offline ControlSet:
+                $operationDetails = if ($state.ActiveValueExists) {
+@"
+Archives the current registry value in the active offline ControlSet:
   $appCsPath
   $activeValueName -> $renamedValueName
 
 Current value: $($state.EntryCount) entries; $duplicateSummary.
-The original data is preserved under the new value name.
+The original data is preserved under the new value name, then an empty
+$activeValueName value is recreated with the original registry type.
 $(
     if ($state.RenamedValueExists) {
         "An existing $renamedValueName value will be replaced before the current value is renamed."
     }
 )
+"@
+                }
+                else {
+@"
+Recreates the missing empty registry value in the active offline ControlSet:
+  $appCsPath
+  $activeValueName
+
+The registry type is copied from the existing $renamedValueName value.
+The archived data in $renamedValueName is not changed.
+"@
+                }
+                if (-not (Confirm-CriticalOperation -Operation 'Fix Windows Firewall loopback-app SID accumulation (-FixFirewallDebugLoopbackApps)' -Details @"
+$operationDetails
 Default and LastKnownGood control sets are not modified.
 "@)) { return }
 
                 $afterState = Invoke-FirewallDebugLoopbackAppsAsSystem -AppCsPath $appCsPath -Operation Rename
-                if ($afterState.OriginalMissing) {
+                if ($afterState.OriginalMissing -and -not $afterState.EmptyValueCreated) {
                     Write-Warning "$activeValueName was no longer present when the SYSTEM repair step ran. No registry values were changed."
                     return
                 }
-                if (-not $afterState.RenamePerformed -or $afterState.ActiveValueExists -or -not $afterState.RenamedValueExists) {
-                    throw "Failed to rename $activeValueName to $renamedValueName at $appCsPath. The original value was not confirmed as preserved under the new name."
+                if ($afterState.EmptyValueCreated -and -not $afterState.RenamePerformed) {
+                    Write-Host "  [OK] Recreated the missing empty $activeValueName value using the registry type from $renamedValueName." -ForegroundColor Green
+                }
+                elseif (-not $afterState.RenamePerformed -or
+                    -not $afterState.ActiveValueExists -or
+                    -not $afterState.RenamedValueExists -or
+                    $afterState.EntryCount -ne 0) {
+                    throw "Failed to archive $activeValueName as $renamedValueName and recreate an empty original value at $appCsPath."
                 }
 
                 if ($afterState.PermissionsAdjusted) {
                     Write-Host "  [OK] Temporarily took ownership of AppCs and restored its original owner and DACL after the rename." -ForegroundColor Green
                 }
-                $replacementText = if ($afterState.ReplacedExistingRenamed) { ' after replacing the previous renamed value' } else { '' }
-                Write-Host "  [OK] Renamed $activeValueName to $renamedValueName$replacementText in $(Get-CurrentOfflineControlSetName)." -ForegroundColor Green
+                if ($afterState.RenamePerformed) {
+                    $replacementText = if ($afterState.ReplacedExistingRenamed) { ' after replacing the previous renamed value' } else { '' }
+                    Write-Host "  [OK] Archived $activeValueName as $renamedValueName$replacementText and recreated an empty original value in $(Get-CurrentOfflineControlSetName)." -ForegroundColor Green
+                }
                 Write-Warning "Restart the repaired guest so the Windows Defender Firewall service can rebuild its loopback-app state."
                 Write-ActionLog -Event 'FixFirewallDebugLoopbackApps' -Details @{
                     Path                 = $appCsPath
@@ -10698,6 +10818,7 @@ Default and LastKnownGood control sets are not modified.
                     PermissionsRestored  = [bool](((-not $state.PermissionsAdjusted) -or $state.PermissionsRestored) -and ((-not $afterState.PermissionsAdjusted) -or $afterState.PermissionsRestored))
                     RenamePerformed      = [bool]$afterState.RenamePerformed
                     ReplacedExistingRenamed = [bool]$afterState.ReplacedExistingRenamed
+                    EmptyValueCreated    = [bool]$afterState.EmptyValueCreated
                     ExecutedAsSystem      = $true
                 }
             }
