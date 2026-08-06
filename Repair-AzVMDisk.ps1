@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.5.10
+        Version: 0.5.11
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -29,7 +29,10 @@
         disk health, boot configuration, RDP/NLA policy, Windows Update/CBS state, credential guard,
         network bindings, Azure VM agent presence, and more - and prints actionable fix suggestions.
 
-        All actions are logged to a JSON-line audit file (Repair-AzVMDisk_actions.log) alongside the script.
+        Repair mutations to the offline guest disk are logged to a JSON-line audit file
+        (Repair-AzVMDisk_actions.log) alongside the script. Infrastructure steps required
+        to access the disk, such as stopping the selected Hyper-V VM, mounting a VHD, bringing the
+        disk online, and assigning temporary drive letters, are intentionally excluded.
         Previous sessions can be reviewed with -ShowLastSession.
 
     .NOTES
@@ -48,13 +51,16 @@
         Name of the Hyper-V VM whose disk should be attached automatically. Use instead of -DiskNumber.
 
     .PARAMETER FixFirewallDebugLoopbackApps
-        Renames the active offline ControlSet value
-        Services\mpssvc\Parameters\AppCs\DebugedLoopbackApps to DebugedLoopbackApps_.
+        Archives the active offline ControlSet value
+        Services\mpssvc\Parameters\AppCs\DebugedLoopbackApps as DebugedLoopbackApps_,
+        replacing an older archive when necessary, then creates a new empty
+        DebugedLoopbackApps value using the original registry value type.
         Use this to mitigate the Windows Defender Firewall start/stop loop and error 0x45b
         detected by -SysCheck when duplicate loopback-app SIDs accumulate. The protected
         value is inspected and renamed through the script's existing SYSTEM scheduled-task
         helper. If access is denied, SYSTEM takes ownership of AppCs and grants FullControl
-        to SYSTEM and BUILTIN\Administrators before retrying the read or rename.
+        to SYSTEM and BUILTIN\Administrators before retrying. The original AppCs owner and
+        DACL are restored afterward, and each mutation is written to the action log.
 
     .EXAMPLE
         # Run a full diagnostic check on disk 3
@@ -664,7 +670,10 @@ end {
     $script:CurrentSessionId = [guid]::NewGuid().ToString()
 
     function Start-ActionLog {
-        param([string]$HeaderMessage = "Repair actions log")
+        param(
+            [string]$HeaderMessage = "Repair actions log",
+            [System.Collections.IDictionary]$ParameterValues = @{}
+        )
         $entry = @{
             SessionId  = $script:CurrentSessionId
             Time       = (Get-Date).ToString('o')
@@ -672,7 +681,7 @@ end {
             Message    = $HeaderMessage
             GuestName  = if ($script:GuestComputerName) { $script:GuestComputerName } else { '' }
             DiskNumber = if ($null -ne $script:DiskNumber -and $script:DiskNumber -ge 0) { $script:DiskNumber } else { '' }
-            Parameters = ($PSBoundParameters.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' '
+            Parameters = ($ParameterValues.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' '
         }
         $entry | ConvertTo-Json -Depth 5 -Compress | Out-File -FilePath $script:ActionLogPath -Encoding UTF8 -Append
     }
@@ -728,6 +737,87 @@ end {
         catch {
             $end = Get-Date
             Write-ActionLog -Event 'ActionExecuted' -Details @{ Description = $Description; Start = $start.ToString('o'); End = $end.ToString('o'); Success = $false; Details = $Details; Error = $_.ToString() }
+            throw
+        }
+    }
+
+    # Execute a PowerShell mutation while preserving object output for callers.
+    function Invoke-LoggedValue {
+        param(
+            [Parameter(Mandatory = $true)][string]$Description,
+            [hashtable]$Details = @{},
+            [Parameter(Mandatory = $true)][scriptblock]$ScriptBlock
+        )
+
+        $start = Get-Date
+        try {
+            $output = @(& $ScriptBlock)
+            $end = Get-Date
+            Write-ActionLog -Event 'ActionExecuted' -Details @{
+                Description = $Description
+                Start       = $start.ToString('o')
+                End         = $end.ToString('o')
+                Success     = $true
+                Details     = $Details
+                Output      = ($output | Out-String)
+            }
+            return $output
+        }
+        catch {
+            $end = Get-Date
+            Write-ActionLog -Event 'ActionExecuted' -Details @{
+                Description = $Description
+                Start       = $start.ToString('o')
+                End         = $end.ToString('o')
+                Success     = $false
+                Details     = $Details
+                Error       = $_.ToString()
+            }
+            throw
+        }
+    }
+
+    # Execute a native command and record its output and process exit code.
+    function Invoke-NativeCommandLogged {
+        param(
+            [Parameter(Mandatory = $true)][string]$Description,
+            [hashtable]$Details = @{},
+            [int[]]$AcceptedExitCodes = @(0),
+            [Parameter(Mandatory = $true)][scriptblock]$ScriptBlock
+        )
+
+        $start = Get-Date
+        try {
+            $output = @(& $ScriptBlock 2>&1)
+            $exitCode = $LASTEXITCODE
+            $success = $exitCode -in $AcceptedExitCodes
+            $end = Get-Date
+            Write-ActionLog -Event 'ActionExecuted' -Details @{
+                Description = $Description
+                Start       = $start.ToString('o')
+                End         = $end.ToString('o')
+                Success     = $success
+                Details     = $Details
+                ExitCode    = $exitCode
+                AcceptedExitCodes = $AcceptedExitCodes
+                Output      = ($output | Out-String)
+            }
+            return [PSCustomObject]@{
+                Output   = $output
+                ExitCode = $exitCode
+                Success  = $success
+            }
+        }
+        catch {
+            $end = Get-Date
+            Write-ActionLog -Event 'ActionExecuted' -Details @{
+                Description = $Description
+                Start       = $start.ToString('o')
+                End         = $end.ToString('o')
+                Success     = $false
+                Details     = $Details
+                Error       = $_.ToString()
+            }
             throw
         }
     }
@@ -1321,25 +1411,59 @@ $($htmlRows -join "`n")
     function ExecuteAsSystem {
         param(
             [Parameter(Mandatory = $true)][string]$cmd,
-            [string]$Description = ''
+            [string]$Description = '',
+            [switch]$SuppressActionLog
         )
         $display = if ($Description) { $Description } else { $cmd }
         Write-Host "  [exec] ExecuteAsSystem: $display" -ForegroundColor DarkGray
+        $actionStart = Get-Date
         $taskName = "TempSystemTask_$([guid]::NewGuid().ToString())"
         $taskRegistered = $false
         $taskScriptPath = $null
+        $taskResultPath = Join-Path $env:windir ("Temp\RepairAzVMDisk-SystemTaskResult-{0}.json" -f [guid]::NewGuid().ToString('N'))
+        $executionMode = ''
+        $taskCompletionConfirmed = $false
+        $commandExitCode = $null
+        $executionError = ''
         Try {
+            $escapedTaskResultPath = $taskResultPath.Replace("'", "''")
+            $innerEncodedCmd = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
+            $wrappedCommand = @"
+`$ErrorActionPreference = 'Stop'
+`$exitCode = 0
+`$errorText = ''
+try {
+    `$innerCommand = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('$innerEncodedCmd'))
+    & ([scriptblock]::Create(`$innerCommand))
+    if (`$null -ne `$LASTEXITCODE) {
+        `$exitCode = [int]`$LASTEXITCODE
+    }
+}
+catch {
+    `$exitCode = 1
+    `$errorText = `$_.ToString()
+}
+`$taskResult = [PSCustomObject]@{
+    ExitCode = `$exitCode
+    Error = `$errorText
+}
+`$taskResult | ConvertTo-Json -Compress | Set-Content -LiteralPath '$escapedTaskResultPath' -Encoding UTF8
+exit `$exitCode
+"@
+
             # Encode the command as Base64 and use -EncodedCommand so that special
             # characters in the command string (e.g. quotes, spaces in paths) cannot
             # break out of the argument and inject arbitrary code. Task Scheduler
             # command lines are limited to 32,767 characters, so oversized payloads
             # are written to a secured temporary script instead.
-            $encodedCmd = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
+            $encodedCmd = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($wrappedCommand))
             $encodedArguments = "-NoProfile -WindowStyle Hidden -EncodedCommand $encodedCmd"
             if ($encodedArguments.Length -le 30000) {
+                $executionMode = 'EncodedCommand'
                 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $encodedArguments
             }
             else {
+                $executionMode = 'SecuredFile'
                 $taskScriptPath = Join-Path $env:windir ("Temp\RepairAzVMDisk-SystemTask-{0}.ps1" -f [guid]::NewGuid().ToString('N'))
                 [IO.File]::WriteAllText($taskScriptPath, $cmd, [Text.UTF8Encoding]::new($false))
 
@@ -1385,15 +1509,32 @@ $($htmlRows -join "`n")
                 $state = (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue).State
                 $lastRun = (Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue).LastRunTime
                 $hasRun = $lastRun -and ($lastRun -ge $taskStart.AddSeconds(-2))
-                if (($state -ne 'Running') -and $hasRun) { break }
+                if (($state -ne 'Running') -and $hasRun) {
+                    $taskCompletionConfirmed = $true
+                    break
+                }
                 if ((Get-Date) -ge $deadline) {
+                    $executionError = "Task '$taskName' did not confirm completion within 5 minutes."
                     Write-Warning "ExecuteAsSystem: task '$taskName' did not confirm completion within 5 minutes; continuing."
                     break
                 }
                 Start-Sleep -Seconds 1
             }
+            if ($taskCompletionConfirmed) {
+                if (Test-Path -LiteralPath $taskResultPath) {
+                    $taskResult = Get-Content -LiteralPath $taskResultPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                    $commandExitCode = [int]$taskResult.ExitCode
+                    if ($taskResult.Error) {
+                        $executionError = [string]$taskResult.Error
+                    }
+                }
+                else {
+                    $executionError = "Task '$taskName' completed without producing a command result."
+                }
+            }
         }
         Catch {
+            $executionError = $_.ToString()
             Write-Error "Failed to execute command as SYSTEM: $_"
         }
         Finally {
@@ -1402,6 +1543,30 @@ $($htmlRows -join "`n")
             }
             if ($taskScriptPath -and (Test-Path -LiteralPath $taskScriptPath)) {
                 Remove-Item -LiteralPath $taskScriptPath -Force -ErrorAction SilentlyContinue
+            }
+            if (Test-Path -LiteralPath $taskResultPath) {
+                Remove-Item -LiteralPath $taskResultPath -Force -ErrorAction SilentlyContinue
+            }
+            if (-not $SuppressActionLog) {
+                $commandSucceeded = $taskCompletionConfirmed -and ($null -ne $commandExitCode) -and ($commandExitCode -eq 0)
+                $actionLogDetails = @{
+                    Description = 'ExecuteAsSystem'
+                    Start       = $actionStart.ToString('o')
+                    End         = (Get-Date).ToString('o')
+                    Success     = $commandSucceeded
+                    Details     = @{
+                        Command                 = $cmd
+                        Display                 = $display
+                        ExecutedAsSystem        = $true
+                        ExecutionMode           = $executionMode
+                        TaskCompletionConfirmed = $taskCompletionConfirmed
+                        ExitCode                 = $commandExitCode
+                    }
+                }
+                if ($executionError) {
+                    $actionLogDetails.Error = $executionError
+                }
+                Write-ActionLog -Event 'ActionExecuted' -Details $actionLogDetails
             }
         }
     }
@@ -2382,6 +2547,7 @@ $stateFunctionBody
 }
 `$result = [ordered]@{
     Success = `$false
+    BeforeState = `$null
     State = `$null
     PermissionsAdjusted = `$false
     PermissionsRestored = `$false
@@ -2416,6 +2582,7 @@ try {
         `$result.PermissionsAdjusted = `$true
         `$beforeState = Get-FirewallDebugLoopbackAppsState -AppCsPath `$path
     }
+    `$result.BeforeState = `$beforeState
     if ('$Operation' -eq 'Rename') {
         if (-not `$beforeState.PathExists) {
             throw "Windows Firewall AppCs key not found: `$path"
@@ -2603,6 +2770,9 @@ finally {
 `$result | ConvertTo-Json -Depth 8 -Compress | Set-Content -LiteralPath '$escapedResultPath' -Encoding UTF8
 "@
 
+        $actionStart = Get-Date
+        $result = $null
+        $invocationError = $null
         try {
             $description = if ($Operation -eq 'Rename') {
                 'Rename protected mpssvc DebugedLoopbackApps registry value'
@@ -2610,11 +2780,14 @@ finally {
             else {
                 'Inspect protected mpssvc DebugedLoopbackApps registry value'
             }
-            ExecuteAsSystem -cmd $systemCommand -Description $description
+            ExecuteAsSystem -cmd $systemCommand -Description $description -SuppressActionLog
             if (-not (Test-Path -LiteralPath $resultPath)) {
                 throw "SYSTEM did not return a Windows Firewall AppCs result for $AppCsPath."
             }
             $result = Get-Content -LiteralPath $resultPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        }
+        catch {
+            $invocationError = $_
         }
         finally {
             if (Test-Path -LiteralPath $resultPath) {
@@ -2622,6 +2795,59 @@ finally {
             }
         }
 
+        $actionEnd = Get-Date
+        $actionSucceeded = ($null -ne $result) -and [bool]$result.Success -and ($null -eq $invocationError)
+        $shouldLogAction = ($Operation -eq 'Rename') -or
+            (($null -ne $result) -and [bool]$result.PermissionsAdjusted)
+        if ($shouldLogAction) {
+            $mutations = [System.Collections.Generic.List[string]]::new()
+            if ($result -and $result.PermissionsAdjusted) {
+                $mutations.Add('Temporarily took AppCs ownership and granted SYSTEM/Administrators FullControl')
+            }
+            if ($result -and $result.ReplacedExistingRenamed) {
+                $mutations.Add('Removed the previous DebugedLoopbackApps_ value')
+            }
+            if ($result -and $result.RenamePerformed) {
+                $mutations.Add('Renamed DebugedLoopbackApps to DebugedLoopbackApps_')
+            }
+            if ($result -and $result.EmptyValueCreated) {
+                $mutations.Add('Created an empty DebugedLoopbackApps value with the preserved registry type')
+            }
+            if ($result -and $result.PermissionsRestored) {
+                $mutations.Add('Restored the original AppCs owner and DACL')
+            }
+            $actionLogDetails = @{
+                Description = "Windows Firewall AppCs $Operation as SYSTEM"
+                Start       = $actionStart.ToString('o')
+                End         = $actionEnd.ToString('o')
+                Success     = $actionSucceeded
+                Details     = @{
+                    Operation                 = $Operation
+                    Path                      = $AppCsPath
+                    ExecutedAsSystem          = $true
+                    Mutations                 = [string[]]$mutations
+                    BeforeState               = if ($result) { $result.BeforeState } else { $null }
+                    AfterState                = if ($result) { $result.State } else { $null }
+                    PermissionsAdjusted       = if ($result) { [bool]$result.PermissionsAdjusted } else { $false }
+                    PermissionsRestored       = if ($result) { [bool]$result.PermissionsRestored } else { $false }
+                    RenamePerformed           = if ($result) { [bool]$result.RenamePerformed } else { $false }
+                    ReplacedExistingRenamed   = if ($result) { [bool]$result.ReplacedExistingRenamed } else { $false }
+                    EmptyValueCreated         = if ($result) { [bool]$result.EmptyValueCreated } else { $false }
+                    OriginalMissing           = if ($result) { [bool]$result.OriginalMissing } else { $false }
+                }
+            }
+            if ($invocationError) {
+                $actionLogDetails.Error = $invocationError.ToString()
+            }
+            elseif ($result -and -not $result.Success) {
+                $actionLogDetails.Error = [string]$result.Error
+            }
+            Write-ActionLog -Event 'ActionExecuted' -Details $actionLogDetails
+        }
+
+        if ($invocationError) {
+            throw $invocationError
+        }
         if (-not $result.Success) {
             throw "Unable to $($Operation.ToLowerInvariant()) $AppCsPath as SYSTEM: $($result.Error)"
         }
@@ -3087,11 +3313,19 @@ finally {
                 # Windows Server 2012 R2, whose proactive-scan model logs corruption that is retired by
                 # spotfix or boot-time/idle maintenance rather than by a one-shot /F pass.
                 Write-Host "Running chkdsk /spotfix on $target (drains the spot-verifier `$corrupt queue) ..." -ForegroundColor Yellow
-                & chkdsk $target /spotfix
+                $chkdskResult = Invoke-NativeCommandLogged -Description 'chkdsk /spotfix' -Details @{
+                    Target = $target
+                    Mode = 'spotfix'
+                } -AcceptedExitCodes @(0, 1, 2) -ScriptBlock { & chkdsk $target /spotfix }
+                $chkdskResult.Output | Out-Host
             }
             else {
                 Write-Host "Running chkdsk /F /X on $target ..." -ForegroundColor Yellow
-                & chkdsk $target /F /X
+                $chkdskResult = Invoke-NativeCommandLogged -Description 'chkdsk /F /X' -Details @{
+                    Target = $target
+                    Mode = 'full'
+                } -AcceptedExitCodes @(0, 1, 2) -ScriptBlock { & chkdsk $target /F /X }
+                $chkdskResult.Output | Out-Host
             }
         }
 
@@ -3190,8 +3424,8 @@ finally {
                 switch ($ext) {
                     '.iso' {
                         Write-Host "Mounting ISO: $RepairSource" -ForegroundColor Cyan
-                        $mountResult = Mount-DiskImage -ImagePath (Resolve-Path $RepairSource).Path -PassThru
                         $mountedIso = (Resolve-Path $RepairSource).Path
+                        $mountResult = Mount-DiskImage -ImagePath $mountedIso -PassThru
                         $isoDrive = ($mountResult | Get-Volume).DriveLetter
                         $wimPath = "$($isoDrive):\sources\install.wim"
                         if (-not (Test-Path $wimPath)) {
@@ -3262,12 +3496,20 @@ finally {
             }
 
             Write-Host "Step 1/2: ScanHealth" -ForegroundColor Cyan
-            & dism /Image:$script:WinDriveLetter /Cleanup-Image /ScanHealth /ScratchDir:C:\Temp
+            $scanResult = Invoke-NativeCommandLogged -Description 'DISM ScanHealth' -Details @{
+                Image = $script:WinDriveLetter
+            } -ScriptBlock { & dism /Image:$script:WinDriveLetter /Cleanup-Image /ScanHealth /ScratchDir:C:\Temp }
+            $scanResult.Output | Out-Host
 
             Write-Host "Step 2/2: RestoreHealth" -ForegroundColor Cyan
             $restoreCmd = "dism /Image:$($script:WinDriveLetter) /Cleanup-Image /RestoreHealth $sourceArg /ScratchDir:C:\Temp"
             Write-Host "  [exec] $restoreCmd" -ForegroundColor DarkGray
-            & cmd.exe /c $restoreCmd
+            $restoreResult = Invoke-NativeCommandLogged -Description 'DISM RestoreHealth' -Details @{
+                Command = $restoreCmd
+                Image = $script:WinDriveLetter
+                RepairSource = $RepairSource
+            } -ScriptBlock { & cmd.exe /c $restoreCmd }
+            $restoreResult.Output | Out-Host
         }
         catch {
             Write-Error "RepairComponentStore failed: $_"
@@ -3289,7 +3531,14 @@ finally {
         try {
             $sfcCmd = "sfc /SCANNOW /OFFBOOTDIR=$script:WinDriveLetter /OFFWINDIR=$($script:WinDriveLetter)windows"
             Write-Host "  [exec] $sfcCmd" -ForegroundColor DarkGray
-            & sfc /SCANNOW /OFFBOOTDIR=$script:WinDriveLetter /OFFWINDIR=$($script:WinDriveLetter)windows
+            $sfcResult = Invoke-NativeCommandLogged -Description 'SFC offline scan and repair' -Details @{
+                Command = $sfcCmd
+                OffBootDir = $script:WinDriveLetter
+                OffWinDir = "$($script:WinDriveLetter)windows"
+            } -ScriptBlock {
+                & sfc /SCANNOW /OFFBOOTDIR=$script:WinDriveLetter /OFFWINDIR=$($script:WinDriveLetter)windows
+            }
+            $sfcResult.Output | Out-Host
         }
         catch {
             Write-Error "RunSFC failed: $_"
@@ -3405,7 +3654,13 @@ finally {
                     }
                     if ($rbcWinPart -and -not $rbcWinPart.IsActive) {
                         Write-Warning "Windows partition is not Active. Setting Active flag so BIOS can find the boot sector..."
-                        Set-Partition -DiskNumber $script:DiskNumber -PartitionNumber $rbcWinPart.PartitionNumber -IsActive $true
+                        Invoke-Logged -Description 'Set Windows partition Active for BIOS boot' -Details @{
+                            DiskNumber = $script:DiskNumber
+                            PartitionNumber = $rbcWinPart.PartitionNumber
+                            IsActive = $true
+                        } -ScriptBlock {
+                            Set-Partition -DiskNumber $script:DiskNumber -PartitionNumber $rbcWinPart.PartitionNumber -IsActive $true
+                        } | Out-Null
                     }
                 }
             }
@@ -3436,7 +3691,7 @@ The script will copy it to the guest before running bcdboot, then proceed with -
   Target : $bcdTemplatePath
 "@
                     if ($doCopy) {
-                        Copy-Item -LiteralPath $hostTemplate -Destination $bcdTemplatePath -Force
+                        Copy-Item-Logged -Path $hostTemplate -Destination $bcdTemplatePath -Force
                         Write-Host "  [OK] BCD-Template copied from host. Proceeding with BCD rebuild." -ForegroundColor Green
                     }
                     else {
@@ -3481,14 +3736,19 @@ The script will copy it to the guest before running bcdboot, then proceed with -
             $format = if ($script:VMGen -eq 1) { "BIOS" } else { "UEFI" }
             $rebuildCmd = "bcdboot $WinDrive\Windows /s $SysDrive /v /f $format"
             Write-Host "Rebuilding BCD (Gen$script:VMGen): $rebuildCmd"
-            & cmd.exe /c $rebuildCmd
-            if ($LASTEXITCODE -ne 0) {
+            $bcdbootResult = Invoke-NativeCommandLogged -Description 'bcdboot rebuild BCD' -Details @{
+                Command = $rebuildCmd
+                StorePath = $storePath
+                Generation = $script:VMGen
+            } -ScriptBlock { & cmd.exe /c $rebuildCmd }
+            $bcdbootResult.Output | Out-Host
+            if ($bcdbootResult.ExitCode -ne 0) {
                 # bcdboot failed - restore original BCD if we backed it up
                 if ($bakPath -and (Test-Path -LiteralPath $bakPath)) {
-                    Write-Warning "bcdboot failed (exit $LASTEXITCODE). Restoring original BCD from backup: $bakPath -> $storePath"
-                    Move-Item -LiteralPath $bakPath -Destination $storePath -Force
+                    Write-Warning "bcdboot failed (exit $($bcdbootResult.ExitCode)). Restoring original BCD from backup: $bakPath -> $storePath"
+                    Move-Item-Logged -LiteralPath $bakPath -Destination $storePath -Force
                 }
-                throw "bcdboot failed with exit code $LASTEXITCODE. BCD was not created. See BFSVC output above for details."
+                throw "bcdboot failed with exit code $($bcdbootResult.ExitCode). BCD was not created. See BFSVC output above for details."
             }
 
             # Verify rebuild
@@ -3546,7 +3806,13 @@ The script will copy it to the guest before running bcdboot, then proceed with -
                 }
                 if ($bootPartition -and -not $bootPartition.IsActive) {
                     Write-Host "Boot partition (Partition $($bootPartition.PartitionNumber)) is not marked Active - setting Active flag..." -ForegroundColor Yellow
-                    Set-Partition -DiskNumber $script:DiskNumber -PartitionNumber $bootPartition.PartitionNumber -IsActive $true
+                    Invoke-Logged -Description 'Set boot partition Active' -Details @{
+                        DiskNumber = $script:DiskNumber
+                        PartitionNumber = $bootPartition.PartitionNumber
+                        IsActive = $true
+                    } -ScriptBlock {
+                        Set-Partition -DiskNumber $script:DiskNumber -PartitionNumber $bootPartition.PartitionNumber -IsActive $true
+                    } | Out-Null
                     Write-ActionLog -Event 'SetBootPartitionActive' -Details @{
                         DiskNumber      = $script:DiskNumber
                         PartitionNumber = $bootPartition.PartitionNumber
@@ -3971,14 +4237,21 @@ The script will copy it to the guest before running bcdboot, then proceed with -
 
                     Write-Warning "  Access denied replacing $($spec.FileName). Taking ownership and granting Administrators Full Control, then retrying once."
                     $restoreProtectedAcl = $true
-                    & takeown.exe /F $targetPath /A | Out-Null
-                    if ($LASTEXITCODE -ne 0) {
-                        throw "takeown failed for $targetPath (exit code $LASTEXITCODE)."
+                    $takeownResult = Invoke-NativeCommandLogged -Description "Take ownership of $($spec.FileName)" -Details @{
+                        Path = $targetPath
+                        Owner = 'BUILTIN\Administrators'
+                    } -ScriptBlock { & takeown.exe /F $targetPath /A }
+                    if ($takeownResult.ExitCode -ne 0) {
+                        throw "takeown failed for $targetPath (exit code $($takeownResult.ExitCode))."
                     }
 
-                    & icacls.exe $targetPath /grant '*S-1-5-32-544:(F)' | Out-Null
-                    if ($LASTEXITCODE -ne 0) {
-                        throw "icacls failed to grant Administrators Full Control on $targetPath (exit code $LASTEXITCODE)."
+                    $icaclsResult = Invoke-NativeCommandLogged -Description "Grant Administrators FullControl on $($spec.FileName)" -Details @{
+                        Path = $targetPath
+                        Principal = 'S-1-5-32-544'
+                        Rights = 'FullControl'
+                    } -ScriptBlock { & icacls.exe $targetPath /grant '*S-1-5-32-544:(F)' }
+                    if ($icaclsResult.ExitCode -ne 0) {
+                        throw "icacls failed to grant Administrators Full Control on $targetPath (exit code $($icaclsResult.ExitCode))."
                     }
 
                     Invoke-Logged -Description "Retry replace $($spec.FileName) after access grant" -Details @{ Source = $best.Path; Destination = $targetPath; SourceType = $best.Source; ComponentVersion = $best.ComponentVersion } -ScriptBlock {
@@ -3990,7 +4263,11 @@ The script will copy it to the guest before running bcdboot, then proceed with -
                 if ($restoreProtectedAcl -and (Test-Path -LiteralPath $targetPath)) {
                     try {
                         $protectedAcl = New-ProtectedSystemFileAcl
-                        Set-Acl -LiteralPath $targetPath -AclObject $protectedAcl -ErrorAction Stop
+                        Invoke-Logged -Description "Restore protected ACL on $($spec.FileName)" -Details @{
+                            Path = $targetPath
+                        } -ScriptBlock {
+                            Set-Acl -LiteralPath $targetPath -AclObject $protectedAcl -ErrorAction Stop
+                        } | Out-Null
                         Write-Host "  [OK] Applied protected Windows system-file ACL/owner baseline." -ForegroundColor Green
                     }
                     catch {
@@ -4182,17 +4459,35 @@ dependencies on the Windows partition.
                 if (-not $confirmed) { return }
 
                 Write-Host "Creating $sizeMB MB EFI System Partition..." -ForegroundColor Cyan
-                $newPart = New-Partition -DiskNumber $script:DiskNumber -Size $useSize `
-                    -GptType '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}' -AssignDriveLetter
+                $newPart = Invoke-LoggedValue -Description 'Create EFI System Partition' -Details @{
+                    DiskNumber = $script:DiskNumber
+                    Size = $useSize
+                    GptType = '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
+                } -ScriptBlock {
+                    New-Partition -DiskNumber $script:DiskNumber -Size $useSize `
+                        -GptType '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}' -AssignDriveLetter
+                } | Select-Object -First 1
                 $newLetter = $newPart.DriveLetter
                 if (-not $newLetter -or $newLetter -eq "`0") {
-                    $newPart | Add-PartitionAccessPath -AssignDriveLetter -ErrorAction SilentlyContinue
+                    Invoke-Logged -Description 'Assign drive letter to EFI System Partition' -Details @{
+                        DiskNumber = $script:DiskNumber
+                        PartitionNumber = $newPart.PartitionNumber
+                    } -ScriptBlock {
+                        $newPart | Add-PartitionAccessPath -AssignDriveLetter -ErrorAction SilentlyContinue
+                    } | Out-Null
                     $newPart = Get-Partition -DiskNumber $script:DiskNumber -PartitionNumber $newPart.PartitionNumber
                     $newLetter = $newPart.DriveLetter
                 }
 
                 Write-Host "Formatting as FAT32 (label: SYSTEM)..." -ForegroundColor Cyan
-                Format-Volume -Partition $newPart -FileSystem FAT32 -NewFileSystemLabel "SYSTEM" -Confirm:$false | Out-Null
+                Invoke-Logged -Description 'Format EFI System Partition' -Details @{
+                    DiskNumber = $script:DiskNumber
+                    PartitionNumber = $newPart.PartitionNumber
+                    FileSystem = 'FAT32'
+                    Label = 'SYSTEM'
+                } -ScriptBlock {
+                    Format-Volume -Partition $newPart -FileSystem FAT32 -NewFileSystemLabel "SYSTEM" -Confirm:$false
+                } | Out-Null
 
                 $bootDrive = "$($newLetter):"
                 $WinDrive = $script:WinDriveLetter.TrimEnd('\')
@@ -4257,23 +4552,52 @@ dependencies on the Windows partition.
                 if (-not $confirmed) { return }
 
                 Write-Host "Creating $sizeMB MB System Reserved partition..." -ForegroundColor Cyan
-                $newPart = New-Partition -DiskNumber $script:DiskNumber -Size $useSize -AssignDriveLetter
+                $newPart = Invoke-LoggedValue -Description 'Create System Reserved partition' -Details @{
+                    DiskNumber = $script:DiskNumber
+                    Size = $useSize
+                } -ScriptBlock {
+                    New-Partition -DiskNumber $script:DiskNumber -Size $useSize -AssignDriveLetter
+                } | Select-Object -First 1
                 $newLetter = $newPart.DriveLetter
                 if (-not $newLetter -or $newLetter -eq "`0") {
-                    $newPart | Add-PartitionAccessPath -AssignDriveLetter -ErrorAction SilentlyContinue
+                    Invoke-Logged -Description 'Assign drive letter to System Reserved partition' -Details @{
+                        DiskNumber = $script:DiskNumber
+                        PartitionNumber = $newPart.PartitionNumber
+                    } -ScriptBlock {
+                        $newPart | Add-PartitionAccessPath -AssignDriveLetter -ErrorAction SilentlyContinue
+                    } | Out-Null
                     $newPart = Get-Partition -DiskNumber $script:DiskNumber -PartitionNumber $newPart.PartitionNumber
                     $newLetter = $newPart.DriveLetter
                 }
 
                 Write-Host "Formatting as NTFS (label: System Reserved)..." -ForegroundColor Cyan
-                Format-Volume -Partition $newPart -FileSystem NTFS -NewFileSystemLabel "System Reserved" -Confirm:$false | Out-Null
+                Invoke-Logged -Description 'Format System Reserved partition' -Details @{
+                    DiskNumber = $script:DiskNumber
+                    PartitionNumber = $newPart.PartitionNumber
+                    FileSystem = 'NTFS'
+                    Label = 'System Reserved'
+                } -ScriptBlock {
+                    Format-Volume -Partition $newPart -FileSystem NTFS -NewFileSystemLabel "System Reserved" -Confirm:$false
+                } | Out-Null
 
                 Write-Host "Setting Active flag on new partition (Partition $($newPart.PartitionNumber))..." -ForegroundColor Cyan
-                Set-Partition -DiskNumber $script:DiskNumber -PartitionNumber $newPart.PartitionNumber -IsActive $true
+                Invoke-Logged -Description 'Set System Reserved partition Active' -Details @{
+                    DiskNumber = $script:DiskNumber
+                    PartitionNumber = $newPart.PartitionNumber
+                    IsActive = $true
+                } -ScriptBlock {
+                    Set-Partition -DiskNumber $script:DiskNumber -PartitionNumber $newPart.PartitionNumber -IsActive $true
+                } | Out-Null
 
                 if ($winPartition -and $winPartition.IsActive) {
                     Write-Host "Clearing Active flag from Windows partition (Partition $($winPartition.PartitionNumber))..." -ForegroundColor Cyan
-                    Set-Partition -DiskNumber $script:DiskNumber -PartitionNumber $winPartition.PartitionNumber -IsActive $false
+                    Invoke-Logged -Description 'Clear Windows partition Active flag' -Details @{
+                        DiskNumber = $script:DiskNumber
+                        PartitionNumber = $winPartition.PartitionNumber
+                        IsActive = $false
+                    } -ScriptBlock {
+                        Set-Partition -DiskNumber $script:DiskNumber -PartitionNumber $winPartition.PartitionNumber -IsActive $false
+                    } | Out-Null
                 }
 
                 $bootDrive = "$($newLetter):"
@@ -4625,13 +4949,31 @@ del /F C:\Temp\adduser.cmd > NUL
         Write-Host "Resetting Windows RSA MachineKeys permissions..." -ForegroundColor Green
         $machineKeysPath = "$($script:WinDriveLetter)ProgramData\Microsoft\Crypto\RSA\MachineKeys"
         Write-Host "  [exec] takeown /f '$machineKeysPath' /a /r" -ForegroundColor DarkGray
-        & takeown /f $machineKeysPath /a /r | Out-Null
+        Invoke-NativeCommandLogged -Description 'Take ownership of RSA MachineKeys' -Details @{
+            Path = $machineKeysPath
+            Recursive = $true
+        } -ScriptBlock { & takeown /f $machineKeysPath /a /r } | Out-Null
         Write-Host "  [exec] icacls '$machineKeysPath' /t /c /grant 'NT AUTHORITY\SYSTEM:(F)'" -ForegroundColor DarkGray
-        & icacls $machineKeysPath /t /c /grant "NT AUTHORITY\SYSTEM:(F)" | Out-Null
+        Invoke-NativeCommandLogged -Description 'Grant SYSTEM FullControl on RSA MachineKeys' -Details @{
+            Path = $machineKeysPath
+            Principal = 'NT AUTHORITY\SYSTEM'
+            Rights = 'FullControl'
+            Recursive = $true
+        } -ScriptBlock { & icacls $machineKeysPath /t /c /grant "NT AUTHORITY\SYSTEM:(F)" } | Out-Null
         Write-Host "  [exec] icacls '$machineKeysPath' /t /c /grant 'NT AUTHORITY\NETWORK SERVICE:(R)'" -ForegroundColor DarkGray
-        & icacls $machineKeysPath /t /c /grant "NT AUTHORITY\NETWORK SERVICE:(R)" | Out-Null
+        Invoke-NativeCommandLogged -Description 'Grant NETWORK SERVICE Read on RSA MachineKeys' -Details @{
+            Path = $machineKeysPath
+            Principal = 'NT AUTHORITY\NETWORK SERVICE'
+            Rights = 'Read'
+            Recursive = $true
+        } -ScriptBlock { & icacls $machineKeysPath /t /c /grant "NT AUTHORITY\NETWORK SERVICE:(R)" } | Out-Null
         Write-Host "  [exec] icacls '$machineKeysPath' /t /c /grant 'BUILTIN\Administrators:(F)'" -ForegroundColor DarkGray
-        & icacls $machineKeysPath /t /c /grant "BUILTIN\Administrators:(F)" | Out-Null
+        Invoke-NativeCommandLogged -Description 'Grant Administrators FullControl on RSA MachineKeys' -Details @{
+            Path = $machineKeysPath
+            Principal = 'BUILTIN\Administrators'
+            Rights = 'FullControl'
+            Recursive = $true
+        } -ScriptBlock { & icacls $machineKeysPath /t /c /grant "BUILTIN\Administrators:(F)" } | Out-Null
 
         $PrivKeys = Get-ChildItem -Path "$($script:WinDriveLetter)ProgramData\Microsoft\Crypto\RSA\MachineKeys\f686aace6942fb7f7ceb231212eef4a4*"
 
@@ -4640,13 +4982,27 @@ del /F C:\Temp\adduser.cmd > NUL
         ForEach ($PrivKey in $PrivKeys) {
             $pkPath = $PrivKey.FullName
             Write-Host "  [exec] takeown /f '$pkPath'" -ForegroundColor DarkGray
-            & takeown.exe /f $pkPath | Out-Null
+            Invoke-NativeCommandLogged -Description 'Take ownership of RDP private key' -Details @{
+                Path = $pkPath
+            } -ScriptBlock { & takeown.exe /f $pkPath } | Out-Null
             Write-Host "  [exec] icacls '$pkPath' /c /grant 'NT AUTHORITY\SYSTEM:(F)'" -ForegroundColor DarkGray
-            & icacls.exe $pkPath /c /grant "NT AUTHORITY\SYSTEM:(F)" | Out-Null
+            Invoke-NativeCommandLogged -Description 'Grant SYSTEM FullControl on RDP private key' -Details @{
+                Path = $pkPath
+                Principal = 'NT AUTHORITY\SYSTEM'
+                Rights = 'FullControl'
+            } -ScriptBlock { & icacls.exe $pkPath /c /grant "NT AUTHORITY\SYSTEM:(F)" } | Out-Null
             Write-Host "  [exec] icacls '$pkPath' /c /grant 'NT AUTHORITY\NETWORK SERVICE:(R)'" -ForegroundColor DarkGray
-            & icacls.exe $pkPath /c /grant "NT AUTHORITY\NETWORK SERVICE:(R)" | Out-Null
+            Invoke-NativeCommandLogged -Description 'Grant NETWORK SERVICE Read on RDP private key' -Details @{
+                Path = $pkPath
+                Principal = 'NT AUTHORITY\NETWORK SERVICE'
+                Rights = 'Read'
+            } -ScriptBlock { & icacls.exe $pkPath /c /grant "NT AUTHORITY\NETWORK SERVICE:(R)" } | Out-Null
             Write-Host "  [exec] icacls '$pkPath' /c /grant 'NT Service\SessionEnv:(F)'" -ForegroundColor DarkGray
-            & icacls.exe $pkPath /c /grant "NT Service\SessionEnv:(F)" | Out-Null
+            Invoke-NativeCommandLogged -Description 'Grant SessionEnv FullControl on RDP private key' -Details @{
+                Path = $pkPath
+                Principal = 'NT Service\SessionEnv'
+                Rights = 'FullControl'
+            } -ScriptBlock { & icacls.exe $pkPath /c /grant "NT Service\SessionEnv:(F)" } | Out-Null
             Write-Host "  [exec] icacls '$pkPath' (display current ACL)" -ForegroundColor DarkGray
             & icacls.exe $pkPath
 
@@ -4816,18 +5172,28 @@ Runs DISM /StartComponentCleanup only if no pending servicing markers remain.
         $pendingUpdates | Set-Content -Path C:\Temp\PendingUpdatePackages.txt
 
         Write-Host "Running DISM /Cleanup-Image /RevertPendingActions (undo in-progress servicing)" -ForegroundColor Yellow
-        & dism /Image:$WinDriveLetter /Cleanup-Image /RevertPendingActions /ScratchDir:C:\Temp
+        $revertResult = Invoke-NativeCommandLogged -Description 'DISM RevertPendingActions' -Details @{
+            Image = $WinDriveLetter
+        } -ScriptBlock { & dism /Image:$WinDriveLetter /Cleanup-Image /RevertPendingActions /ScratchDir:C:\Temp }
+        $revertResult.Output | Out-Host
 
         $pendingUpdates | ForEach-Object {
             Write-Host "Running package uninstall: $($_)" -ForegroundColor Yellow
-            & dism /Image:$WinDriveLetter /Remove-Package /PackageName:$_
+            $packageName = $_
+            $removePackageResult = Invoke-NativeCommandLogged -Description 'DISM remove pending package' -Details @{
+                Image = $WinDriveLetter
+                PackageName = $packageName
+            } -ScriptBlock { & dism /Image:$WinDriveLetter /Remove-Package /PackageName:$packageName }
+            $removePackageResult.Output | Out-Host
         }
 
         Write-Host "Clearing transactions from TxR folder..." -ForegroundColor Yellow
         $TxRFolder = Join-Path $WinDriveLetter "Windows\system32\config\TxR"
         if (Test-Path $TxRFolder) {
             $BackupFolder = Join-Path $TxRFolder "Backup"
-            Get-ChildItem -Path $TxRFolder -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.Attributes = 'Normal' }
+            Invoke-Logged -Description 'Clear TxR file attributes' -Details @{ Path = $TxRFolder } -ScriptBlock {
+                Get-ChildItem -Path $TxRFolder -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.Attributes = 'Normal' }
+            } | Out-Null
             New-Item-Logged -Path $TxRFolder -Name "Backup" -ItemType Directory -Force
             Copy-Item-Logged -Path (Join-Path $TxRFolder '*') -Destination $BackupFolder -Force
             Invoke-Logged -Description 'Remove TxR blf/regtrans files' -Details @{ Path = $TxRFolder } -ScriptBlock {
@@ -4838,7 +5204,7 @@ Runs DISM /StartComponentCleanup only if no pending servicing markers remain.
             # Remove any leftover TxR_OLD from a previous run before renaming
             $TxROld = Join-Path $WinDriveLetter "Windows\system32\config\TxR_OLD"
             if (Test-Path $TxROld) {
-                Remove-Item -Path $TxROld -Recurse -Force -ErrorAction SilentlyContinue
+                Remove-Item-Logged -Path $TxROld -Recurse -Force
             }
             Rename-Item-Logged -Path $TxRFolder -NewName "TxR_OLD"
             New-Item-Logged -Path (Join-Path $WinDriveLetter "Windows\system32\config") -Name "TxR" -ItemType Directory -Force
@@ -4850,9 +5216,11 @@ Runs DISM /StartComponentCleanup only if no pending servicing markers remain.
         Write-Host "Clearing transactions from Config folder..." -ForegroundColor Yellow
         $ConfigFolder = Join-Path $WinDriveLetter "Windows\system32\config"
         $BackupFolder = Join-Path $ConfigFolder "BackupCfg"
-        Get-ChildItem -Path $ConfigFolder -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'BackupCfg' } | ForEach-Object { try { $_.Attributes = 'Normal' } catch {} }
+        Invoke-Logged -Description 'Clear Config file attributes' -Details @{ Path = $ConfigFolder } -ScriptBlock {
+            Get-ChildItem -Path $ConfigFolder -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'BackupCfg' } | ForEach-Object { try { $_.Attributes = 'Normal' } catch {} }
+        } | Out-Null
         if (Test-Path $BackupFolder) {
-            Remove-Item -Path $BackupFolder -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item-Logged -Path $BackupFolder -Recurse -Force
         }
         New-Item-Logged -Path $ConfigFolder -Name "BackupCfg" -ItemType Directory -Force
         Copy-Item-Logged -Path (Join-Path $ConfigFolder '*') -Destination $BackupFolder -Force
@@ -4865,9 +5233,11 @@ Runs DISM /StartComponentCleanup only if no pending servicing markers remain.
         $SMIFolder = Join-Path $WinDriveLetter "Windows\System32\SMI\Store\Machine"
         if (Test-Path $SMIFolder) {
             $BackupFolder = Join-Path $SMIFolder "Backup"
-            Get-ChildItem -Path $SMIFolder -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'Backup' } | ForEach-Object { try { $_.Attributes = 'Normal' } catch {} }
+            Invoke-Logged -Description 'Clear SMI file attributes' -Details @{ Path = $SMIFolder } -ScriptBlock {
+                Get-ChildItem -Path $SMIFolder -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'Backup' } | ForEach-Object { try { $_.Attributes = 'Normal' } catch {} }
+            } | Out-Null
             if (Test-Path $BackupFolder) {
-                Remove-Item -Path $BackupFolder -Recurse -Force -ErrorAction SilentlyContinue
+                Remove-Item-Logged -Path $BackupFolder -Recurse -Force
             }
             New-Item-Logged -Path $SMIFolder -Name "Backup" -ItemType Directory -Force
             Copy-Item-Logged -Path (Join-Path $SMIFolder '*') -Destination $BackupFolder -Force
@@ -4886,7 +5256,7 @@ Runs DISM /StartComponentCleanup only if no pending servicing markers remain.
             # Remove stale pending.old from a previous run
             $pendingOld = Join-Path $WinDriveLetter "Windows\WinSxS\pending.old"
             if (Test-Path $pendingOld) {
-                Remove-Item -Path $pendingOld -Force -ErrorAction SilentlyContinue
+                Remove-Item-Logged -Path $pendingOld -Force
             }
             Rename-Item-Logged -Path $pendingXmlPath -NewName "pending.old"
         }
@@ -4940,9 +5310,12 @@ Runs DISM /StartComponentCleanup only if no pending servicing markers remain.
         }
         else {
             Write-Host "Running DISM /Cleanup-Image /StartComponentCleanup (best-effort reclaim of superseded components)" -ForegroundColor Yellow
-            & dism /Image:$WinDriveLetter /Cleanup-Image /StartComponentCleanup /ScratchDir:C:\Temp
-            if ($LASTEXITCODE -ne 0) {
-                Write-Warning "DISM /StartComponentCleanup exited with code $LASTEXITCODE. Pending-update cleanup steps already completed; component cleanup is best-effort and can be retried later."
+            $cleanupResult = Invoke-NativeCommandLogged -Description 'DISM StartComponentCleanup' -Details @{
+                Image = $WinDriveLetter
+            } -ScriptBlock { & dism /Image:$WinDriveLetter /Cleanup-Image /StartComponentCleanup /ScratchDir:C:\Temp }
+            $cleanupResult.Output | Out-Host
+            if ($cleanupResult.ExitCode -ne 0) {
+                Write-Warning "DISM /StartComponentCleanup exited with code $($cleanupResult.ExitCode). Pending-update cleanup steps already completed; component cleanup is best-effort and can be retried later."
             }
         }
 
@@ -5415,7 +5788,11 @@ Restart-Service -Name WinRM -Force
 
         try {
             if (-not (Test-Path -LiteralPath $stagedDir)) {
-                $null = New-Item -ItemType Directory -Path $stagedDir -Force -ErrorAction Stop
+                Invoke-Logged -Description 'Create WinRE staging directory' -Details @{
+                    Path = $stagedDir
+                } -ScriptBlock {
+                    $null = New-Item -ItemType Directory -Path $stagedDir -Force -ErrorAction Stop
+                } | Out-Null
             }
 
             $needsCopy = $true
@@ -5434,10 +5811,20 @@ Restart-Service -Name WinRM -Force
             if ($needsCopy) {
                 # Clear hidden/system/readonly so Copy-Item can overwrite.
                 if (Test-Path -LiteralPath $stagedWim) {
-                    & cmd.exe /c "attrib -s -h -r `"$stagedWim`"" 2>&1 | Out-Null
+                    Invoke-NativeCommandLogged -Description 'Clear staged WinRE image attributes' -Details @{
+                        Path = $stagedWim
+                    } -ScriptBlock { & cmd.exe /c "attrib -s -h -r `"$stagedWim`"" } | Out-Null
                 }
-                Copy-Item -LiteralPath $SourceWinrePath -Destination $stagedWim -Force -ErrorAction Stop
-                & cmd.exe /c "attrib +s +h +r `"$stagedWim`"" 2>&1 | Out-Null
+                Invoke-Logged -Description 'Stage WinRE image' -Details @{
+                    Source = $SourceWinrePath
+                    Destination = $stagedWim
+                } -ScriptBlock {
+                    Copy-Item -LiteralPath $SourceWinrePath -Destination $stagedWim -Force -ErrorAction Stop
+                } | Out-Null
+                Invoke-NativeCommandLogged -Description 'Protect staged WinRE image attributes' -Details @{
+                    Path = $stagedWim
+                    Attributes = @('System', 'Hidden', 'ReadOnly')
+                } -ScriptBlock { & cmd.exe /c "attrib +s +h +r `"$stagedWim`"" } | Out-Null
                 Write-Host "Stage-WinReImage: copied Winre.wim -> $stagedWim" -ForegroundColor DarkCyan
             }
             else {
@@ -5480,9 +5867,12 @@ Restart-Service -Name WinRM -Force
         # Best-effort filesystem check. Tolerate non-zero exit if the volume root is still readable.
         try {
             Write-Host "Repair-RecoveryPartition: running chkdsk $driveLetter /F /X (best-effort)..." -ForegroundColor DarkCyan
-            $chkOut = & cmd.exe /c "echo Y| chkdsk $driveLetter /F /X" 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                Write-Warning "chkdsk $driveLetter returned $LASTEXITCODE; will continue if volume is still readable."
+            $chkResult = Invoke-NativeCommandLogged -Description 'Repair recovery partition filesystem' -Details @{
+                Drive = $driveLetter
+                Mode = 'F/X'
+            } -AcceptedExitCodes @(0, 1, 2) -ScriptBlock { & cmd.exe /c "echo Y| chkdsk $driveLetter /F /X" }
+            if (-not $chkResult.Success) {
+                Write-Warning "chkdsk $driveLetter returned $($chkResult.ExitCode); will continue if volume is still readable."
             }
             if (-not (Test-Path -LiteralPath $AccessPath)) {
                 Write-Warning "Repair-RecoveryPartition: $AccessPath not accessible after chkdsk; aborting."
@@ -5495,22 +5885,46 @@ Restart-Service -Name WinRM -Force
 
         try {
             if (-not (Test-Path -LiteralPath $targetDir)) {
-                $null = New-Item -ItemType Directory -Path $targetDir -Force -ErrorAction Stop
+                Invoke-Logged -Description 'Create recovery WindowsRE directory' -Details @{
+                    Path = $targetDir
+                } -ScriptBlock {
+                    $null = New-Item -ItemType Directory -Path $targetDir -Force -ErrorAction Stop
+                } | Out-Null
             }
 
             if (Test-Path -LiteralPath $targetWim) {
-                & cmd.exe /c "attrib -s -h -r `"$targetWim`"" 2>&1 | Out-Null
+                Invoke-NativeCommandLogged -Description 'Clear recovery WinRE image attributes' -Details @{
+                    Path = $targetWim
+                } -ScriptBlock { & cmd.exe /c "attrib -s -h -r `"$targetWim`"" } | Out-Null
             }
-            Copy-Item -LiteralPath $SourceWinrePath -Destination $targetWim -Force -ErrorAction Stop
-            & cmd.exe /c "attrib +s +h +r `"$targetWim`"" 2>&1 | Out-Null
+            Invoke-Logged -Description 'Restore recovery WinRE image' -Details @{
+                Source = $SourceWinrePath
+                Destination = $targetWim
+            } -ScriptBlock {
+                Copy-Item -LiteralPath $SourceWinrePath -Destination $targetWim -Force -ErrorAction Stop
+            } | Out-Null
+            Invoke-NativeCommandLogged -Description 'Protect recovery WinRE image attributes' -Details @{
+                Path = $targetWim
+                Attributes = @('System', 'Hidden', 'ReadOnly')
+            } -ScriptBlock { & cmd.exe /c "attrib +s +h +r `"$targetWim`"" } | Out-Null
 
             $sourceXml = Join-Path $WindowsPath 'System32\Recovery\ReAgent.xml'
             if (Test-Path -LiteralPath $sourceXml) {
                 if (Test-Path -LiteralPath $targetXml) {
-                    & cmd.exe /c "attrib -s -h -r `"$targetXml`"" 2>&1 | Out-Null
+                    Invoke-NativeCommandLogged -Description 'Clear recovery ReAgent.xml attributes' -Details @{
+                        Path = $targetXml
+                    } -ScriptBlock { & cmd.exe /c "attrib -s -h -r `"$targetXml`"" } | Out-Null
                 }
-                Copy-Item -LiteralPath $sourceXml -Destination $targetXml -Force -ErrorAction Stop
-                & cmd.exe /c "attrib +s +h +r `"$targetXml`"" 2>&1 | Out-Null
+                Invoke-Logged -Description 'Restore recovery ReAgent.xml' -Details @{
+                    Source = $sourceXml
+                    Destination = $targetXml
+                } -ScriptBlock {
+                    Copy-Item -LiteralPath $sourceXml -Destination $targetXml -Force -ErrorAction Stop
+                } | Out-Null
+                Invoke-NativeCommandLogged -Description 'Protect recovery ReAgent.xml attributes' -Details @{
+                    Path = $targetXml
+                    Attributes = @('System', 'Hidden', 'ReadOnly')
+                } -ScriptBlock { & cmd.exe /c "attrib +s +h +r `"$targetXml`"" } | Out-Null
             }
             elseif (-not (Test-Path -LiteralPath $targetXml)) {
                 # Minimal default ReAgent.xml so reagentc has something to update.
@@ -5536,8 +5950,15 @@ Restart-Service -Name WinRM -Force
   <ScheduledOperation state="4"/>
 </WindowsRE>
 '@
-                Set-Content -LiteralPath $targetXml -Value $minXml -Encoding ASCII -Force
-                & cmd.exe /c "attrib +s +h +r `"$targetXml`"" 2>&1 | Out-Null
+                Invoke-Logged -Description 'Create recovery ReAgent.xml' -Details @{
+                    Path = $targetXml
+                } -ScriptBlock {
+                    Set-Content -LiteralPath $targetXml -Value $minXml -Encoding ASCII -Force
+                } | Out-Null
+                Invoke-NativeCommandLogged -Description 'Protect recovery ReAgent.xml attributes' -Details @{
+                    Path = $targetXml
+                    Attributes = @('System', 'Hidden', 'ReadOnly')
+                } -ScriptBlock { & cmd.exe /c "attrib +s +h +r `"$targetXml`"" } | Out-Null
             }
 
             Write-Host "Repair-RecoveryPartition: restored Winre.wim -> $targetWim" -ForegroundColor Green
@@ -5608,16 +6029,22 @@ Restart-Service -Name WinRM -Force
 
             $windowsPath = $winre.WindowsPath
             Write-Host "reagentc /setreimage /path $stagedDir /target $windowsPath" -ForegroundColor DarkCyan
-            $setRaw = & reagentc.exe /setreimage /path $stagedDir /target $windowsPath 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                Write-Warning "reagentc /setreimage failed (exit $LASTEXITCODE):`n$($setRaw -join "`n")"
+            $setResult = Invoke-NativeCommandLogged -Description 'Register offline WinRE image path' -Details @{
+                Path = $stagedDir
+                Target = $windowsPath
+            } -ScriptBlock { & reagentc.exe /setreimage /path $stagedDir /target $windowsPath }
+            if ($setResult.ExitCode -ne 0) {
+                Write-Warning "reagentc /setreimage failed (exit $($setResult.ExitCode)):`n$($setResult.Output -join "`n")"
                 return $false
             }
 
             Write-Host "reagentc /enable /osguid $($winre.PreferredOsGuid)" -ForegroundColor DarkCyan
-            $enableRaw = & reagentc.exe /enable /osguid $winre.PreferredOsGuid 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                Write-Warning "reagentc /enable /osguid failed (exit $LASTEXITCODE):`n$($enableRaw -join "`n")"
+            $enableResult = Invoke-NativeCommandLogged -Description 'Enable offline WinRE' -Details @{
+                OsGuid = $winre.PreferredOsGuid
+                Target = $windowsPath
+            } -ScriptBlock { & reagentc.exe /enable /osguid $winre.PreferredOsGuid }
+            if ($enableResult.ExitCode -ne 0) {
+                Write-Warning "reagentc /enable /osguid failed (exit $($enableResult.ExitCode)):`n$($enableResult.Output -join "`n")"
                 return $false
             }
 
@@ -6158,7 +6585,13 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
             # Remove any pre-existing entry with this GUID to ensure a clean state
             $deleteBcdCmd = "bcdedit /store `"$storePath`" /delete $cgGuid /cleanup"
             Write-Host "  [exec] $deleteBcdCmd" -ForegroundColor DarkGray
-            & cmd.exe /c $deleteBcdCmd 2>&1 | Out-Null
+            $deleteResult = Invoke-NativeCommandLogged -Description 'Remove existing Credential Guard BCD entry' -Details @{
+                StorePath = $storePath
+                Identifier = $cgGuid
+            } -ScriptBlock { & cmd.exe /c $deleteBcdCmd }
+            if ($deleteResult.ExitCode -ne 0) {
+                Write-Host "  Existing Credential Guard BCD entry was not present or could not be removed; continuing with recreation." -ForegroundColor DarkGray
+            }
 
             # Create the one-time boot sequence entry
             $bcdCmds = @(
@@ -6796,9 +7229,13 @@ complete recovery.
                 $dstReg = "HKLM\BROKENSYSTEM\$csName\Services\$svc"
 
                 Write-Host "  Copying registry: $svc -> offline $csName..." -ForegroundColor Cyan
-                $out = reg.exe copy $srcReg $dstReg /s /f 2>&1
-                if ($LASTEXITCODE -ne 0) {
-                    throw "reg.exe copy failed for '$svc': $out"
+                $copyResult = Invoke-NativeCommandLogged -Description 'Copy Azure VM Agent service registry key' -Details @{
+                    Service = $svc
+                    Source = $srcReg
+                    Destination = $dstReg
+                } -ScriptBlock { & reg.exe copy $srcReg $dstReg /s /f }
+                if ($copyResult.ExitCode -ne 0) {
+                    throw "reg.exe copy failed for '$svc': $($copyResult.Output -join "`n")"
                 }
 
                 # Ensure Start = 2 (Automatic) - the copied key may have a different value
@@ -8939,7 +9376,7 @@ complete recovery.
                         }
                     }
                     elseif ($loopbackState.RenamedValueExists) {
-                        & $emit 'Firewall' 'OK' 'mpssvc DebugedLoopbackApps is already renamed to DebugedLoopbackApps_ (0x45b mitigation present)'
+                        & $emit 'Firewall' 'CRIT' 'mpssvc DebugedLoopbackApps_ archive exists but the required empty DebugedLoopbackApps value is missing; mpssvc may fail to start' '-FixFirewallDebugLoopbackApps'
                     }
                     else {
                         & $emit 'Firewall' 'OK' 'mpssvc DebugedLoopbackApps value not present'
@@ -10359,11 +10796,23 @@ Domain-joined VMs will re-download GPOs on next gpupdate cycle.
                 # Backup the original hive on the guest disk
                 $bakPath = New-UniqueBackupPath -BasePath $originalHive -BakSuffix '.chkreg.bak'
                 Write-Host "  Backing up original: $originalHive -> $bakPath" -ForegroundColor DarkGray
-                Copy-Item -LiteralPath $originalHive -Destination $bakPath -Force
+                Invoke-Logged -Description 'Back up registry hive before repair' -Details @{
+                    Hive = $hiveName
+                    Source = $originalHive
+                    Destination = $bakPath
+                } -ScriptBlock {
+                    Copy-Item -LiteralPath $originalHive -Destination $bakPath -Force -ErrorAction Stop
+                } | Out-Null
 
                 # Copy repaired hive back
                 Write-Host "  Copying repaired hive back: $repairedSource -> $originalHive" -ForegroundColor Green
-                Copy-Item -LiteralPath $repairedSource -Destination $originalHive -Force
+                Invoke-Logged -Description 'Replace registry hive with repaired copy' -Details @{
+                    Hive = $hiveName
+                    Source = $repairedSource
+                    Destination = $originalHive
+                } -ScriptBlock {
+                    Copy-Item -LiteralPath $repairedSource -Destination $originalHive -Force -ErrorAction Stop
+                } | Out-Null
 
                 Write-ActionLog -Event 'RegistryHiveRepaired' -Details @{
                     Hive           = $hiveName
@@ -11195,7 +11644,12 @@ instead of preserving ACLs that may have been modified during troubleshooting.
                 $bakPath = New-UniqueBackupPath -BasePath $targetPath -BakSuffix $backupSuffix
                 Write-Host "  Backing up existing file: $targetPath -> $bakPath" -ForegroundColor DarkGray
                 try {
-                    Rename-Item -LiteralPath $targetPath -NewName (Split-Path $bakPath -Leaf) -Force -ErrorAction Stop
+                    Invoke-Logged -Description 'Back up broken system file' -Details @{
+                        Path = $targetPath
+                        Destination = $bakPath
+                    } -ScriptBlock {
+                        Rename-Item -LiteralPath $targetPath -NewName (Split-Path $bakPath -Leaf) -Force -ErrorAction Stop
+                    } | Out-Null
                 }
                 catch {
                     Write-Warning "  Could not rename broken file: $_"
@@ -11205,15 +11659,25 @@ instead of preserving ACLs that may have been modified during troubleshooting.
 
             # Ensure target directory exists
             if (-not (Test-Path $targetDir)) {
-                New-Item -Path $targetDir -ItemType Directory -Force | Out-Null
+                New-Item-Logged -Path $targetDir -ItemType Directory -Force | Out-Null
             }
 
             # -- 5. Copy the replacement -----------------------------------------
             try {
-                Copy-Item -LiteralPath $best.Path -Destination $targetPath -Force -ErrorAction Stop
+                Invoke-Logged -Description 'Replace broken system file' -Details @{
+                    Source = $best.Path
+                    Destination = $targetPath
+                } -ScriptBlock {
+                    Copy-Item -LiteralPath $best.Path -Destination $targetPath -Force -ErrorAction Stop
+                } | Out-Null
                 try {
                     $protectedAcl = New-ProtectedSystemFileAcl
-                    Set-Acl -LiteralPath $targetPath -AclObject $protectedAcl -ErrorAction Stop
+                    Invoke-Logged -Description 'Apply protected system-file ACL' -Details @{
+                        Path = $targetPath
+                        Owner = 'NT SERVICE\TrustedInstaller'
+                    } -ScriptBlock {
+                        Set-Acl -LiteralPath $targetPath -AclObject $protectedAcl -ErrorAction Stop
+                    } | Out-Null
                     Write-Host "  [OK] Applied protected Windows system-file ACL/owner baseline." -ForegroundColor Green
                     Write-ActionLog -Event 'SystemFileAclRestored' -Details @{
                         FileName   = $fileName
@@ -14311,7 +14775,7 @@ PARAMETERS:
   -DisableBFE            Disable Base Filtering Engine service
   -DisableFirewall       Disable Windows Firewall for all profiles (Domain/Private/Public)
   -EnableBFE             Re-enable Base Filtering Engine service
-  -FixFirewallDebugLoopbackApps  Rename mpssvc DebugedLoopbackApps to DebugedLoopbackApps_
+  -FixFirewallDebugLoopbackApps  Archive mpssvc DebugedLoopbackApps and recreate an empty value
                                   when duplicate SIDs risk the Firewall error 0x45b start/stop loop;
                                   if denied, takes ownership and grants SYSTEM/Administrators FullControl
   -FixNetBindings        Remove orphaned third-party network binding components (missing binary; prevents NDIS init failure)
@@ -14442,8 +14906,9 @@ AVAILABLE DISKS:
         # the first time the SYSTEM hive is loaded for any action.
         $script:GuestComputerName = ''
 
-        # Log session start after disk is resolved so disk info appears in every entry
-        Start-ActionLog "Repair-OfflineDisk start"
+        # Infrastructure setup is intentionally not action-logged. Start the repair
+        # session after the target disk is ready so only guest mutations are recorded.
+        Start-ActionLog -HeaderMessage 'Repair-OfflineDisk start' -ParameterValues $PSBoundParameters
 
         try {
             if ($FixFileSystem) { FixDiskCorruption -DriveLetter $DriveLetter }
