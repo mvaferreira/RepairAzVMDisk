@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.5.9
+        Version: 0.5.10
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -8913,12 +8913,14 @@ complete recovery.
                     }
                     if ($loopbackState.ActiveValueExists) {
                         $loopbackSeverity = Get-FirewallDebugLoopbackAppsEntrySeverity -EntryCount $loopbackState.EntryCount
-                        $duplicatePreview = @($loopbackState.DuplicateSids | Select-Object -First 5)
-                        $previewText = if ($duplicatePreview.Count -gt 0) {
-                            $suffix = if ($loopbackState.DuplicateSidCount -gt $duplicatePreview.Count) { ', ...' } else { '' }
-                            "; duplicate examples: $($duplicatePreview -join ', ')$suffix"
+                        $previewText = ''
+                        if ($loopbackSeverity -eq 'CRIT') {
+                            $duplicatePreview = @($loopbackState.DuplicateSids | Select-Object -First 5)
+                            if ($duplicatePreview.Count -gt 0) {
+                                $suffix = if ($loopbackState.DuplicateSidCount -gt $duplicatePreview.Count) { ', ...' } else { '' }
+                                $previewText = "; duplicate examples: $($duplicatePreview -join ', ')$suffix"
+                            }
                         }
-                        else { '' }
                         $duplicateText = if ($loopbackState.DuplicateSidCount -gt 0) {
                             " with $($loopbackState.DuplicateSidCount) duplicated SID(s) and $($loopbackState.DuplicateEntryCount) extra duplicate occurrence(s)$previewText"
                         }
