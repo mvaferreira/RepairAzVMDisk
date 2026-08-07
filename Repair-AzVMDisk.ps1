@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.5.11
+        Version: 0.5.12
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -58,9 +58,9 @@
         Use this to mitigate the Windows Defender Firewall start/stop loop and error 0x45b
         detected by -SysCheck when duplicate loopback-app SIDs accumulate. The protected
         value is inspected and renamed through the script's existing SYSTEM scheduled-task
-        helper. If access is denied, SYSTEM takes ownership of AppCs and grants FullControl
-        to SYSTEM and BUILTIN\Administrators before retrying. The original AppCs owner and
-        DACL are restored afterward, and each mutation is written to the action log.
+        helper. Before changing the value, the exact AppCs owner and DACL are captured,
+        SYSTEM temporarily obtains FullControl, and the captured owner and DACL are restored
+        and verified afterward. Each mutation is written to the action log.
 
     .EXAMPLE
         # Run a full diagnostic check on disk 3
@@ -2351,6 +2351,20 @@ public static class RepairAzVmDiskProtectedRegistry
         }
     }
 
+    public static string GetOwnerAndDaclSddl(byte[] descriptor)
+    {
+        if (descriptor == null || descriptor.Length == 0)
+        {
+            throw new ArgumentException("The registry security descriptor is empty.", "descriptor");
+        }
+
+        RawSecurityDescriptor securityDescriptor =
+            new RawSecurityDescriptor(descriptor, 0);
+        return securityDescriptor.GetSddlForm(
+            AccessControlSections.Access |
+            AccessControlSections.Owner);
+    }
+
     public static void RestoreSecurityDescriptor(
         string rootName,
         string subKey,
@@ -2587,6 +2601,23 @@ try {
         if (-not `$beforeState.PathExists) {
             throw "Windows Firewall AppCs key not found: `$path"
         }
+        if ((`$beforeState.ActiveValueExists -or `$beforeState.RenamedValueExists) -and
+            -not `$result.PermissionsAdjusted) {
+            # Reading the value does not prove that SYSTEM can rename it. Capture the
+            # exact security descriptor before temporarily granting write access.
+            `$registryAccessSource = [Text.Encoding]::UTF8.GetString(
+                [Convert]::FromBase64String('$registryAccessSourceBase64'))
+            Add-Type -TypeDefinition `$registryAccessSource -ErrorAction Stop
+            `$originalSecurityDescriptor = [RepairAzVmDiskProtectedRegistry]::CaptureSecurityDescriptor(
+                '$registryRootName',
+                '$escapedNativeSubKey')
+            [RepairAzVmDiskProtectedRegistry]::TakeOwnershipAndGrantAccess(
+                '$registryRootName',
+                '$escapedNativeSubKey')
+            `$result.PermissionsAdjusted = `$true
+            `$beforeState = Get-FirewallDebugLoopbackAppsState -AppCsPath `$path
+            `$result.BeforeState = `$beforeState
+        }
         if (-not `$beforeState.ActiveValueExists) {
             if (`$beforeState.RenamedValueExists) {
                 `$registryKey = Get-Item -LiteralPath `$path -ErrorAction Stop
@@ -2753,6 +2784,19 @@ finally {
                 '$registryRootName',
                 '$escapedNativeSubKey',
                 `$originalSecurityDescriptor)
+            `$restoredSecurityDescriptor = [RepairAzVmDiskProtectedRegistry]::CaptureSecurityDescriptor(
+                '$registryRootName',
+                '$escapedNativeSubKey')
+            `$expectedSddl = [RepairAzVmDiskProtectedRegistry]::GetOwnerAndDaclSddl(
+                `$originalSecurityDescriptor)
+            `$restoredSddl = [RepairAzVmDiskProtectedRegistry]::GetOwnerAndDaclSddl(
+                `$restoredSecurityDescriptor)
+            if (-not [string]::Equals(
+                `$expectedSddl,
+                `$restoredSddl,
+                [StringComparison]::Ordinal)) {
+                throw 'The restored AppCs owner and DACL do not match the captured security descriptor.'
+            }
             `$result.PermissionsRestored = `$true
         }
         catch {
@@ -2802,7 +2846,7 @@ finally {
         if ($shouldLogAction) {
             $mutations = [System.Collections.Generic.List[string]]::new()
             if ($result -and $result.PermissionsAdjusted) {
-                $mutations.Add('Temporarily took AppCs ownership and granted SYSTEM/Administrators FullControl')
+                $mutations.Add('Captured the AppCs owner/DACL and temporarily granted SYSTEM/Administrators FullControl')
             }
             if ($result -and $result.ReplacedExistingRenamed) {
                 $mutations.Add('Removed the previous DebugedLoopbackApps_ value')
@@ -2814,7 +2858,7 @@ finally {
                 $mutations.Add('Created an empty DebugedLoopbackApps value with the preserved registry type')
             }
             if ($result -and $result.PermissionsRestored) {
-                $mutations.Add('Restored the original AppCs owner and DACL')
+                $mutations.Add('Restored and verified the captured AppCs owner and DACL')
             }
             $actionLogDetails = @{
                 Description = "Windows Firewall AppCs $Operation as SYSTEM"
@@ -11185,7 +11229,7 @@ to .disabled extension. Does NOT remove them; they can be re-enabled by renaming
                 $renamedValueName = 'DebugedLoopbackApps_'
                 $state = Invoke-FirewallDebugLoopbackAppsAsSystem -AppCsPath $appCsPath -Operation Inspect
                 if ($state.PermissionsAdjusted) {
-                    Write-Host "  [OK] Temporarily took ownership of AppCs and restored its original owner and DACL after inspection." -ForegroundColor Green
+                    Write-Host "  [OK] Temporarily adjusted AppCs access and restored its captured owner and DACL after inspection." -ForegroundColor Green
                 }
 
                 if (-not $state.PathExists) {
@@ -11251,7 +11295,7 @@ Default and LastKnownGood control sets are not modified.
                 }
 
                 if ($afterState.PermissionsAdjusted) {
-                    Write-Host "  [OK] Temporarily took ownership of AppCs and restored its original owner and DACL after the rename." -ForegroundColor Green
+                    Write-Host "  [OK] Restored and verified the captured AppCs owner and DACL after the rename." -ForegroundColor Green
                 }
                 if ($afterState.RenamePerformed) {
                     $replacementText = if ($afterState.ReplacedExistingRenamed) { ' after replacing the previous renamed value' } else { '' }
@@ -14777,7 +14821,7 @@ PARAMETERS:
   -EnableBFE             Re-enable Base Filtering Engine service
   -FixFirewallDebugLoopbackApps  Archive mpssvc DebugedLoopbackApps and recreate an empty value
                                   when duplicate SIDs risk the Firewall error 0x45b start/stop loop;
-                                  if denied, takes ownership and grants SYSTEM/Administrators FullControl
+                                  captures/restores the existing AppCs owner/DACL around the repair
   -FixNetBindings        Remove orphaned third-party network binding components (missing binary; prevents NDIS init failure)
   -ResetNetworkStack     Reset TCP/IP stack, Winsock, firewall and DNS at next boot (also clears static DNS offline)
   -ResetInterfacesToDHCP Reset interface IPv4 settings to DHCP and clear static DNS/gateway values
