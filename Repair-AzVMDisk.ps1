@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.5.12
+        Version: 0.6.0
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -121,7 +121,6 @@ param (
     [Parameter(ParameterSetName = 'Repair')][switch]$FixFileSystem,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixBoot,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixSecureBootCodeIntegrity,
-    [Parameter(ParameterSetName = 'Repair')][string]$CodeIntegrityPolicySourcePath = '',
     [Parameter(ParameterSetName = 'Repair')][switch]$Force,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixBootSector,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixBootStorageDrivers,
@@ -231,9 +230,80 @@ dynamicparam {
         $dict.Add($Name, $p)
     }
 
+    # Reset conditional completion visibility because command metadata can be reused
+    # across consecutive TabExpansion2 calls in the same PowerShell session.
+    $commandParameters = $MyInvocation.MyCommand.Parameters
+    $commonParameterNames = @(
+        'Verbose', 'Debug', 'ErrorAction', 'WarningAction', 'InformationAction',
+        'ProgressAction', 'ErrorVariable', 'WarningVariable', 'InformationVariable',
+        'OutVariable', 'OutBuffer', 'PipelineVariable', 'WhatIf', 'Confirm'
+    )
+    $setParameterHidden = {
+        param([string[]]$Names, [bool]$Hidden)
+        foreach ($name in $Names) {
+            if (-not $commandParameters.ContainsKey($name)) { continue }
+            foreach ($attribute in $commandParameters[$name].Attributes) {
+                if ($attribute -is [System.Management.Automation.ParameterAttribute]) {
+                    $attribute.DontShow = $Hidden
+                }
+            }
+        }
+    }
+    & $setParameterHidden -Names @($commandParameters.Keys) -Hidden $false
+
+    # A parent with sub-parameters narrows the next completion to those children.
+    # Other repair parameters remain valid when typed explicitly, preserving batch use.
+    $subParameterParents = @(
+        'FixFileSystem',
+        'FixSecureBootCodeIntegrity',
+        'RepairComponentStore',
+        'GetServicesReport',
+        'EnableDriverOrService',
+        'FixDeviceFilters',
+        'AnalyzeRecentChanges',
+        'ShowLastSession'
+    )
+    $hasSubParameterParent = @(
+        $subParameterParents | Where-Object { $PSBoundParameters.ContainsKey($_) }
+    ).Count -gt 0
+    $mutuallyExclusiveParameterPairs = @(
+        [pscustomobject]@{ Left = 'VMName';                   Right = 'DiskNumber' }
+        [pscustomobject]@{ Left = 'DisableStartupRepair';    Right = 'EnableStartupRepair' }
+        [pscustomobject]@{ Left = 'DisableBFE';              Right = 'EnableBFE' }
+        [pscustomobject]@{ Left = 'DisableNLA';              Right = 'EnableNLA' }
+        [pscustomobject]@{ Left = 'DisableThirdPartyDrivers'; Right = 'EnableThirdPartyDrivers' }
+        [pscustomobject]@{ Left = 'DisableCredentialGuard';  Right = 'EnableCredentialGuard' }
+        [pscustomobject]@{ Left = 'EnableTestSigning';       Right = 'DisableTestSigning' }
+        [pscustomobject]@{ Left = 'DisableDriverVerifier';   Right = 'EnableDriverVerifier' }
+        [pscustomobject]@{ Left = 'TrySafeMode';             Right = 'RemoveSafeModeFlag' }
+        [pscustomobject]@{ Left = 'TryLGKC';                 Right = 'TryOtherBootConfig' }
+        [pscustomobject]@{ Left = 'DisableLsaProtection';    Right = 'EnableCredentialGuard' }
+    )
+    if ($hasSubParameterParent) {
+        $scriptParameterNames = @(
+            $commandParameters.Keys | Where-Object { $commonParameterNames -notcontains $_ }
+        )
+        & $setParameterHidden -Names $scriptParameterNames -Hidden $true
+    }
+    else {
+        # Hide only the conflicting counterpart after one option is selected.
+        foreach ($pair in $mutuallyExclusiveParameterPairs) {
+            if ($PSBoundParameters.ContainsKey($pair.Left)) {
+                & $setParameterHidden -Names @($pair.Right) -Hidden $true
+            }
+            if ($PSBoundParameters.ContainsKey($pair.Right)) {
+                & $setParameterHidden -Names @($pair.Left) -Hidden $true
+            }
+        }
+    }
+
     # -DriveLetter: sub-option of -FixFileSystem
     if ($PSBoundParameters.ContainsKey('FixFileSystem')) {
         & $addParam 'DriveLetter' ([string]) 'Repair' ''
+    }
+    # -CodeIntegrityPolicySourcePath: sub-option of -FixSecureBootCodeIntegrity
+    if ($PSBoundParameters.ContainsKey('FixSecureBootCodeIntegrity')) {
+        & $addParam 'CodeIntegrityPolicySourcePath' ([string]) 'Repair' ''
     }
     # -RepairSource: sub-option of -RepairComponentStore
     if ($PSBoundParameters.ContainsKey('RepairComponentStore')) {
@@ -14720,6 +14790,14 @@ No destructive file or registry cleanup is performed.
         $script:LocalOsDiskNumber = (Get-Partition -DriveLetter 'C' -ErrorAction SilentlyContinue).DiskNumber
         $script:RepairForceConfirm = [bool]$Force
 
+        foreach ($pair in $mutuallyExclusiveParameterPairs) {
+            if ($PSBoundParameters.ContainsKey($pair.Left) -and
+                $PSBoundParameters.ContainsKey($pair.Right)) {
+                Write-Error "Parameters -$($pair.Left) and -$($pair.Right) cannot be used together."
+                return
+            }
+        }
+
         # Show usage/disk list when called with no actionable parameters
         if ($DiskNumber -lt 0 -and [string]::IsNullOrWhiteSpace($VMName)) {
             Write-Host @"
@@ -14922,12 +15000,6 @@ AVAILABLE DISKS:
             return
         }
 
-        # Validate mutual exclusivity
-        if ($DiskNumber -ge 0 -and -not [string]::IsNullOrWhiteSpace($VMName)) {
-            Write-Error "Specify either -DiskNumber or -VMName, not both."
-            return
-        }
-
         # Refuse to operate on the local OS disk when -DiskNumber is supplied directly
         if ($null -ne $script:LocalOsDiskNumber -and $DiskNumber -ge 0 -and $DiskNumber -eq $script:LocalOsDiskNumber) {
             Write-Error "Disk $DiskNumber hosts the local C: drive. Refusing to modify it to prevent breaking the Hyper-V host."
@@ -15109,6 +15181,7 @@ AVAILABLE DISKS:
 
     # Promote dynamic sub-parameters to local variables so the rest of the script can use them.
     # Dynamic params are in $PSBoundParameters but not in automatic $variables.
+    $CodeIntegrityPolicySourcePath = if ($PSBoundParameters.ContainsKey('CodeIntegrityPolicySourcePath')) { $PSBoundParameters['CodeIntegrityPolicySourcePath'] } else { '' }
     $DriveLetter = if ($PSBoundParameters.ContainsKey('DriveLetter')) { $PSBoundParameters['DriveLetter'] }      else { '' }
     $RepairSource = if ($PSBoundParameters.ContainsKey('RepairSource')) { $PSBoundParameters['RepairSource'] }     else { '' }
     $IncludeServices = [bool]$PSBoundParameters.ContainsKey('IncludeServices')
