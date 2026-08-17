@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.6.0
+        Version: 0.6.1
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -123,6 +123,7 @@ param (
     [Parameter(ParameterSetName = 'Repair')][switch]$FixSecureBootCodeIntegrity,
     [Parameter(ParameterSetName = 'Repair')][switch]$Force,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixBootSector,
+    [Parameter(ParameterSetName = 'Repair')][string]$BootsectPath = '',
     [Parameter(ParameterSetName = 'Repair')][switch]$FixBootStorageDrivers,
     [Parameter(ParameterSetName = 'Repair')][switch]$RecreateBootPartition,
     [Parameter(ParameterSetName = 'Repair')][switch]$RepairComponentStore,
@@ -5515,6 +5516,445 @@ Restart-Service -Name WinRM -Force
     # New repair functions
     ################################################################################
 
+    ################################################################################
+    # Boot sector (MBR / VBR) inspection and repair
+    #
+    # bcdboot repairs boot FILES (bootmgr, \Boot\BCD). It never writes disk sectors.
+    # The two links before bootmgr - the MBR bootstrap in sector 0 of the disk and
+    # the NTFS volume boot record (VBR) in sector 0 of the active partition - are
+    # only repaired by bootsect.exe, which does not ship in-box with Windows Server
+    # and is therefore usually absent on an Azure rescue VM. The helpers below give
+    # the script native visibility into, and repair of, those two sectors.
+    #
+    # Typical symptoms that live in this layer (and that -FixBoot can never fix):
+    #   "An operating system wasn't found" / "Operating system not found"
+    #   "Missing operating system" / "Invalid partition table"
+    #   "A disk read error occurred. Press Ctrl+Alt+Del to restart"
+    #   "BOOTMGR is missing" when \bootmgr is demonstrably present on the volume
+    ################################################################################
+
+    function Get-SectorAsciiView {
+        param([byte[]]$Bytes)
+        $sb = New-Object System.Text.StringBuilder
+        foreach ($b in $Bytes) {
+            if ($b -ge 32 -and $b -lt 127) { [void]$sb.Append([char]$b) } else { [void]$sb.Append('.') }
+        }
+        return $sb.ToString()
+    }
+
+    function Read-RawDiskBytes {
+        param(
+            [Parameter(Mandatory = $true)][int]$DiskNumber,
+            [Parameter(Mandatory = $true)][UInt64]$ByteOffset,
+            [int]$Length = 512
+        )
+        $fs = $null
+        try {
+            $fs = New-Object System.IO.FileStream("\\.\PhysicalDrive$DiskNumber",
+                [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            $null = $fs.Seek([long]$ByteOffset, [System.IO.SeekOrigin]::Begin)
+            $buf = New-Object byte[] $Length
+            $read = 0
+            while ($read -lt $Length) {
+                $n = $fs.Read($buf, $read, $Length - $read)
+                if ($n -le 0) { break }
+                $read += $n
+            }
+            if ($read -lt $Length) { throw "Short read at offset $ByteOffset : got $read of $Length bytes." }
+            return $buf
+        }
+        finally { if ($fs) { $fs.Dispose() } }
+    }
+
+    function Write-RawDiskBytes {
+        param(
+            [Parameter(Mandatory = $true)][int]$DiskNumber,
+            [Parameter(Mandatory = $true)][UInt64]$ByteOffset,
+            [Parameter(Mandatory = $true)][byte[]]$Data
+        )
+        if ($Data.Length % 512 -ne 0) { throw "Sector writes must be a multiple of 512 bytes (got $($Data.Length))." }
+        $fs = $null
+        try {
+            $fs = New-Object System.IO.FileStream("\\.\PhysicalDrive$DiskNumber",
+                [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
+            $null = $fs.Seek([long]$ByteOffset, [System.IO.SeekOrigin]::Begin)
+            $fs.Write($Data, 0, $Data.Length)
+            $fs.Flush($true)
+        }
+        finally { if ($fs) { $fs.Dispose() } }
+    }
+
+    function ConvertFrom-MbrSector {
+        param([Parameter(Mandatory = $true)][byte[]]$Sector)
+
+        if ($Sector.Length -lt 512) { throw "MBR sector must be at least 512 bytes (got $($Sector.Length))." }
+
+        $result = [ordered]@{
+            HasSignature      = ($Sector[510] -eq 0x55 -and $Sector[511] -eq 0xAA)
+            BootCodeNonZero   = 0
+            IsWindowsBootCode = $false
+            IsProtectiveMbr   = $false
+            DiskSignature     = ''
+            Markers           = @()
+            Partitions        = @()
+            ActiveCount       = 0
+        }
+
+        $bootCode = $Sector[0..439]
+        $result.BootCodeNonZero = @($bootCode | Where-Object { $_ -ne 0 }).Count
+
+        # Strings carried by the standard Windows (NT/Vista/7/10/2016+) MBR bootstrap.
+        $text = Get-SectorAsciiView -Bytes $bootCode
+        foreach ($k in @('Invalid partition table', 'Error loading operating system', 'Missing operating system')) {
+            if ($text.Contains($k)) { $result.Markers += $k }
+        }
+        $result.IsWindowsBootCode = ($result.Markers.Count -ge 2)
+
+        $result.DiskSignature = '{0:X2}{1:X2}{2:X2}{3:X2}' -f $Sector[443], $Sector[442], $Sector[441], $Sector[440]
+
+        for ($i = 0; $i -lt 4; $i++) {
+            $off = 446 + ($i * 16)
+            $type = $Sector[$off + 4]
+            if ($type -eq 0 -and $Sector[$off] -eq 0) { continue }
+            $isActive = ($Sector[$off] -eq 0x80)
+            if ($isActive) { $result.ActiveCount++ }
+            if ($type -eq 0xEE) { $result.IsProtectiveMbr = $true }
+            $numSect = [BitConverter]::ToUInt32($Sector, $off + 12)
+            $result.Partitions += [pscustomobject]@{
+                Index       = $i + 1
+                IsActive    = $isActive
+                TypeByte    = ('0x{0:X2}' -f $type)
+                StartLBA    = [BitConverter]::ToUInt32($Sector, $off + 8)
+                SectorCount = $numSect
+                SizeGB      = [math]::Round(($numSect * 512) / 1GB, 2)
+            }
+        }
+
+        return [pscustomobject]$result
+    }
+
+    function ConvertFrom-NtfsVbr {
+        param([Parameter(Mandatory = $true)][byte[]]$Bytes)
+
+        if ($Bytes.Length -lt 512) { throw "VBR needs at least 512 bytes (got $($Bytes.Length))." }
+
+        $oem = [Text.Encoding]::ASCII.GetString($Bytes, 3, 8)
+        $result = [ordered]@{
+            HasSignature      = ($Bytes[510] -eq 0x55 -and $Bytes[511] -eq 0xAA)
+            OemId             = $oem
+            IsNtfs            = ($oem -eq 'NTFS    ')
+            BytesPerSector    = [BitConverter]::ToUInt16($Bytes, 11)
+            SectorsPerCluster = $Bytes[13]
+            SectorsPerTrack   = [BitConverter]::ToUInt16($Bytes, 24)
+            NumberOfHeads     = [BitConverter]::ToUInt16($Bytes, 26)
+            HiddenSectors     = [BitConverter]::ToUInt32($Bytes, 28)
+            TotalSectors      = [UInt64]0
+            BootCodeNonZero   = 0
+            Loader            = 'None'
+            Markers           = @()
+        }
+        if ($result.IsNtfs) { $result.TotalSectors = [BitConverter]::ToUInt64($Bytes, 40) }
+
+        # NTFS bootstrap code in sector 0 runs from 0x54 to 0x1FD.
+        $result.BootCodeNonZero = @($Bytes[0x54..0x1FD] | Where-Object { $_ -ne 0 }).Count
+
+        $text = Get-SectorAsciiView -Bytes $Bytes
+        foreach ($k in @('BOOTMGR is missing', 'BOOTMGR is compressed', 'A disk read error occurred',
+                'Press Ctrl+Alt+Del to restart', 'NTLDR is missing', 'NTLDR is compressed', 'BOOTMGR', 'NTLDR')) {
+            if ($text.Contains($k)) { $result.Markers += $k }
+        }
+        if ($result.Markers -contains 'BOOTMGR') { $result.Loader = 'BOOTMGR (NT60 - Vista+)' }
+        elseif ($result.Markers -contains 'NTLDR') { $result.Loader = 'NTLDR (NT52 - XP/2003)' }
+
+        return [pscustomobject]$result
+    }
+
+    ################################################################################
+    # Get-BootSectorReport
+    #
+    # Read-only. Reads sector 0 of the disk (MBR), sector 0 of the boot partition
+    # (VBR) and the NTFS backup boot sector (last sector of that partition), then
+    # produces a findings list. Safe to call at any time; performs no writes.
+    ################################################################################
+    function Get-BootSectorReport {
+        param(
+            [Parameter(Mandatory = $true)][int]$DiskNumber,
+            [string]$BootDriveLetter = ''
+        )
+
+        $report = [ordered]@{
+            DiskNumber    = $DiskNumber
+            Mbr           = $null
+            Vbr           = $null
+            BackupVbr     = $null
+            BootPartition = $null
+            VbrMatchesBackup = $null
+            Findings      = @()
+            Errors        = @()
+        }
+
+        try { $report.Mbr = ConvertFrom-MbrSector -Sector (Read-RawDiskBytes -DiskNumber $DiskNumber -ByteOffset 0 -Length 512) }
+        catch { $report.Errors += "Could not read MBR of disk $DiskNumber : $_" }
+
+        $bootPart = $null
+        if ($BootDriveLetter) {
+            $letter = $BootDriveLetter.TrimEnd('\', ':')
+            $bootPart = Get-Partition -DiskNumber $DiskNumber -ErrorAction SilentlyContinue |
+                Where-Object { $_.DriveLetter -and ([string]$_.DriveLetter) -eq $letter } | Select-Object -First 1
+        }
+        if (-not $bootPart) {
+            $bootPart = Get-Partition -DiskNumber $DiskNumber -ErrorAction SilentlyContinue |
+                Where-Object { $_.IsActive } | Select-Object -First 1
+        }
+        $report.BootPartition = $bootPart
+
+        if ($bootPart) {
+            try {
+                $vbrBytes = Read-RawDiskBytes -DiskNumber $DiskNumber -ByteOffset ([UInt64]$bootPart.Offset) -Length 512
+                $report.Vbr = ConvertFrom-NtfsVbr -Bytes $vbrBytes
+
+                # NTFS keeps a byte-identical copy of sector 0 in the final sector of the
+                # volume. TotalSectors excludes that backup sector, so it is exactly at
+                # partitionOffset + TotalSectors * bytesPerSector.
+                if ($report.Vbr.IsNtfs -and $report.Vbr.TotalSectors -gt 0 -and $report.Vbr.BytesPerSector -ge 512) {
+                    $backupOffset = [UInt64]$bootPart.Offset + ([UInt64]$report.Vbr.TotalSectors * [UInt64]$report.Vbr.BytesPerSector)
+                    if (($backupOffset + 512) -le [UInt64]($bootPart.Offset + $bootPart.Size)) {
+                        $backupBytes = Read-RawDiskBytes -DiskNumber $DiskNumber -ByteOffset $backupOffset -Length 512
+                        $report.BackupVbr = ConvertFrom-NtfsVbr -Bytes $backupBytes
+                        $report.BackupVbr | Add-Member -NotePropertyName ByteOffset -NotePropertyValue $backupOffset -Force
+                        $report.BackupVbr | Add-Member -NotePropertyName Raw -NotePropertyValue $backupBytes -Force
+                        $report.VbrMatchesBackup = -not (Compare-Object $vbrBytes $backupBytes -SyncWindow 0)
+                    }
+                }
+                $report.Vbr | Add-Member -NotePropertyName Raw -NotePropertyValue $vbrBytes -Force
+            }
+            catch { $report.Errors += "Could not read VBR of partition $($bootPart.PartitionNumber): $_" }
+        }
+        else {
+            $report.Errors += "No boot partition could be resolved on disk $DiskNumber (no drive letter match and no Active partition)."
+        }
+
+        # ---------------- Findings ----------------
+        $f = [System.Collections.Generic.List[object]]::new()
+        $add = { param($Sev, $Msg, $Fix) $f.Add([pscustomobject]@{ Severity = $Sev; Message = $Msg; Fix = $Fix }) }
+
+        if ($report.Mbr) {
+            if (-not $report.Mbr.HasSignature) {
+                & $add 'CRITICAL' 'MBR sector 0 has no 0x55AA boot signature - the BIOS will not treat this disk as bootable ("Operating system not found" / "No bootable device").' '-FixBootSector'
+            }
+            if ($report.Mbr.BootCodeNonZero -eq 0) {
+                & $add 'CRITICAL' 'MBR bootstrap code (bytes 0-439) is entirely zero - nothing will execute after the BIOS hands over ("Operating system not found").' '-FixBootSector'
+            }
+            elseif (-not $report.Mbr.IsWindowsBootCode) {
+                & $add 'WARNING' "MBR bootstrap code is present but does not look like the standard Windows MBR (expected strings not found; markers: $($report.Mbr.Markers -join ', ')). It may be a third-party or damaged bootloader." '-FixBootSector'
+            }
+            if ($report.Mbr.ActiveCount -eq 0) {
+                & $add 'CRITICAL' 'No MBR partition is flagged Active - the Windows MBR bootstrap prints "Missing operating system" and stops.' '-FixBoot (sets Active) or -FixBootSector'
+            }
+            elseif ($report.Mbr.ActiveCount -gt 1) {
+                & $add 'CRITICAL' "$($report.Mbr.ActiveCount) partitions are flagged Active - the MBR bootstrap requires exactly one." '-FixBootSector'
+            }
+        }
+
+        if ($report.Vbr) {
+            if (-not $report.Vbr.HasSignature) {
+                & $add 'CRITICAL' 'Volume boot record (VBR) has no 0x55AA signature - the MBR bootstrap prints "Missing operating system".' '-FixBootSector'
+            }
+            if (-not $report.Vbr.IsNtfs) {
+                & $add 'WARNING' "Boot partition OEM ID is '$($report.Vbr.OemId)', not 'NTFS    '. The boot volume may be RAW or a different filesystem." '-FixFileSystem'
+            }
+            if ($report.Vbr.BootCodeNonZero -eq 0) {
+                & $add 'CRITICAL' 'VBR bootstrap code (offset 0x54-0x1FD) is entirely zero - the MBR loads it and nothing happens.' '-FixBootSector'
+            }
+            if ($report.Vbr.Loader -eq 'NTLDR (NT52 - XP/2003)') {
+                & $add 'CRITICAL' 'VBR carries the NT52 (NTLDR) bootstrap, but this OS boots via BOOTMGR. The VBR will look for NTLDR and fail.' '-FixBootSector'
+            }
+            elseif ($report.Vbr.Loader -eq 'None' -and $report.Vbr.BootCodeNonZero -gt 0) {
+                & $add 'WARNING' 'VBR bootstrap contains code but references neither BOOTMGR nor NTLDR - it is probably not a Windows boot sector.' '-FixBootSector'
+            }
+
+            # The single highest-value check: BPB HiddenSectors must equal the partition's
+            # start LBA. The bootstrap adds HiddenSectors to every relative read, so a stale
+            # value sends the BIOS reads to the wrong absolute sectors. Windows itself never
+            # uses this field, so the volume mounts fine and chkdsk/sfc report no problems -
+            # the failure only appears at BIOS boot as "A disk read error occurred".
+            if ($report.BootPartition -and $report.Vbr.BytesPerSector -ge 512) {
+                $expectedHidden = [UInt64]$report.BootPartition.Offset / [UInt64]$report.Vbr.BytesPerSector
+                $report.Vbr | Add-Member -NotePropertyName ExpectedHiddenSectors -NotePropertyValue $expectedHidden -Force
+                if ([UInt64]$report.Vbr.HiddenSectors -ne $expectedHidden) {
+                    & $add 'CRITICAL' ("VBR BPB HiddenSectors = $($report.Vbr.HiddenSectors) but the partition actually starts at LBA $expectedHidden. " +
+                        'The BIOS bootstrap will read from the wrong absolute sectors: "A disk read error occurred. Press Ctrl+Alt+Del to restart". ' +
+                        'Windows ignores this field, which is why chkdsk and sfc come back clean.') '-FixBootSector'
+                }
+            }
+
+            # Total sectors must fit inside the partition, otherwise the volume was resized
+            # or the partition table was rewritten without updating the BPB.
+            if ($report.BootPartition -and $report.Vbr.IsNtfs -and $report.Vbr.TotalSectors -gt 0) {
+                $partSectors = [UInt64]$report.BootPartition.Size / [UInt64]$report.Vbr.BytesPerSector
+                if ([UInt64]$report.Vbr.TotalSectors -ge $partSectors) {
+                    & $add 'CRITICAL' ("VBR BPB TotalSectors = $($report.Vbr.TotalSectors) but the partition only holds $partSectors sectors. " +
+                        'The filesystem believes it is larger than its container - this follows a bad resize and makes the NTFS backup boot sector unreachable.') '-FixFileSystem then -FixBootSector'
+                }
+            }
+
+            if ($null -ne $report.VbrMatchesBackup -and -not $report.VbrMatchesBackup) {
+                & $add 'WARNING' 'VBR does not match the NTFS backup boot sector at the end of the volume - one of the two has been modified or corrupted.' '-FixBootSector'
+            }
+            if ($report.Vbr.IsNtfs -and $null -eq $report.BackupVbr) {
+                & $add 'WARNING' 'NTFS backup boot sector could not be read - native VBR restore is unavailable; bootsect.exe would be required.' ''
+            }
+        }
+
+        $report.Findings = $f.ToArray()
+        return [pscustomobject]$report
+    }
+
+    function Show-BootSectorReport {
+        param([Parameter(Mandatory = $true)]$Report)
+
+        Write-Host ""
+        Write-Host "Boot sector analysis (disk $($Report.DiskNumber)):" -ForegroundColor Cyan
+
+        if ($Report.Mbr) {
+            $m = $Report.Mbr
+            $sig = if ($m.HasSignature) { '0x55AA OK' } else { 'MISSING' }
+            $code = if ($m.BootCodeNonZero -eq 0) { 'ZEROED' }
+            elseif ($m.IsWindowsBootCode) { "Windows bootstrap ($($m.BootCodeNonZero) bytes)" }
+            else { "unrecognised ($($m.BootCodeNonZero) bytes)" }
+            Write-Host "  MBR  : signature $sig | bootstrap: $code | disk signature 0x$($m.DiskSignature) | active partitions: $($m.ActiveCount)"
+            foreach ($p in $m.Partitions) {
+                $flag = if ($p.IsActive) { 'ACTIVE' } else { '      ' }
+                Write-Host ("         [$flag] entry $($p.Index): type $($p.TypeByte) | start LBA $($p.StartLBA) | $($p.SizeGB) GB") -ForegroundColor DarkGray
+            }
+        }
+
+        if ($Report.Vbr) {
+            $v = $Report.Vbr
+            $letter = if ($Report.BootPartition -and $Report.BootPartition.DriveLetter) { "$($Report.BootPartition.DriveLetter):" } else { "partition $($Report.BootPartition.PartitionNumber)" }
+            $sig = if ($v.HasSignature) { '0x55AA OK' } else { 'MISSING' }
+            Write-Host "  VBR  : $letter | OEM '$($v.OemId)' | signature $sig | bootstrap: $($v.Loader) | $($v.BootCodeNonZero) code bytes"
+            $hiddenNote = ''
+            if ($null -ne $v.ExpectedHiddenSectors) {
+                $hiddenNote = if ([UInt64]$v.HiddenSectors -eq [UInt64]$v.ExpectedHiddenSectors) { ' (matches partition start - OK)' }
+                else { " (MISMATCH - partition starts at LBA $($v.ExpectedHiddenSectors))" }
+            }
+            Write-Host "         HiddenSectors $($v.HiddenSectors)$hiddenNote" -ForegroundColor DarkGray
+            Write-Host "         TotalSectors $($v.TotalSectors) | $($v.BytesPerSector) B/sector | $($v.SectorsPerCluster) sectors/cluster" -ForegroundColor DarkGray
+            if ($null -ne $Report.VbrMatchesBackup) {
+                $bk = if ($Report.VbrMatchesBackup) { 'identical to backup boot sector' } else { 'DIFFERS from backup boot sector' }
+                Write-Host "         Backup boot sector: $bk" -ForegroundColor DarkGray
+            }
+        }
+
+        foreach ($e in $Report.Errors) { Write-Warning $e }
+
+        if ($Report.Findings.Count -eq 0) {
+            Write-Host "  [OK] No boot sector problems detected." -ForegroundColor Green
+        }
+        else {
+            Write-Host ""
+            foreach ($finding in $Report.Findings) {
+                $colour = if ($finding.Severity -eq 'CRITICAL') { 'Red' } else { 'Yellow' }
+                Write-Host "  [$($finding.Severity)] $($finding.Message)" -ForegroundColor $colour
+                if ($finding.Fix) { Write-Host "             Fix: $($finding.Fix)" -ForegroundColor DarkGray }
+            }
+        }
+        Write-Host ""
+    }
+
+    ################################################################################
+    # Find-BootsectExe - bootsect.exe is not in-box on Windows Server. Look in every
+    # place it realistically turns up on a rescue VM, including mounted ISOs.
+    ################################################################################
+    function Find-BootsectExe {
+        param([string]$ExplicitPath = '')
+
+        if ($ExplicitPath) {
+            if (Test-Path -LiteralPath $ExplicitPath) { return $ExplicitPath }
+            Write-Warning "BootsectPath '$ExplicitPath' does not exist; falling back to auto-discovery."
+        }
+
+        $candidates = @(
+            "$env:ProgramFiles\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\BCDBoot\bootsect.exe",
+            "${env:ProgramFiles(x86)}\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\BCDBoot\bootsect.exe",
+            "$env:ProgramFiles\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\x86\BCDBoot\bootsect.exe",
+            "${env:ProgramFiles(x86)}\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\x86\BCDBoot\bootsect.exe",
+            "$env:SystemRoot\System32\bootsect.exe",
+            "$env:SystemRoot\Boot\bootsect.exe",
+            "$env:SystemDrive\bootsect.exe",
+            (Join-Path $PSScriptRoot 'bootsect.exe')
+        )
+        foreach ($p in $candidates) {
+            if ($p -and (Test-Path -LiteralPath $p)) { return $p }
+        }
+
+        $inPath = Get-Command bootsect.exe -ErrorAction SilentlyContinue
+        if ($inPath) { return $inPath.Source }
+
+        # Windows installation media (ISO/USB) always carries \boot\bootsect.exe and it
+        # runs standalone. Check every optical / removable volume that is mounted.
+        foreach ($vol in (Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter -and $_.DriveType -in @('CD-ROM', 'Removable') })) {
+            $p = "$($vol.DriveLetter):\boot\bootsect.exe"
+            if (Test-Path -LiteralPath $p) { return $p }
+        }
+
+        return $null
+    }
+
+    ################################################################################
+    # Get-WindowsMbrBootstrap - source a known-good 440-byte Windows MBR bootstrap.
+    # The rescue VM itself is normally a Gen1 (BIOS/MBR) Azure VM, so its own disk 0
+    # carries exactly the bootstrap we need. Never returns the target disk's own code.
+    ################################################################################
+    function Get-WindowsMbrBootstrap {
+        param([int]$ExcludeDiskNumber = -1)
+
+        $disks = @(Get-Disk -ErrorAction SilentlyContinue |
+            Where-Object { $_.PartitionStyle -eq 'MBR' -and $_.Number -ne $ExcludeDiskNumber } |
+            Sort-Object Number)
+
+        foreach ($d in $disks) {
+            try {
+                $sector = Read-RawDiskBytes -DiskNumber $d.Number -ByteOffset 0 -Length 512
+                $info = ConvertFrom-MbrSector -Sector $sector
+                if ($info.HasSignature -and $info.IsWindowsBootCode -and -not $info.IsProtectiveMbr) {
+                    return [pscustomobject]@{
+                        SourceDisk = $d.Number
+                        Bootstrap  = $sector[0..439]
+                    }
+                }
+            }
+            catch { continue }
+        }
+        return $null
+    }
+
+    function Save-BootSectorBackup {
+        param(
+            [Parameter(Mandatory = $true)][int]$DiskNumber,
+            [Parameter(Mandatory = $true)]$Report
+        )
+        $dir = Join-Path $env:SystemDrive 'RepairAzVMDisk-Backups'
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+        $saved = @()
+
+        if ($Report.Mbr) {
+            $path = Join-Path $dir "disk$DiskNumber-mbr-$stamp.bin"
+            [System.IO.File]::WriteAllBytes($path, (Read-RawDiskBytes -DiskNumber $DiskNumber -ByteOffset 0 -Length 512))
+            $saved += $path
+        }
+        if ($Report.Vbr -and $Report.Vbr.Raw) {
+            $path = Join-Path $dir "disk$DiskNumber-part$($Report.BootPartition.PartitionNumber)-vbr-$stamp.bin"
+            [System.IO.File]::WriteAllBytes($path, $Report.Vbr.Raw)
+            $saved += $path
+        }
+        foreach ($p in $saved) { Write-Host "  Sector backup written: $p" -ForegroundColor DarkGray }
+        Write-ActionLog -Event 'BootSectorBackup' -Details @{ DiskNumber = $DiskNumber; Files = $saved }
+        return $saved
+    }
+
     function FixBootSector {
         Write-Host "Fixing MBR/VBR boot sector..." -ForegroundColor Yellow
         try {
@@ -5523,43 +5963,238 @@ Restart-Service -Name WinRM -Force
                 return
             }
 
-            $WinDrive = $script:WinDriveLetter.TrimEnd('\')
             $SysDrive = $script:BootDriveLetter.TrimEnd('\')
+            $diskNum = $script:DiskNumber
 
-            # bootrec.exe only exists in WinRE/WinPE - not available on a regular Hyper-V host.
-            # Use bootsect.exe (ships with Windows ADK) if present, otherwise fall back to bcdboot
-            # which also rewrites the VBR as a side effect of recreating the boot files.
-            $bootsect = $null
-            $adkPaths = @(
-                "$env:ProgramFiles\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\BCDBoot\bootsect.exe",
-                "${env:ProgramFiles(x86)}\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\BCDBoot\bootsect.exe",
-                "$env:ProgramFiles\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\x86\BCDBoot\bootsect.exe"
-            )
-            foreach ($p in $adkPaths) {
-                if (Test-Path $p) { $bootsect = $p; break }
-            }
-            if (-not $bootsect) {
-                $inPath = Get-Command bootsect.exe -ErrorAction SilentlyContinue
-                if ($inPath) { $bootsect = $inPath.Source }
+            # ---------------------------------------------------------------
+            # 1. Inspect first. Nothing here writes.
+            # ---------------------------------------------------------------
+            $report = Get-BootSectorReport -DiskNumber $diskNum -BootDriveLetter $SysDrive
+            Show-BootSectorReport -Report $report
+            $script:BootSectorReport = $report
+
+            if (-not $report.BootPartition) {
+                Write-Error "Cannot repair boot sectors: no boot partition resolved on disk $diskNum."
+                return
             }
 
+            $criticals = @($report.Findings | Where-Object { $_.Severity -eq 'CRITICAL' })
+            if ($report.Findings.Count -eq 0) {
+                Write-Host "Boot sectors already look healthy. Repairing anyway is harmless but usually unnecessary." -ForegroundColor DarkGray
+            }
+
+            $bootPart = $report.BootPartition
+            $partLabel = if ($bootPart.DriveLetter) { "$($bootPart.DriveLetter): (partition $($bootPart.PartitionNumber))" } else { "partition $($bootPart.PartitionNumber)" }
+
+            $proceed = Confirm-CriticalOperation `
+                -Operation "Rewrite MBR bootstrap and volume boot record on disk $diskNum" `
+                -Details @"
+This writes raw sectors. It is the only repair in this script that does so.
+
+  Disk           : $diskNum
+  Boot partition : $partLabel
+  Findings       : $($report.Findings.Count) ($($criticals.Count) critical)
+
+Steps:
+  - Back up the current MBR and VBR sectors to $env:SystemDrive\RepairAzVMDisk-Backups
+  - Take disk $diskNum offline (raw sector writes into a mounted volume are blocked by Windows)
+  - Repair the VBR bootstrap and correct the BPB HiddenSectors field
+  - Repair the MBR bootstrap (partition table is preserved byte for byte)
+  - Bring disk $diskNum back online
+
+The MBR partition table and all filesystem data are left untouched.
+"@
+            if (-not $proceed) { return }
+
+            Save-BootSectorBackup -DiskNumber $diskNum -Report $report | Out-Null
+
+            # ---------------------------------------------------------------
+            # 2. Prefer bootsect.exe when it is genuinely available.
+            # ---------------------------------------------------------------
+            $bootsect = Find-BootsectExe -ExplicitPath $script:BootsectPath
+            $bootsectDone = $false
             if ($bootsect) {
                 Write-Host "Using bootsect.exe: $bootsect" -ForegroundColor Cyan
-                # /nt60 = Windows Vista+ compatible VBR; /mbr = also rewrite MBR
-                Invoke-Logged -Description "bootsect /nt60 /mbr" -Details @{ SysDrive = $SysDrive; Tool = $bootsect } -ScriptBlock {
-                    & $bootsect /nt60 $SysDrive /mbr /force
+                $bsCmd = "`"$bootsect`" /nt60 $SysDrive /mbr /force"
+                $bsResult = Invoke-NativeCommandLogged -Description 'bootsect /nt60 /mbr' -Details @{
+                    SysDrive = $SysDrive; Tool = $bootsect
+                } -ScriptBlock { & cmd.exe /c $bsCmd }
+                $bsResult.Output | Out-Host
+                if ($bsResult.ExitCode -eq 0) {
+                    Write-Host "MBR and VBR bootstrap rewritten via bootsect." -ForegroundColor Green
+                    $bootsectDone = $true
                 }
-                Write-Host "MBR and VBR repaired via bootsect. If boot still fails, try -FixBoot." -ForegroundColor Green
+                else {
+                    Write-Warning "bootsect.exe returned exit code $($bsResult.ExitCode). Falling back to the native repair."
+                }
             }
             else {
-                Write-Warning "bootsect.exe not found. It is only available via the Windows ADK (not installed) or inside WinRE."
-                Write-Warning "Falling back to bcdboot, which rewrites the VBR and rebuilds boot files (equivalent to /fixboot)."
-                Write-Warning "For a full MBR repair (/fixmbr equivalent), install the Windows ADK and re-run -FixBootSector."
-                $rebuildCmd = "bcdboot $WinDrive\Windows /s $SysDrive /v /f BIOS"
-                Invoke-Logged -Description "bcdboot fallback (VBR repair)" -Details @{ Command = $rebuildCmd } -ScriptBlock {
-                    & cmd.exe /c $rebuildCmd
+                Write-Host "bootsect.exe not found (it is not in-box on Windows Server; it ships with the Windows ADK" -ForegroundColor DarkGray
+                Write-Host "or as \boot\bootsect.exe on Windows installation media). Using the native repair instead." -ForegroundColor DarkGray
+                Write-Host "You can also point the script at a copy with -BootsectPath <path>." -ForegroundColor DarkGray
+            }
+
+            # ---------------------------------------------------------------
+            # 3. Native repair. Runs with the disk offline so Windows permits
+            #    writes to sectors that belong to a mounted volume.
+            #    Note: bootsect does NOT correct BPB HiddenSectors, so the
+            #    HiddenSectors repair runs even when bootsect succeeded.
+            # ---------------------------------------------------------------
+            $wasOffline = (Get-Disk -Number $diskNum).IsOffline
+            $changed = @()
+            try {
+                if (-not $wasOffline) {
+                    Write-Host "Taking disk $diskNum offline for sector writes..." -ForegroundColor DarkGray
+                    Set-Disk -Number $diskNum -IsOffline $true
+                    Start-Sleep -Seconds 2
                 }
-                Write-Host "VBR repaired via bcdboot. BCD entries also rebuilt as part of this operation." -ForegroundColor Green
+
+                # ---- VBR ----
+                $vbrOffset = [UInt64]$bootPart.Offset
+                $current = Read-RawDiskBytes -DiskNumber $diskNum -ByteOffset $vbrOffset -Length 512
+                $cur = ConvertFrom-NtfsVbr -Bytes $current
+                $newVbr = $current.Clone()
+                $vbrDirty = $false
+
+                # 3a. Bootstrap code: restore from the NTFS backup boot sector when the
+                #     live one is unusable. The backup is a byte-identical copy written at
+                #     format time and kept in the final sector of the volume.
+                $needBootstrap = (-not $cur.HasSignature) -or ($cur.BootCodeNonZero -eq 0) -or
+                                 ($cur.Loader -eq 'NTLDR (NT52 - XP/2003)') -or ($cur.Loader -eq 'None')
+                if ($needBootstrap -and -not $bootsectDone) {
+                    if ($report.BackupVbr -and $report.BackupVbr.HasSignature -and
+                        $report.BackupVbr.IsNtfs -and $report.BackupVbr.Loader -like 'BOOTMGR*') {
+                        Write-Host "  Restoring VBR bootstrap from the NTFS backup boot sector at offset $($report.BackupVbr.ByteOffset)." -ForegroundColor Cyan
+                        $newVbr = $report.BackupVbr.Raw.Clone()
+                        $vbrDirty = $true
+                        $changed += 'VBR bootstrap restored from NTFS backup boot sector'
+                    }
+                    else {
+                        Write-Warning "  VBR bootstrap is damaged and no usable NTFS backup boot sector is available."
+                        Write-Warning "  Supply bootsect.exe via -BootsectPath to rewrite the NT60 bootstrap."
+                    }
+                }
+
+                # 3b. BPB HiddenSectors must equal the partition start LBA. This is the field
+                #     that a partition move or a bad resize leaves stale, and neither bcdboot,
+                #     bootsect, chkdsk nor sfc corrects it.
+                $bps = if ($cur.BytesPerSector -ge 512) { [UInt64]$cur.BytesPerSector } else { [UInt64]512 }
+                $expectedHidden = $vbrOffset / $bps
+                $actualHidden = [UInt64][BitConverter]::ToUInt32($newVbr, 28)
+                if ($actualHidden -ne $expectedHidden) {
+                    if ($expectedHidden -gt [UInt32]::MaxValue) {
+                        Write-Warning "  Partition starts at LBA $expectedHidden, which exceeds the 32-bit HiddenSectors field. Skipping."
+                    }
+                    else {
+                        Write-Host "  Correcting BPB HiddenSectors: $actualHidden -> $expectedHidden" -ForegroundColor Cyan
+                        [Array]::Copy([BitConverter]::GetBytes([UInt32]$expectedHidden), 0, $newVbr, 28, 4)
+                        $vbrDirty = $true
+                        $changed += "BPB HiddenSectors corrected ($actualHidden -> $expectedHidden)"
+                    }
+                }
+
+                # 3c. Boot signature.
+                if ($newVbr[510] -ne 0x55 -or $newVbr[511] -ne 0xAA) {
+                    Write-Host "  Restoring VBR 0x55AA boot signature." -ForegroundColor Cyan
+                    $newVbr[510] = 0x55; $newVbr[511] = 0xAA
+                    $vbrDirty = $true
+                    $changed += 'VBR boot signature restored'
+                }
+
+                if ($vbrDirty) {
+                    Invoke-Logged -Description 'Write repaired VBR' -Details @{
+                        DiskNumber = $diskNum; ByteOffset = $vbrOffset; Partition = $bootPart.PartitionNumber
+                    } -ScriptBlock {
+                        Write-RawDiskBytes -DiskNumber $diskNum -ByteOffset $vbrOffset -Data $newVbr
+                    } | Out-Null
+                }
+
+                # ---- MBR ----
+                if (-not $bootsectDone) {
+                    $mbrSector = Read-RawDiskBytes -DiskNumber $diskNum -ByteOffset 0 -Length 512
+                    $mbrInfo = ConvertFrom-MbrSector -Sector $mbrSector
+                    $mbrDirty = $false
+
+                    if (-not $mbrInfo.IsWindowsBootCode) {
+                        $src = Get-WindowsMbrBootstrap -ExcludeDiskNumber $diskNum
+                        if ($src) {
+                            Write-Host "  Writing Windows MBR bootstrap sourced from disk $($src.SourceDisk) (partition table preserved)." -ForegroundColor Cyan
+                            [Array]::Copy($src.Bootstrap, 0, $mbrSector, 0, 440)
+                            $mbrDirty = $true
+                            $changed += "MBR bootstrap rewritten from disk $($src.SourceDisk)"
+                        }
+                        else {
+                            Write-Warning "  MBR bootstrap is not a Windows bootstrap and no healthy MBR disk is available on this host to copy from."
+                            Write-Warning "  Supply bootsect.exe via -BootsectPath, or attach the disk to a Gen1 (BIOS/MBR) rescue VM."
+                        }
+                    }
+
+                    if ($mbrSector[510] -ne 0x55 -or $mbrSector[511] -ne 0xAA) {
+                        Write-Host "  Restoring MBR 0x55AA boot signature." -ForegroundColor Cyan
+                        $mbrSector[510] = 0x55; $mbrSector[511] = 0xAA
+                        $mbrDirty = $true
+                        $changed += 'MBR boot signature restored'
+                    }
+
+                    if ($mbrDirty) {
+                        Invoke-Logged -Description 'Write repaired MBR' -Details @{ DiskNumber = $diskNum } -ScriptBlock {
+                            Write-RawDiskBytes -DiskNumber $diskNum -ByteOffset 0 -Data $mbrSector
+                        } | Out-Null
+                    }
+                }
+            }
+            finally {
+                if (-not $wasOffline) {
+                    Write-Host "Bringing disk $diskNum back online..." -ForegroundColor DarkGray
+                    Set-Disk -Number $diskNum -IsOffline $false -ErrorAction SilentlyContinue
+                    Set-Disk -Number $diskNum -IsReadOnly $false -ErrorAction SilentlyContinue
+                    # Wait for the volumes to remount before any later repair step needs them.
+                    $letter = $SysDrive.TrimEnd(':')
+                    for ($i = 0; $i -lt 15; $i++) {
+                        Start-Sleep -Seconds 1
+                        $d = Get-Disk -Number $diskNum -ErrorAction SilentlyContinue
+                        if ($d -and -not $d.IsOffline -and (Get-Volume -DriveLetter $letter -ErrorAction SilentlyContinue)) { break }
+                    }
+                    $d = Get-Disk -Number $diskNum -ErrorAction SilentlyContinue
+                    if ($d -and $d.IsOffline) {
+                        Write-Warning "Disk $diskNum did not come back online automatically. Bring it online manually before continuing."
+                    }
+                    elseif (-not (Get-Volume -DriveLetter $letter -ErrorAction SilentlyContinue)) {
+                        Write-Warning "Disk $diskNum is online but drive letter $SysDrive has not reappeared yet."
+                    }
+                }
+            }
+
+            Write-ActionLog -Event 'FixBootSector' -Details @{
+                DiskNumber = $diskNum
+                UsedBootsect = $bootsectDone
+                Changes = $changed
+            }
+
+            # ---------------------------------------------------------------
+            # 4. Re-inspect so the operator sees the post-repair state.
+            # ---------------------------------------------------------------
+            if ($changed.Count -eq 0 -and -not $bootsectDone) {
+                Write-Host "No boot sector changes were applied." -ForegroundColor Yellow
+            }
+            else {
+                Write-Host ""
+                Write-Host "Boot sector changes applied:" -ForegroundColor Green
+                foreach ($c in $changed) { Write-Host "  - $c" -ForegroundColor Green }
+                if ($bootsectDone) { Write-Host "  - MBR/VBR bootstrap rewritten by bootsect.exe" -ForegroundColor Green }
+            }
+
+            $after = Get-BootSectorReport -DiskNumber $diskNum -BootDriveLetter $SysDrive
+            Write-Host "Post-repair verification:" -ForegroundColor Cyan
+            Show-BootSectorReport -Report $after
+            $script:BootSectorReport = $after
+
+            if (@($after.Findings | Where-Object { $_.Severity -eq 'CRITICAL' }).Count -eq 0) {
+                Write-Host "Boot sector chain is now valid. If the VM still fails to boot, the fault is above this layer" -ForegroundColor Green
+                Write-Host "(boot files / BCD -> -FixBoot, storage drivers -> -FixBootStorageDrivers, filesystem -> -FixFileSystem)." -ForegroundColor DarkGray
+            }
+            else {
+                Write-Warning "Critical boot sector findings remain - see above."
             }
         }
         catch {
@@ -8800,6 +9435,30 @@ complete recovery.
         }
         else {
             & $emit 'Boot' 'OK' "BCD-Template hive present ($bcdTemplateHive)"
+        }
+
+        # Boot sectors (Gen1/BIOS only). bcdboot repairs boot FILES; it never writes
+        # sector 0 of the disk or of the boot partition. A damaged MBR bootstrap or a
+        # stale BPB HiddenSectors value fails the boot before bootmgr ever loads, and
+        # is invisible to chkdsk, sfc and every BCD-level check above.
+        if ($script:VMGen -eq 1) {
+            try {
+                $bsReport = Get-BootSectorReport -DiskNumber $script:DiskNumber -BootDriveLetter $script:BootDriveLetter
+                $script:BootSectorReport = $bsReport
+                if ($bsReport.Findings.Count -eq 0 -and $bsReport.Errors.Count -eq 0) {
+                    & $emit 'Boot' 'OK' 'MBR bootstrap, active flag and volume boot record (VBR) all valid'
+                }
+                foreach ($bsf in $bsReport.Findings) {
+                    $bsSev = if ($bsf.Severity -eq 'CRITICAL') { & $toSev 2 } else { & $toSev 1 }
+                    & $emit 'Boot' $bsSev $bsf.Message $bsf.Fix
+                }
+                foreach ($bsErr in $bsReport.Errors) {
+                    & $emit 'Boot' (& $toSev 1) "Boot sector check incomplete: $bsErr"
+                }
+            }
+            catch {
+                & $emit 'Boot' (& $toSev 1) "Boot sector check could not run: $_"
+            }
         }
         $bootFileIssues = 0
         $sigIssues = 0
@@ -14688,6 +15347,7 @@ No destructive file or registry cleanup is performed.
             [string]$CodeIntegrityPolicySourcePath = '',
             [switch]$Force,
             [switch]$FixBootSector,
+            [string]$BootsectPath = '',
             [switch]$FixBootStorageDrivers,
             [switch]$RecreateBootPartition,
             [switch]$RepairComponentStore,
@@ -14789,6 +15449,7 @@ No destructive file or registry cleanup is performed.
         # Identify the local OS disk (C: drive) to prevent accidental modification of the Hyper-V host
         $script:LocalOsDiskNumber = (Get-Partition -DriveLetter 'C' -ErrorAction SilentlyContinue).DiskNumber
         $script:RepairForceConfirm = [bool]$Force
+        $script:BootsectPath = $BootsectPath
 
         foreach ($pair in $mutuallyExclusiveParameterPairs) {
             if ($PSBoundParameters.ContainsKey($pair.Left) -and
@@ -14854,7 +15515,12 @@ PARAMETERS:
   -FixBoot               Rebuild BCD from scratch
         -FixSecureBootCodeIntegrity  Refresh Gen2 EFI boot manager + SKUSiPolicy.p7b and repair CodeIntegrity Driver.stl/DriverSiPolicy.p7b for winload.efi / 0xc0430001
             -CodeIntegrityPolicySourcePath <path> Optional known-good CodeIntegrity folder/file source; otherwise uses offline WinSxS, then same-build rescue host fallback
-  -FixBootSector         Repair MBR/VBR boot sector (Gen1/BIOS only; bootrec)
+  -FixBootSector         Inspect and repair the MBR bootstrap + NTFS volume boot record (Gen1/BIOS only).
+                         Fixes what -FixBoot cannot: "Operating system not found", "Missing operating
+                         system", "A disk read error occurred" and a stale BPB HiddenSectors after a
+                         disk/partition resize. Uses bootsect.exe when available, otherwise repairs
+                         natively from the NTFS backup boot sector and a healthy local MBR.
+    -BootsectPath <path> Optional explicit path to bootsect.exe (ADK, or \boot\bootsect.exe on Windows media)
     -FixBootStorageDrivers Repair boot storage Start/StartOverride settings and recreate safe missing inbox service keys
   -RecreateBootPartition Recreate missing boot partition (System Reserved for Gen1, EFI SP for Gen2) and run bcdboot
   -RemoveSafeModeFlag    Remove Safe Mode flag
