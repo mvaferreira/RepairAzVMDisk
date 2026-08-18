@@ -139,13 +139,13 @@ You can also target a Hyper-V VM by name instead of disk number:
 # Repair component store using a known-good source image
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -RepairComponentStore -RepairSource "D:\sources\install.wim"
 
-# Repair a specific broken system file from the WinSxS store
+# Repair a system file using architecture-validated WinSxS/DriverStore candidates
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -RepairSystemFile "ntoskrnl.exe","ci.dll"
 
 # Fix registry corruption
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixRegistryCorruption
 
-# Restore registry from RegBack folder
+# Restore a validated, timestamp-consistent registry hive set from RegBack
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -RestoreRegistryFromRegBack
 ```
 
@@ -448,7 +448,7 @@ first.
 | **0xC0000098** | "BCD file doesn't contain a valid OS entry" | BCD has no/invalid Windows loader entry | `-FixBoot` → `-RecreateBootPartition` | [0xC0000098][c098] |
 | **0xC0000102** | STATUS_FILE_CORRUPT | Corrupt file or hive on the boot volume | `-FixFileSystem` → `-RunSFC` → `-RepairComponentStore` → `-RestoreRegistryFromRegBack` | [0xC0000102][c102] |
 | **0xC0000225** | "boot selection failed; a required device is inaccessible" | Missing boot partition / BCD device mismatch | `-FixBoot` → `-RecreateBootPartition` → `-FixBootSector` | [Boot errors][be] |
-| **0xC0000359** | Boot error 0xC0000359 | Corrupt/mismatched `winload` boot loader | `-FixBoot` → `-RepairSystemFile winload.efi` → `-RepairComponentStore` | [0xC0000359][c359] |
+| **0xC0000359** | "Critical system driver is missing or corrupt" | A 32-bit system driver was installed on the x64 Windows guest | `-RepairSystemFile <driver.sys>` | [0xC0000359][c359] |
 | "An operating system wasn't found" / **0xC000000E** | Boot manager finds no bootable OS | Inactive/missing boot partition or empty BCD | `-FixBoot` → `-RecreateBootPartition` → `-FixBootSector` | [OS not found][osnf] |
 | **0x0000007B** | INACCESSIBLE_BOOT_DEVICE | Storage driver `Start`/filters/SAN policy after migration | `-FixBootStorageDrivers` → `-EnsureSyntheticDriversEnabled` → `-FixDeviceFilters` → `-FixSanPolicy` | [INACCESSIBLE_BOOT_DEVICE][7b], [Server 2012 R2 / platform update][2012] |
 | **0x000000ED** | UNMOUNTABLE_BOOT_VOLUME | File-system corruption on boot volume | `-CheckDiskHealth` → `-FixFileSystem` | [Check-disk boot error][chk] |

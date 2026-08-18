@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.6.1
+        Version: 0.6.2
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -1922,6 +1922,203 @@ exit `$exitCode
         }
 
         return $result
+    }
+
+    function ConvertTo-NormalizedProcessorArchitecture {
+        param([AllowEmptyString()][string]$Architecture)
+
+        # Standard Azure Windows images are AMD64. x86 remains identifiable so it
+        # can be rejected on x64 guests and recognized on legacy specialized VHDs.
+        $normalized = if ($null -eq $Architecture) { '' } else { $Architecture.Trim().ToUpperInvariant() }
+        switch -Regex ($normalized) {
+            '^(AMD64|X64|X86_64)$' { return 'AMD64' }
+            '^(X86|I386|I686)$' { return 'x86' }
+            '^(ARM64|AARCH64|ARM64EC|ARM64X)$' { return 'ARM64' }
+            default { return 'Unknown' }
+        }
+    }
+
+    function Get-PortableExecutableInfo {
+        param([Parameter(Mandatory = $true)][string]$FilePath)
+
+        $result = [ordered]@{
+            Path                  = $FilePath
+            IsPortableExecutable = $false
+            Machine               = $null
+            MachineValue          = $null
+            Architecture          = 'Unknown'
+            Error                 = $null
+        }
+
+        $stream = $null
+        $reader = $null
+        try {
+            $item = Get-Item -LiteralPath $FilePath -ErrorAction Stop
+            if ($item.PSIsContainer) {
+                throw "Path is a directory."
+            }
+            if ($item.Length -lt 64) {
+                throw "File is too small to contain a PE header."
+            }
+
+            $stream = [System.IO.File]::Open(
+                $item.FullName,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::ReadWrite
+            )
+            $reader = New-Object System.IO.BinaryReader($stream)
+
+            if ($reader.ReadUInt16() -ne 0x5A4D) {
+                throw "DOS MZ signature is missing."
+            }
+
+            $stream.Position = 0x3C
+            $peOffset = $reader.ReadInt32()
+            if ($peOffset -lt 64 -or ([int64]$peOffset + 6) -gt $stream.Length) {
+                throw "PE header offset is outside the file."
+            }
+
+            $stream.Position = $peOffset
+            if ($reader.ReadUInt32() -ne 0x00004550) {
+                throw "PE signature is missing."
+            }
+
+            $machine = $reader.ReadUInt16()
+            $architecture = switch ($machine) {
+                0x014C { 'x86' }
+                0x8664 { 'AMD64' }
+                0xAA64 { 'ARM64' }
+                0xA641 { 'ARM64' } # ARM64EC
+                0xA64E { 'ARM64' } # ARM64X
+                default { 'Unknown' }
+            }
+
+            $result.IsPortableExecutable = $true
+            $result.Machine = ('0x{0:X4}' -f $machine)
+            $result.MachineValue = $machine
+            $result.Architecture = $architecture
+        }
+        catch {
+            $result.Error = $_.Exception.Message
+        }
+        finally {
+            if ($reader) { $reader.Dispose() }
+            elseif ($stream) { $stream.Dispose() }
+        }
+
+        return [pscustomobject]$result
+    }
+
+    function Test-PortableExecutableArchitectureCompatible {
+        param(
+            [Parameter(Mandatory = $true)]
+            [ValidateSet('AMD64', 'x86', 'ARM64', 'Unknown')]
+            [string]$ExpectedArchitecture,
+
+            [Parameter(Mandatory = $true)]
+            [ValidateSet('AMD64', 'x86', 'ARM64', 'Unknown')]
+            [string]$ActualArchitecture
+        )
+
+        if ($ExpectedArchitecture -eq 'Unknown' -or $ActualArchitecture -eq 'Unknown') {
+            return $false
+        }
+
+        return ($ExpectedArchitecture -eq $ActualArchitecture)
+    }
+
+    function Select-SystemFileRepairCandidates {
+        param(
+            [Parameter(Mandatory = $true)]
+            [AllowEmptyCollection()]
+            [object[]]$Candidates,
+
+            [Parameter(Mandatory = $true)]
+            [ValidateSet('AMD64', 'x86', 'ARM64', 'Unknown')]
+            [string]$ExpectedArchitecture
+        )
+
+        $allCandidates = @($Candidates)
+        if ($ExpectedArchitecture -eq 'Unknown') {
+            return [pscustomobject]@{
+                Eligible               = $allCandidates
+                Matching               = @()
+                Unverified             = $allCandidates
+                Mismatched             = @()
+                UsedUnverifiedFallback = ($allCandidates.Count -gt 0)
+            }
+        }
+
+        $matching = @(
+            $allCandidates | Where-Object {
+                $_.IsPortableExecutable -and
+                (Test-PortableExecutableArchitectureCompatible `
+                    -ExpectedArchitecture $ExpectedArchitecture `
+                    -ActualArchitecture $_.Architecture)
+            }
+        )
+        $unverified = @(
+            $allCandidates | Where-Object {
+                -not $_.IsPortableExecutable -or $_.Architecture -eq 'Unknown'
+            }
+        )
+        $mismatched = @(
+            $allCandidates | Where-Object {
+                $_.IsPortableExecutable -and
+                $_.Architecture -ne 'Unknown' -and
+                -not (Test-PortableExecutableArchitectureCompatible `
+                    -ExpectedArchitecture $ExpectedArchitecture `
+                    -ActualArchitecture $_.Architecture)
+            }
+        )
+
+        $eligible = if ($matching.Count -gt 0) { $matching } else { $unverified }
+        return [pscustomobject]@{
+            Eligible               = @($eligible)
+            Matching               = $matching
+            Unverified             = $unverified
+            Mismatched             = $mismatched
+            UsedUnverifiedFallback = ($matching.Count -eq 0 -and $unverified.Count -gt 0)
+        }
+    }
+
+    function Get-OfflineGuestProcessorArchitecture {
+        $rawArchitecture = $null
+        try {
+            Invoke-WithHive 'SYSTEM' {
+                $systemRoot = Get-SystemRootPath
+                $key = Join-Path $systemRoot 'Control\Session Manager\Environment'
+                if (Test-Path $key) {
+                    $script:_RepairAzVmDiskGuestArchitecture = (Get-ItemProperty `
+                            -Path $key `
+                            -Name 'PROCESSOR_ARCHITECTURE' `
+                            -ErrorAction SilentlyContinue).PROCESSOR_ARCHITECTURE
+                }
+            }
+            $rawArchitecture = $script:_RepairAzVmDiskGuestArchitecture
+        }
+        catch {
+            Write-Verbose "Could not read the offline PROCESSOR_ARCHITECTURE value: $($_.Exception.Message)"
+        }
+        finally {
+            Remove-Variable -Name '_RepairAzVmDiskGuestArchitecture' -Scope Script -ErrorAction SilentlyContinue
+        }
+
+        $architecture = ConvertTo-NormalizedProcessorArchitecture -Architecture $rawArchitecture
+        if ($architecture -ne 'Unknown') {
+            return $architecture
+        }
+
+        $kernelPath = Resolve-GuestImagePath -ImagePath 'C:\Windows\System32\ntoskrnl.exe'
+        if ($kernelPath -and (Test-Path -LiteralPath $kernelPath)) {
+            $kernelInfo = Get-PortableExecutableInfo -FilePath $kernelPath
+            if ($kernelInfo.IsPortableExecutable -and $kernelInfo.Architecture -ne 'Unknown') {
+                return $kernelInfo.Architecture
+            }
+        }
+
+        return 'Unknown'
     }
 
     # Validate user-supplied service/driver names before using them in registry paths.
@@ -3946,27 +4143,11 @@ The script will copy it to the guest before running bcdboot, then proceed with -
     }
 
     function Get-EfiFallbackBootFileName {
-        $guestArch = ''
-        try {
-            Invoke-WithHive 'SYSTEM' {
-                $sysRoot = Get-SystemRootPath
-                $envPath = Join-Path $sysRoot 'Control\Session Manager\Environment'
-                $env = Get-ItemProperty -Path $envPath -ErrorAction SilentlyContinue
-                if ($env -and $env.PROCESSOR_ARCHITECTURE) {
-                    $script:_RepairGuestProcessorArchitecture = [string]$env.PROCESSOR_ARCHITECTURE
-                }
-            }
-            $guestArch = $script:_RepairGuestProcessorArchitecture
-        }
-        catch {}
-        finally {
-            Remove-Variable -Name _RepairGuestProcessorArchitecture -Scope Script -ErrorAction SilentlyContinue
-        }
-
-        switch -Regex ($guestArch) {
-            'ARM64|AA64' { return 'bootaa64.efi' }
-            'x86|IA32'  { return 'bootia32.efi' }
-            default     { return 'bootx64.efi' }
+        $guestArch = Get-OfflineGuestProcessorArchitecture
+        switch ($guestArch) {
+            'ARM64' { return 'bootaa64.efi' }
+            'x86' { return 'bootia32.efi' }
+            default { return 'bootx64.efi' }
         }
     }
 
@@ -10983,57 +11164,343 @@ shutdown /r /t 10 /c "Network stack reset complete - rebooting"
         }
     }
 
+    function Test-RegistryHiveFile {
+        param([Parameter(Mandatory = $true)][string]$Path)
+
+        $result = [ordered]@{
+            Path    = $Path
+            IsValid = $false
+            Size    = 0
+            Reason  = $null
+        }
+
+        $stream = $null
+        $reader = $null
+        $handle = [IntPtr]::Zero
+        $temporaryHivePath = $null
+        try {
+            $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+            if ($item.PSIsContainer) {
+                throw "Path is a directory."
+            }
+
+            $result.Size = $item.Length
+            if ($item.Length -lt 4096) {
+                throw "File is smaller than the minimum registry hive structure (4096 bytes)."
+            }
+
+            $stream = [System.IO.File]::Open(
+                $item.FullName,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::ReadWrite
+            )
+            $reader = New-Object System.IO.BinaryReader($stream)
+            $signature = [System.Text.Encoding]::ASCII.GetString($reader.ReadBytes(4))
+            if ($signature -ne 'regf') {
+                throw "Registry hive header signature 'regf' is missing."
+            }
+            $reader.Dispose()
+            $reader = $null
+            $stream = $null
+
+            if (-not ('RepairAzVmDisk.RegistryHiveNativeMethods' -as [type])) {
+                Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace RepairAzVmDisk
+{
+    public static class RegistryHiveNativeMethods
+    {
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern int RegLoadAppKey(
+            string lpFile,
+            out IntPtr phkResult,
+            int samDesired,
+            int dwOptions,
+            int reserved);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        public static extern int RegCloseKey(IntPtr hKey);
+    }
+}
+'@
+            }
+
+            $temporaryHivePath = Join-Path `
+                ([System.IO.Path]::GetTempPath()) `
+                ("RepairAzVMDisk-HiveValidation-{0}.hiv" -f [guid]::NewGuid().ToString('N'))
+            [System.IO.File]::Copy($item.FullName, $temporaryHivePath, $true)
+
+            $status = [RepairAzVmDisk.RegistryHiveNativeMethods]::RegLoadAppKey(
+                $temporaryHivePath,
+                [ref]$handle,
+                0x20019,
+                1,
+                0
+            )
+            if ($status -ne 0) {
+                $message = (New-Object System.ComponentModel.Win32Exception($status)).Message
+                throw "Windows could not open the hive: $message (error $status)."
+            }
+
+            $result.IsValid = $true
+        }
+        catch {
+            $result.Reason = $_.Exception.Message
+        }
+        finally {
+            if ($handle -ne [IntPtr]::Zero -and ('RepairAzVmDisk.RegistryHiveNativeMethods' -as [type])) {
+                [void][RepairAzVmDisk.RegistryHiveNativeMethods]::RegCloseKey($handle)
+            }
+            if ($reader) { $reader.Dispose() }
+            elseif ($stream) { $stream.Dispose() }
+            if ($temporaryHivePath -and (Test-Path -LiteralPath $temporaryHivePath)) {
+                Remove-Item -LiteralPath $temporaryHivePath -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        return [pscustomobject]$result
+    }
+
+    function Get-RegBackRestorePlan {
+        param(
+            [Parameter(Mandatory = $true)][string]$ConfigPath,
+            [timespan]$MaximumTimestampSkew = ([timespan]::FromHours(24))
+        )
+
+        $regBackPath = Join-Path $ConfigPath 'RegBack'
+        $specifications = @(
+            [pscustomobject]@{ HiveName = 'SYSTEM'; Required = $true },
+            [pscustomobject]@{ HiveName = 'SOFTWARE'; Required = $true },
+            [pscustomobject]@{ HiveName = 'SAM'; Required = $false },
+            [pscustomobject]@{ HiveName = 'SECURITY'; Required = $false },
+            [pscustomobject]@{ HiveName = 'DEFAULT'; Required = $false },
+            [pscustomobject]@{ HiveName = 'COMPONENTS'; Required = $false }
+        )
+
+        $valid = @()
+        $excluded = @()
+        $warnings = @()
+        foreach ($spec in $specifications) {
+            $sourcePath = Join-Path $regBackPath $spec.HiveName
+            $sourceItem = Get-Item -LiteralPath $sourcePath -Force -ErrorAction SilentlyContinue
+            if (-not $sourceItem -or $sourceItem.PSIsContainer) {
+                if ($spec.Required) {
+                    $excluded += [pscustomobject]@{
+                        HiveName = $spec.HiveName
+                        Reason   = 'Required RegBack file is missing.'
+                    }
+                }
+                continue
+            }
+
+            $validation = Test-RegistryHiveFile -Path $sourcePath
+            if (-not $validation.IsValid) {
+                $excluded += [pscustomobject]@{
+                    HiveName = $spec.HiveName
+                    Reason   = $validation.Reason
+                }
+                continue
+            }
+
+            $valid += [pscustomobject]@{
+                HiveName          = $spec.HiveName
+                Required          = $spec.Required
+                SourcePath        = $sourcePath
+                SourceItem        = $sourceItem
+                LivePath          = Join-Path $ConfigPath $spec.HiveName
+                LiveBackup        = $null
+                LogBackups        = @()
+                CopyStarted       = $false
+            }
+        }
+
+        $missingCore = @(
+            @('SYSTEM', 'SOFTWARE') | Where-Object {
+                $_ -notin @($valid.HiveName)
+            }
+        )
+        if ($missingCore.Count -gt 0) {
+            return [pscustomobject]@{
+                CanRestore  = $false
+                Hives       = @()
+                Excluded    = $excluded
+                Warnings    = $warnings
+                MissingCore = $missingCore
+            }
+        }
+
+        $core = @($valid | Where-Object { $_.HiveName -in @('SYSTEM', 'SOFTWARE') })
+        $coreTimes = @($core | ForEach-Object { $_.SourceItem.LastWriteTimeUtc })
+        $oldestCore = ($coreTimes | Sort-Object | Select-Object -First 1)
+        $newestCore = ($coreTimes | Sort-Object -Descending | Select-Object -First 1)
+        if (($newestCore - $oldestCore) -gt $MaximumTimestampSkew) {
+            $warnings += "SYSTEM and SOFTWARE RegBack timestamps differ by more than $([math]::Round($MaximumTimestampSkew.TotalHours, 1)) hours."
+        }
+
+        $selected = @($core)
+        foreach ($candidate in @($valid | Where-Object { -not $_.Required })) {
+            $skew = [timespan]::FromTicks([math]::Abs(($candidate.SourceItem.LastWriteTimeUtc - $newestCore).Ticks))
+            if ($skew -gt $MaximumTimestampSkew) {
+                $excluded += [pscustomobject]@{
+                    HiveName = $candidate.HiveName
+                    Reason   = "Timestamp differs from the core backup set by $([math]::Round($skew.TotalHours, 1)) hours."
+                }
+                continue
+            }
+            $selected += $candidate
+        }
+
+        $sam = @($selected | Where-Object { $_.HiveName -eq 'SAM' })
+        $security = @($selected | Where-Object { $_.HiveName -eq 'SECURITY' })
+        if (($sam.Count -eq 1) -xor ($security.Count -eq 1)) {
+            $selected = @($selected | Where-Object { $_.HiveName -notin @('SAM', 'SECURITY') })
+            $missingPairMember = if ($sam.Count -eq 1) { 'SECURITY' } else { 'SAM' }
+            $excluded += [pscustomobject]@{
+                HiveName = 'SAM/SECURITY'
+                Reason   = "Both identity hives must be restored together; $missingPairMember is unavailable or invalid."
+            }
+        }
+        elseif ($sam.Count -eq 1 -and $security.Count -eq 1) {
+            $pairSkew = [timespan]::FromTicks(
+                [math]::Abs(($sam[0].SourceItem.LastWriteTimeUtc - $security[0].SourceItem.LastWriteTimeUtc).Ticks)
+            )
+            if ($pairSkew -gt $MaximumTimestampSkew) {
+                $selected = @($selected | Where-Object { $_.HiveName -notin @('SAM', 'SECURITY') })
+                $excluded += [pscustomobject]@{
+                    HiveName = 'SAM/SECURITY'
+                    Reason   = "Identity hive timestamps differ by $([math]::Round($pairSkew.TotalHours, 1)) hours."
+                }
+            }
+        }
+
+        return [pscustomobject]@{
+            CanRestore  = $true
+            Hives       = @($selected)
+            Excluded    = $excluded
+            Warnings    = $warnings
+            MissingCore = @()
+        }
+    }
+
     function RestoreRegistryFromRegBack {
-        if (-not (Confirm-CriticalOperation -Operation 'Restore Registry from RegBack (-RestoreRegistryFromRegBack)' -Details @"
-Replaces the live SYSTEM and SOFTWARE hives with the RegBack copies.
-The current hives and their transaction log files (.LOG/.LOG1/.LOG2) are renamed to *.bak before overwriting.
-"@)) { return }
+        Write-Host "Validating RegBack registry hives..." -ForegroundColor Yellow
+        $configPath = Join-Path $script:WinDriveLetter 'Windows\System32\config'
+        $regBackPath = Join-Path $configPath 'RegBack'
 
-        Write-Host "Attempting to restore SYSTEM and SOFTWARE hives from RegBack..." -ForegroundColor Yellow
-        $regBackPath = Join-Path $script:WinDriveLetter "Windows\System32\config\RegBack"
-        $configPath = Join-Path $script:WinDriveLetter "Windows\System32\config"
-
-        if (-not (Test-Path $regBackPath)) {
+        if (-not (Test-Path -LiteralPath $regBackPath -PathType Container)) {
             Write-Warning "RegBack folder not found at $regBackPath. Cannot restore."
             return
         }
 
-        $hives = @('SYSTEM', 'SOFTWARE')
-        foreach ($hive in $hives) {
-            $backupFile = Join-Path $regBackPath $hive
-            $liveFile = Join-Path $configPath  $hive
-            $backupItem = Get-Item -LiteralPath $backupFile -Force -ErrorAction SilentlyContinue
+        $plan = Get-RegBackRestorePlan -ConfigPath $configPath
+        foreach ($warning in $plan.Warnings) {
+            Write-Warning $warning
+        }
+        foreach ($item in $plan.Excluded) {
+            Write-Warning "  $($item.HiveName) will not be restored: $($item.Reason)"
+        }
+        if (-not $plan.CanRestore) {
+            Write-Error "RegBack restore requires valid SYSTEM and SOFTWARE hives. Missing or invalid: $($plan.MissingCore -join ', ')."
+            return
+        }
 
-            if (-not $backupItem) {
-                Write-Warning "  RegBack copy of $hive not found - skipping."
-                continue
+        $hiveSummary = @(
+            $plan.Hives | ForEach-Object {
+                "  $($_.HiveName): $([math]::Round($_.SourceItem.Length / 1MB, 2)) MB, $($_.SourceItem.LastWriteTime)"
             }
+        ) -join "`n"
+        if (-not (Confirm-CriticalOperation -Operation 'Restore Registry from RegBack (-RestoreRegistryFromRegBack)' -Details @"
+The following validated hives will replace the live copies:
+$hiveSummary
 
-            $backupSize = $backupItem.Length
-            if ($backupSize -lt 1MB) {
-                Write-Warning "  RegBack $hive is suspiciously small ($backupSize bytes) - skipping to avoid overwriting with empty hive."
-                continue
-            }
+All destination hives and their .LOG/.LOG1/.LOG2 files are backed up before any RegBack hive is copied.
+SAM and SECURITY are restored only as a validated pair. If any copy or hash verification fails, the function attempts to roll back the full set.
+"@)) { return }
 
-            Write-Host "  Restoring $hive ($([math]::Round($backupSize/1MB,1)) MB)..." -ForegroundColor Yellow
-            $bakPath = New-UniqueBackupPath -BasePath $liveFile -BakSuffix ".bak"
-            Move-Item-Logged -LiteralPath $liveFile -Destination $bakPath -Force
-            Copy-Item-Logged -Path $backupFile -Destination $liveFile -Force
-            Write-Host "  $hive restored. Previous live hive backed up to $bakPath" -ForegroundColor Green
+        Write-Host "Backing up live registry hives and transaction logs..." -ForegroundColor Yellow
+        try {
+            foreach ($hive in $plan.Hives) {
+                if (Test-Path -LiteralPath $hive.LivePath -PathType Leaf) {
+                    $liveBackup = New-UniqueBackupPath -BasePath $hive.LivePath -BakSuffix '.regback.bak'
+                    Move-Item-Logged -LiteralPath $hive.LivePath -Destination $liveBackup -Force
+                    $hive.LiveBackup = $liveBackup
+                }
 
-            # Rename stale transaction logs so Windows starts fresh logging against the restored hive.
-            # Leaving old logs risks Windows replaying stale transactions from the previous (newer) hive
-            # onto the restored snapshot, which can silently re-corrupt it.
-            foreach ($logSuffix in @('.LOG', '.LOG1', '.LOG2')) {
-                $logPath = Join-Path $configPath "$hive$logSuffix"
-                if (Test-Path -LiteralPath $logPath) {
-                    $logBak = New-UniqueBackupPath -BasePath $logPath -BakSuffix '.bak'
-                    Move-Item-Logged -LiteralPath $logPath -Destination $logBak -Force
-                    Write-Host "    Renamed $hive$logSuffix -> $(Split-Path $logBak -Leaf)" -ForegroundColor DarkGray
+                foreach ($logSuffix in @('.LOG', '.LOG1', '.LOG2')) {
+                    $logPath = Join-Path $configPath "$($hive.HiveName)$logSuffix"
+                    if (Test-Path -LiteralPath $logPath -PathType Leaf) {
+                        $logBackup = New-UniqueBackupPath -BasePath $logPath -BakSuffix '.regback.bak'
+                        Move-Item-Logged -LiteralPath $logPath -Destination $logBackup -Force
+                        $hive.LogBackups += [pscustomobject]@{
+                            LivePath   = $logPath
+                            BackupPath = $logBackup
+                        }
+                    }
                 }
             }
+
+            Write-Host "Copying validated RegBack hives..." -ForegroundColor Yellow
+            foreach ($hive in $plan.Hives) {
+                $hive.CopyStarted = $true
+                Copy-Item-Logged -Path $hive.SourcePath -Destination $hive.LivePath -Force
+                if (-not (Test-Path -LiteralPath $hive.LivePath -PathType Leaf)) {
+                    throw "Copy did not create the destination hive $($hive.LivePath)."
+                }
+
+                $sourceHash = (Get-FileHash -LiteralPath $hive.SourcePath -Algorithm SHA256 -ErrorAction Stop).Hash
+                $destinationHash = (Get-FileHash -LiteralPath $hive.LivePath -Algorithm SHA256 -ErrorAction Stop).Hash
+                if ($sourceHash -ne $destinationHash) {
+                    throw "Hash verification failed for the restored $($hive.HiveName) hive."
+                }
+
+                Write-Host "  $($hive.HiveName) restored and verified." -ForegroundColor Green
+            }
         }
-        Write-Host "RegBack restore complete. Boot the VM to verify." -ForegroundColor Green
+        catch {
+            $restoreError = $_
+            Write-Warning "RegBack restore failed. Attempting to roll back every touched hive..."
+            for ($index = $plan.Hives.Count - 1; $index -ge 0; $index--) {
+                $hive = $plan.Hives[$index]
+                if (-not $hive.CopyStarted -and -not $hive.LiveBackup -and $hive.LogBackups.Count -eq 0) { continue }
+
+                try {
+                    if ($hive.CopyStarted -and (Test-Path -LiteralPath $hive.LivePath)) {
+                        Invoke-Logged -Description 'Remove failed RegBack hive copy' -Details @{
+                            Path = $hive.LivePath
+                        } -ScriptBlock {
+                            Remove-Item -LiteralPath $hive.LivePath -Force -ErrorAction Stop
+                        } | Out-Null
+                    }
+                    if ($hive.LiveBackup -and (Test-Path -LiteralPath $hive.LiveBackup)) {
+                        Move-Item-Logged -LiteralPath $hive.LiveBackup -Destination $hive.LivePath -Force
+                    }
+
+                    foreach ($logBackup in $hive.LogBackups) {
+                        if (Test-Path -LiteralPath $logBackup.LivePath) {
+                            Invoke-Logged -Description 'Remove failed RegBack transaction log' -Details @{
+                                Path = $logBackup.LivePath
+                            } -ScriptBlock {
+                                Remove-Item -LiteralPath $logBackup.LivePath -Force -ErrorAction Stop
+                            } | Out-Null
+                        }
+                        if (Test-Path -LiteralPath $logBackup.BackupPath) {
+                            Move-Item-Logged -LiteralPath $logBackup.BackupPath -Destination $logBackup.LivePath -Force
+                        }
+                    }
+                }
+                catch {
+                    Write-Warning "  Rollback failed for $($hive.HiveName): $($_.Exception.Message)"
+                }
+            }
+            throw $restoreError
+        }
+
+        $restoredNames = @($plan.Hives.HiveName) -join ', '
+        $script:ActionLog.Add("Restored and hash-verified RegBack hives: $restoredNames")
+        Write-Host "RegBack restore complete ($restoredNames). Boot the VM to verify." -ForegroundColor Green
     }
 
     function SetTestSigning {
@@ -12242,17 +12709,29 @@ Default and LastKnownGood control sets are not modified.
             [Parameter(Mandatory = $true)]
             [string[]]$FileNames
         )
-        # Replaces a missing or 0-byte Windows system binary by locating the latest
-        # version from the offline disk's WinSxS component store or DriverStore.
+        # Replaces a missing, 0-byte, or wrong-architecture Windows system binary
+        # from the offline disk's WinSxS component store or DriverStore.
         #
-        # Search order (picks the largest / newest match):
+        # Search sources:
         #   1. \Windows\WinSxS\<component>\<filename>          (component store - primary)
         #   2. \Windows\System32\DriverStore\FileRepository\*\<filename>  (driver packages)
         #
+        # Known PE architecture mismatches are excluded before version/source ranking.
         # Only Microsoft/Windows binaries are expected targets (e.g. storvsc.sys, ntoskrnl.exe).
-        # The original file (if present) is renamed to .broken.bak before replacement.
+        # The original file (if present) is backed up before replacement.
         #
         # Reference: https://learn.microsoft.com/en-us/troubleshoot/azure/virtual-machines/windows/virtual-machines-windows-repair-replace-system-binary-file
+
+        $portableExecutableExtensions = @('.sys', '.dll', '.exe', '.efi')
+        $guestArchitecture = Get-OfflineGuestProcessorArchitecture
+        if ($guestArchitecture -eq 'Unknown') {
+            $guestArchitecture = 'AMD64'
+            Write-Warning "The offline guest architecture could not be determined. Defaulting to AMD64/x64, which is the supported Azure Windows VM image architecture."
+            Write-Warning "Do not continue on a legacy specialized 32-bit VHD unless its x86 architecture can be confirmed from the offline registry or kernel."
+        }
+        else {
+            Write-Host "Offline guest architecture: $guestArchitecture" -ForegroundColor DarkGray
+        }
 
         foreach ($fileName in $FileNames) {
             $fileName = $fileName.Trim()
@@ -12280,37 +12759,72 @@ Default and LastKnownGood control sets are not modified.
             $targetPath = Join-Path $targetDir $fileName
 
             # Check current state
-            $targetExists = Test-Path -LiteralPath $targetPath
-            $targetSize = if ($targetExists) { (Get-Item -LiteralPath $targetPath -ErrorAction SilentlyContinue).Length } else { 0 }
-            $isBroken = (-not $targetExists) -or ($targetSize -eq 0)
+            $targetItem = Get-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue
+            $targetExists = $null -ne $targetItem
+            $targetIsDirectory = $targetExists -and $targetItem.PSIsContainer
+            $targetSize = if ($targetExists -and -not $targetIsDirectory) { $targetItem.Length } else { 0 }
+            $targetVersion = if ($targetExists -and -not $targetIsDirectory) { $targetItem.VersionInfo } else { $null }
+            $targetPeInfo = $null
+            $targetArchitectureMismatch = $false
+            if ($targetExists -and -not $targetIsDirectory -and $targetSize -gt 0 -and
+                $portableExecutableExtensions -contains $ext) {
+                $targetPeInfo = Get-PortableExecutableInfo -FilePath $targetPath
+                if ($guestArchitecture -ne 'Unknown' -and $targetPeInfo.IsPortableExecutable -and
+                    $targetPeInfo.Architecture -ne 'Unknown') {
+                    $targetArchitectureMismatch = -not (Test-PortableExecutableArchitectureCompatible `
+                            -ExpectedArchitecture $guestArchitecture `
+                            -ActualArchitecture $targetPeInfo.Architecture)
+                }
+            }
 
-            if (-not $isBroken) {
-                $ver = (Get-Item -LiteralPath $targetPath -ErrorAction SilentlyContinue).VersionInfo
-                Write-Host "  $targetPath already exists ($("{0:N0}" -f $targetSize) bytes, version: $($ver.FileVersion))" -ForegroundColor DarkGray
-                                if (-not (Confirm-CriticalOperation -Operation "Force replace existing system file ($fileName)" -Details @"
-The target file exists and is not zero bytes:
+            $isBroken = (-not $targetExists) -or $targetIsDirectory -or ($targetSize -eq 0) -or $targetArchitectureMismatch
+            if ($targetExists -and ($targetIsDirectory -or $targetSize -gt 0)) {
+                $currentSizeText = if ($targetIsDirectory) { 'directory' } else { "$targetSize bytes" }
+                $currentArchitecture = if ($targetPeInfo -and $targetPeInfo.IsPortableExecutable) {
+                    "$($targetPeInfo.Architecture) ($($targetPeInfo.Machine))"
+                }
+                else {
+                    'not verified'
+                }
+                Write-Host "  $targetPath already exists ($currentSizeText, version: $($targetVersion.FileVersion), architecture: $currentArchitecture)" -ForegroundColor DarkGray
+                if (-not (Confirm-CriticalOperation -Operation "Force replace existing system file ($fileName)" -Details @"
+The target path already exists:
     $targetPath
 
-Current size   : $targetSize bytes
-Current version: $($ver.FileVersion)
+Current state       : $currentSizeText
+Current version     : $($targetVersion.FileVersion)
+Current architecture: $currentArchitecture
+Guest architecture : $guestArchitecture
 
 The script will search WinSxS and DriverStore for a replacement candidate,
 back up the existing target to a .replaced.bak file, copy the selected candidate
-to the target path, and apply a protected Windows system-file ACL/owner baseline
-instead of preserving ACLs that may have been modified during troubleshooting.
+to the target path, verify its content and PE architecture when possible, and
+apply a protected Windows system-file ACL/owner baseline.
 "@)) {
-                                        Write-Host "  Skipped. Existing file was left unchanged." -ForegroundColor DarkGray
-                                        continue
-                                }
+                    Write-Host "  Skipped. Existing path was left unchanged." -ForegroundColor DarkGray
+                    continue
+                }
             }
 
-                        $stateDesc = if (-not $targetExists) { 'MISSING' } elseif ($targetSize -eq 0) { '0 bytes (corrupt)' } else { 'present/non-zero (forced replacement)' }
-            Write-Host "  Target: $targetPath [$stateDesc]" -ForegroundColor Yellow
-            $targetAclBeforeRepair = $null
-            if ($targetExists) {
-                try { $targetAclBeforeRepair = Get-Acl -LiteralPath $targetPath -ErrorAction Stop }
-                catch { Write-Warning "  Could not capture existing target ACL before replacement: $_" }
+            $stateDesc = if (-not $targetExists) {
+                'MISSING'
             }
+            elseif ($targetIsDirectory) {
+                'directory where a file is required'
+            }
+            elseif ($targetSize -eq 0) {
+                '0 bytes (corrupt)'
+            }
+            elseif ($targetArchitectureMismatch) {
+                "$($targetPeInfo.Architecture) PE architecture mismatches $guestArchitecture guest"
+            }
+            elseif ($isBroken) {
+                'corrupt'
+            }
+            else {
+                'present/non-zero (forced replacement)'
+            }
+            Write-Host "  Target: $targetPath [$stateDesc]" -ForegroundColor Yellow
 
             # -- 2. Search WinSxS and DriverStore for replacement candidates ------
             $candidates = [System.Collections.Generic.List[PSCustomObject]]::new()
@@ -12328,9 +12842,10 @@ instead of preserving ACLs that may have been modified during troubleshooting.
                 Where-Object { $_.Length -gt 0 -and $_.DirectoryName -notmatch '\\(f|r)$' } |
                 ForEach-Object {
                     $ver = $_.VersionInfo
+                    $peInfo = Get-PortableExecutableInfo -FilePath $_.FullName
                     # Filter out delta stubs: no version info + under 1KB = not a real PE binary
-                    if ($_.Length -lt 1024 -and -not $ver.FileVersion) { return }
-                    $candidates.Add([PSCustomObject]@{
+                    if (-not ($_.Length -lt 1024 -and -not $ver.FileVersion)) {
+                        $candidates.Add([PSCustomObject]@{
                             Path       = $_.FullName
                             Size       = $_.Length
                             Version    = $ver.FileVersion
@@ -12338,7 +12853,11 @@ instead of preserving ACLs that may have been modified during troubleshooting.
                             Company    = $ver.CompanyName
                             LastWrite  = $_.LastWriteTime
                             Source     = 'WinSxS'
+                            IsPortableExecutable = $peInfo.IsPortableExecutable
+                            Architecture = $peInfo.Architecture
+                            Machine      = $peInfo.Machine
                         })
+                    }
                 }
             }
 
@@ -12350,6 +12869,7 @@ instead of preserving ACLs that may have been modified during troubleshooting.
                 Where-Object { $_.Length -gt 0 } |
                 ForEach-Object {
                     $ver = $_.VersionInfo
+                    $peInfo = Get-PortableExecutableInfo -FilePath $_.FullName
                     $candidates.Add([PSCustomObject]@{
                             Path       = $_.FullName
                             Size       = $_.Length
@@ -12358,6 +12878,9 @@ instead of preserving ACLs that may have been modified during troubleshooting.
                             Company    = $ver.CompanyName
                             LastWrite  = $_.LastWriteTime
                             Source     = 'DriverStore'
+                            IsPortableExecutable = $peInfo.IsPortableExecutable
+                            Architecture = $peInfo.Architecture
+                            Machine      = $peInfo.Machine
                         })
                 }
             }
@@ -12368,10 +12891,45 @@ instead of preserving ACLs that may have been modified during troubleshooting.
                 continue
             }
 
-            # Display all candidates
-            Write-Host "  Found $($candidates.Count) candidate(s):" -ForegroundColor Green
-            $candidates | Sort-Object LastWrite -Descending |
+            $candidateSelection = if ($portableExecutableExtensions -contains $ext) {
+                Select-SystemFileRepairCandidates `
+                    -Candidates @($candidates) `
+                    -ExpectedArchitecture $guestArchitecture
+            }
+            else {
+                [pscustomobject]@{
+                    Eligible               = @($candidates)
+                    Matching               = @()
+                    Unverified             = @()
+                    Mismatched             = @()
+                    UsedUnverifiedFallback = $false
+                }
+            }
+
+            if ($candidateSelection.Mismatched.Count -gt 0) {
+                $mismatchSummary = @(
+                    $candidateSelection.Mismatched |
+                    Group-Object Architecture |
+                    ForEach-Object { "$($_.Name): $($_.Count)" }
+                ) -join ', '
+                Write-Warning "  Excluded $($candidateSelection.Mismatched.Count) known architecture-mismatched candidate(s) ($mismatchSummary)."
+            }
+
+            $eligibleCandidates = @($candidateSelection.Eligible)
+            if ($eligibleCandidates.Count -eq 0) {
+                Write-Warning "  No candidate matches the offline guest architecture ($guestArchitecture)."
+                Write-Warning "  Do not use a binary from a different architecture. Use matching installation media or a same-build VM if the local stores are incomplete."
+                continue
+            }
+            if ($candidateSelection.UsedUnverifiedFallback) {
+                Write-Warning "  No architecture-verified candidate was available. Only candidates whose PE architecture could not be verified remain."
+            }
+
+            # Display eligible candidates
+            Write-Host "  Found $($eligibleCandidates.Count) eligible candidate(s):" -ForegroundColor Green
+            $eligibleCandidates | Sort-Object LastWrite -Descending |
             Format-Table @{L = 'Source'; E = { $_.Source } },
+            @{L = 'Arch'; E = { if ($_.Architecture -eq 'Unknown') { '?' } else { $_.Architecture } } },
             @{L = 'Version'; E = { $_.Version } },
             @{L = 'Size'; E = { "{0:N0}" -f $_.Size } },
             @{L = 'Date'; E = { $_.LastWrite.ToString('yyyy-MM-dd HH:mm') } },
@@ -12390,7 +12948,7 @@ instead of preserving ACLs that may have been modified during troubleshooting.
             # Files without version info are likely delta stubs or placeholders.
             $driverBaseName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
             $infMatchPattern = '\\' + [regex]::Escape($driverBaseName) + '\.inf_'
-            $best = $candidates |
+            $best = $eligibleCandidates |
                 Sort-Object @{Expression = {
                                 if ($ext -eq '.sys' -and $_.Source -eq 'DriverStore' -and $_.Path -match $infMatchPattern) { 0 } else { 1 } } },
                             @{Expression = { if ($_.Version -and $_.Company) { 0 } else { 1 } } },
@@ -12403,7 +12961,8 @@ instead of preserving ACLs that may have been modified during troubleshooting.
             }
 
             Write-Host "  Selected: $($best.Path)" -ForegroundColor Cyan
-            Write-Host "    Version: $($best.Version)  |  Size: $("{0:N0}" -f $best.Size) bytes  |  Date: $($best.LastWrite.ToString('yyyy-MM-dd HH:mm'))  |  Company: $($best.Company)" -ForegroundColor White
+            Write-Host "    Architecture: $($best.Architecture) $($best.Machine)  |  Version: $($best.Version)  |  Size: $("{0:N0}" -f $best.Size) bytes" -ForegroundColor White
+            Write-Host "    Date: $($best.LastWrite.ToString('yyyy-MM-dd HH:mm'))  |  Company: $($best.Company)" -ForegroundColor White
 
             # Verify it's a Microsoft binary (safety check)
             if ($best.Company -and $best.Company -notmatch 'Microsoft') {
@@ -12412,10 +12971,12 @@ instead of preserving ACLs that may have been modified during troubleshooting.
             }
 
             # -- 4. Backup the broken file (if it exists) ------------------------
+            $bakPath = $null
+            $backupCreated = $false
             if ($targetExists) {
-                $backupSuffix = if ($targetSize -eq 0) { '.broken.bak' } else { '.replaced.bak' }
+                $backupSuffix = if ($targetSize -eq 0 -and -not $targetIsDirectory) { '.broken.bak' } else { '.replaced.bak' }
                 $bakPath = New-UniqueBackupPath -BasePath $targetPath -BakSuffix $backupSuffix
-                Write-Host "  Backing up existing file: $targetPath -> $bakPath" -ForegroundColor DarkGray
+                Write-Host "  Backing up existing path: $targetPath -> $bakPath" -ForegroundColor DarkGray
                 try {
                     Invoke-Logged -Description 'Back up broken system file' -Details @{
                         Path = $targetPath
@@ -12423,10 +12984,15 @@ instead of preserving ACLs that may have been modified during troubleshooting.
                     } -ScriptBlock {
                         Rename-Item -LiteralPath $targetPath -NewName (Split-Path $bakPath -Leaf) -Force -ErrorAction Stop
                     } | Out-Null
+                    if (-not (Test-Path -LiteralPath $bakPath)) {
+                        throw "Backup path was not created."
+                    }
+                    $backupCreated = $true
                 }
                 catch {
-                    Write-Warning "  Could not rename broken file: $_"
-                    Write-Warning "  Attempting to overwrite directly."
+                    Write-Warning "  Could not back up the existing path: $_"
+                    Write-Error "  Replacement was cancelled because automatic rollback would not be available."
+                    continue
                 }
             }
 
@@ -12437,12 +13003,39 @@ instead of preserving ACLs that may have been modified during troubleshooting.
 
             # -- 5. Copy the replacement -----------------------------------------
             try {
+                $sourceHash = (Get-FileHash -LiteralPath $best.Path -Algorithm SHA256 -ErrorAction Stop).Hash
                 Invoke-Logged -Description 'Replace broken system file' -Details @{
                     Source = $best.Path
                     Destination = $targetPath
                 } -ScriptBlock {
                     Copy-Item -LiteralPath $best.Path -Destination $targetPath -Force -ErrorAction Stop
                 } | Out-Null
+                if (-not (Test-Path -LiteralPath $targetPath -PathType Leaf)) {
+                    throw "Replacement copy did not create a file at $targetPath."
+                }
+
+                $destinationHash = (Get-FileHash -LiteralPath $targetPath -Algorithm SHA256 -ErrorAction Stop).Hash
+                if ($sourceHash -ne $destinationHash) {
+                    throw "SHA-256 verification failed after copying the replacement."
+                }
+
+                $replacementPeInfo = $null
+                if ($portableExecutableExtensions -contains $ext) {
+                    $replacementPeInfo = Get-PortableExecutableInfo -FilePath $targetPath
+                    if ($replacementPeInfo.IsPortableExecutable -and $replacementPeInfo.Architecture -ne 'Unknown') {
+                        if ($guestArchitecture -ne 'Unknown' -and
+                            -not (Test-PortableExecutableArchitectureCompatible `
+                                -ExpectedArchitecture $guestArchitecture `
+                                -ActualArchitecture $replacementPeInfo.Architecture)) {
+                            throw "Replacement PE architecture $($replacementPeInfo.Architecture) ($($replacementPeInfo.Machine)) does not match guest architecture $guestArchitecture."
+                        }
+                        Write-Host "  [OK] Replacement PE architecture: $($replacementPeInfo.Architecture) ($($replacementPeInfo.Machine))." -ForegroundColor Green
+                    }
+                    else {
+                        Write-Warning "  The copied file's PE architecture could not be verified: $($replacementPeInfo.Error)"
+                    }
+                }
+
                 try {
                     $protectedAcl = New-ProtectedSystemFileAcl
                     Invoke-Logged -Description 'Apply protected system-file ACL' -Details @{
@@ -12481,11 +13074,36 @@ instead of preserving ACLs that may have been modified during troubleshooting.
                     Version       = $best.Version
                     Size          = $best.Size
                     Company       = $best.Company
+                    GuestArchitecture = $guestArchitecture
+                    CandidateArchitecture = $best.Architecture
+                    CandidateMachine = $best.Machine
                     PreviousState = $stateDesc
                 }
             }
             catch {
-                Write-Error "  Failed to copy replacement: $_"
+                $replacementError = $_
+                Write-Error "  Failed to replace or verify the system file: $replacementError"
+
+                if ($backupCreated) {
+                    try {
+                        if (Test-Path -LiteralPath $targetPath) {
+                            Remove-Item -LiteralPath $targetPath -Recurse -Force -ErrorAction Stop
+                        }
+                        Invoke-Logged -Description 'Roll back failed system file replacement' -Details @{
+                            Backup = $bakPath
+                            Destination = $targetPath
+                        } -ScriptBlock {
+                            Move-Item -LiteralPath $bakPath -Destination $targetPath -Force -ErrorAction Stop
+                        } | Out-Null
+                        Write-Warning "  Restored the original path from $bakPath."
+                    }
+                    catch {
+                        Write-Warning "  Automatic rollback failed: $($_.Exception.Message)"
+                    }
+                }
+                elseif (-not $targetExists -and (Test-Path -LiteralPath $targetPath)) {
+                    Remove-Item-Logged -Path $targetPath -Force
+                }
             }
         }
     }
@@ -15535,7 +16153,7 @@ PARAMETERS:
   -FixFileSystem         Run chkdsk on the Windows partition
     -DriveLetter <letter>    (sub-option) target a specific drive letter instead of the auto-detected Windows partition
   -FixSanPolicy          Set SAN policy to OnlineAll (fix offline disks after migration)
-  -RepairSystemFile <name[,name,...]>  Replace missing/0-byte system binary from WinSxS or DriverStore
+  -RepairSystemFile <name[,name,...]>  Replace missing/0-byte/wrong-architecture binary from WinSxS or DriverStore
   -RunSFC                Run SFC in offline mode
   -SetFullMemDump        Configure full memory dump + pagefile on C:
 
