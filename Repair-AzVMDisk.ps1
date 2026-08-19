@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.6.4
+        Version: 0.7.0
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -4794,13 +4794,13 @@ loaded from them must be unloaded first.
 
             Write-Host "Configuring full memory dump settings..." -ForegroundColor Yellow
             Set-ItemProperty-Logged -Path "$SystemRoot\Control\CrashControl" -Name CrashDumpEnabled -Value 1 -Type DWord -Force
-            Set-ItemProperty-Logged -Path "$SystemRoot\Control\CrashControl" -Name DumpFile -Value "C:\Windows\MEMORY.dmp" -Type ExpandString -Force
+            Set-ItemProperty-Logged -Path "$SystemRoot\Control\CrashControl" -Name DumpFile -Value "%SystemRoot%\MEMORY.DMP" -Type ExpandString -Force
             Set-ItemProperty-Logged -Path "$SystemRoot\Control\CrashControl" -Name DedicatedDumpFile -Value "C:\DD.sys" -Type String -Force
             Set-ItemProperty-Logged -Path "$SystemRoot\Control\CrashControl" -Name Overwrite -Value 1 -Type DWord -Force
             Set-ItemProperty-Logged -Path "$SystemRoot\Control\CrashControl" -Name NMICrashDump -Value 1 -Type DWord -Force
             Set-ItemProperty-Logged -Path "$SystemRoot\Control\CrashControl" -Name AutoReboot -Value 1 -Type DWord -Force
 
-            Write-Host "Check for dump as 'C:\Windows\MEMORY.dmp'." -ForegroundColor Green
+            Write-Host "Check for dump as '%SystemRoot%\MEMORY.DMP' (usually C:\Windows\MEMORY.DMP)." -ForegroundColor Green
 
             $CurrentPagefile = (Get-ItemProperty -Path "$SystemRoot\Control\Session Manager\Memory Management" -Name PagingFiles).PagingFiles
             if ($CurrentPagefile -notmatch "C:") {
@@ -4940,7 +4940,6 @@ The script will copy it to the guest before running bcdboot, then proceed with -
             $originalBcdInventory = $script:BcdInventory
             $originalLoaders = @($originalBcdInventory.Loaders)
             $originalSetupLoaders = @($originalLoaders | Where-Object { $_.IsSetupEntry })
-            $hideBootMenu = ($originalLoaders.Count -gt 1) -or ($originalSetupLoaders.Count -gt 0) -or ($script:WindowsInstallCandidates.Count -gt 1)
             if ($script:SelectedWindowsInstall) {
                 $selectedBuild = Format-WindowsBuildLabel -Build $script:SelectedWindowsInstall.CurrentBuildNumber -Ubr $script:SelectedWindowsInstall.UBR -Fallback 'unknown'
                 Write-Host "Selected Windows install for BCD rebuild: $($script:SelectedWindowsInstall.Drive) ($($script:SelectedWindowsInstall.ProductName), build $selectedBuild)" -ForegroundColor Cyan
@@ -4954,11 +4953,12 @@ The script will copy it to the guest before running bcdboot, then proceed with -
             # Apply additional boot configuration flags (same for both Gen1 and Gen2)
             $extraCmds = @(
                 "/set {bootmgr} default $identifier",
+                "/set {bootmgr} integrityservices enable",
                 "/set $identifier integrityservices enable",
                 "/set $identifier recoveryenabled Off",
                 "/set $identifier bootstatuspolicy IgnoreAllFailures",
-                "/set {bootmgr} displaybootmenu $(if ($hideBootMenu) { 'no' } else { 'yes' })",
-                "/set {bootmgr} timeout $(if ($hideBootMenu) { '0' } else { '5' })",
+                "/set {bootmgr} displaybootmenu yes",
+                "/set {bootmgr} timeout 5",
                 "/set {bootmgr} bootems yes",
                 "/ems $identifier on",
                 "/emssettings EMSPORT:1 EMSBAUDRATE:115200"
@@ -6032,22 +6032,35 @@ del /F C:\Temp\adduser.cmd > NUL
             # not only on the policy path, otherwise RDP remains blocked.
             Set-ItemProperty-Logged -Path $TSKeyPath -Name fDenyTSConnections -Value 0 -Type Dword -Force
 
-            # -- RDP-dependent services --------------------------------------------
-            # TermService (Remote Desktop Services) - must not be disabled.
-            # SessionEnv  (Remote Desktop Config)   - required for TermService to start.
-            # UmRdpService (Remote Desktop UserMode Port Redirector) - required for redirectors.
-            # All three default to Manual (3); set to Auto (2) so they survive reboots reliably.
+            # -- RDP and connectivity services --------------------------------------
+            # Startup values follow the Azure "Prepare a Windows VHD to upload" guidance:
+            #   Manual (3)    - TermService and its two helpers. Windows starts these on
+            #                   demand through the RDP listener trigger, so Manual is the
+            #                   supported default; forcing Automatic diverges from it.
+            #   Automatic (2) - the core networking stack. If any of these are Disabled the
+            #                   guest can lose TCP/IP, DHCP or the firewall engine outright,
+            #                   which presents as "no RDP" even when RDP itself is healthy.
+            # Only a Disabled (4) or missing value is corrected, so an intentional
+            # configuration is never overridden.
             $rdpServices = @(
-                @{ Name = 'TermService'; DefaultStart = 2 }
-                @{ Name = 'SessionEnv'; DefaultStart = 2 }
-                @{ Name = 'UmRdpService'; DefaultStart = 2 }
+                @{ Name = 'TermService'; DefaultStart = 3 }   # Remote Desktop Services
+                @{ Name = 'SessionEnv'; DefaultStart = 3 }   # Remote Desktop Configuration
+                @{ Name = 'UmRdpService'; DefaultStart = 3 }   # RD UserMode Port Redirector
+                @{ Name = 'nsi'; DefaultStart = 2 }   # Network Store Interface - TCP/IP fails without it
+                @{ Name = 'BFE'; DefaultStart = 2 }   # Base Filtering Engine - mpssvc cannot start without it
+                @{ Name = 'mpssvc'; DefaultStart = 2 }   # Windows Firewall
+                @{ Name = 'Dhcp'; DefaultStart = 2 }   # DHCP Client - no lease means no address
+                @{ Name = 'Dnscache'; DefaultStart = 2 }   # DNS Client
+                @{ Name = 'IKEEXT'; DefaultStart = 2 }   # IKE / AuthIP keying modules
+                @{ Name = 'iphlpsvc'; DefaultStart = 2 }   # IP Helper
             )
+            $startLabels = @{ 2 = 'Automatic (2)'; 3 = 'Manual (3)' }
             foreach ($svc in $rdpServices) {
                 $svcPath = "$SystemRoot\Services\$($svc.Name)"
                 if (Test-Path $svcPath) {
                     $current = (Get-ItemProperty $svcPath -ErrorAction SilentlyContinue).Start
                     if ($current -eq 4 -or $null -eq $current) {
-                        Write-Host "  $($svc.Name): Start was $(if ($null -eq $current) {'(not set)'} else {'Disabled (4)'}) -> setting to Auto (2)" -ForegroundColor Yellow
+                        Write-Host "  $($svc.Name): Start was $(if ($null -eq $current) {'(not set)'} else {'Disabled (4)'}) -> setting to $($startLabels[$svc.DefaultStart])" -ForegroundColor Yellow
                         Set-ItemProperty-Logged -Path $svcPath -Name Start -Value $svc.DefaultStart -Type DWord -Force
                     }
                     else {
@@ -6063,7 +6076,7 @@ del /F C:\Temp\adduser.cmd > NUL
 
             Set-ItemProperty-Logged -Path $RdpTcpPath -Name PortNumber -Value 3389 -Type Dword -Force
             Set-ItemProperty-Logged -Path $RdpTcpPath -Name fInheritReconnectSame -Value 1 -Type Dword -Force
-            Set-ItemProperty-Logged -Path $RdpTcpPath -Name fReconnectSame -Value 1 -Type Dword -Force
+            Set-ItemProperty-Logged -Path $RdpTcpPath -Name fReconnectSame -Value 0 -Type Dword -Force
             Set-ItemProperty-Logged -Path $RdpTcpPath -Name fInheritMaxSessionTime -Value 1 -Type Dword -Force
             Set-ItemProperty-Logged -Path $RdpTcpPath -Name fInheritMaxDisconnectionTime -Value 1 -Type Dword -Force
             Set-ItemProperty-Logged -Path $RdpTcpPath -Name MaxDisconnectionTime -Value 0 -Type Dword -Force
@@ -6075,11 +6088,28 @@ del /F C:\Temp\adduser.cmd > NUL
             Set-ItemProperty-Logged -Path $RdpTcpPath -Name TSServerDrainMode -Value 0 -Type Dword -Force
             Set-ItemProperty-Logged -Path $RdpTcpPath -Name fQueryUserConfigFromLocalMachine -Value 1 -Type Dword -Force
 
+            # KeepAliveTimeout lives on the listener key, not only under Policies.
+            # Writing just the policy copy leaves the listener running its own default.
+            Set-ItemProperty-Logged -Path $RdpTcpPath -Name KeepAliveTimeout -Value 1 -Type Dword -Force
+
             Set-ItemProperty-Logged -Path $TSPolicyPath -Name KeepAliveEnable -Value 1 -Type Dword -Force
             Set-ItemProperty-Logged -Path $TSPolicyPath -Name KeepAliveInterval -Value 1 -Type Dword -Force
             Set-ItemProperty-Logged -Path $TSPolicyPath -Name KeepAliveTimeout -Value 1 -Type Dword -Force
             Set-ItemProperty-Logged -Path $TSPolicyPath -Name fDenyTSConnections -Value 0 -Type Dword -Force
             Set-ItemProperty-Logged -Path $TSPolicyPath -Name fDisableAutoReconnect -Value 0 -Type Dword -Force
+
+            # -- Drop any certificate pinned to the RDP listener --------------------
+            # A stale or self-signed SSLCertificateSHA1Hash whose private key no longer
+            # resolves makes the TLS handshake fail before authentication, so the client
+            # sees a generic "internal error". Removing the value lets Windows fall back
+            # to regenerating a self-signed listener certificate on the next start.
+            if ((Get-Item -Path $RdpTcpPath -ErrorAction SilentlyContinue).Property -contains 'SSLCertificateSHA1Hash') {
+                Write-Host "Removing pinned RDP listener certificate (SSLCertificateSHA1Hash)..." -ForegroundColor Yellow
+                Remove-ItemProperty-Logged -Path $RdpTcpPath -Name SSLCertificateSHA1Hash -Force
+            }
+            else {
+                Write-Host "No pinned RDP listener certificate present (SSLCertificateSHA1Hash)." -ForegroundColor DarkGray
+            }
 
             $SSLPolicyPath = "HKLM:\BROKENSOFTWARE\Policies\Microsoft\Cryptography\Configuration\SSL\00010002"
             Write-Host "Clearing SSL 00010002 'Functions'..." -ForegroundColor Yellow
@@ -17105,7 +17135,7 @@ PARAMETERS:
   -DisableNLA            Disable Network Level Authentication
   -EnableNLA             Enable Network Level Authentication
   -EnableWinRMHTTPS      Configure WinRM HTTPS listener via startup script
-  -FixRDP                Reset RDP registry settings to defaults
+  -FixRDP                Reset RDP settings, clear pinned listener cert, restore net services
   -FixRDPAuth            Set optimal RDP/NLA/NTLM auth policy for recovery
   -FixRDPCert            Recreate the self-signed RDP certificate
   -FixRDPPermissions     Reset RDP private key and certificate service permissions

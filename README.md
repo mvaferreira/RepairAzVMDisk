@@ -164,7 +164,8 @@ You can also target a Hyper-V VM by name instead of disk number:
 ### RDP & Remote Access
 
 ```powershell
-# Fix common RDP settings (listener, port, firewall rules)
+# Reset RDP to Windows/Azure defaults — listener, port, keep-alive, pinned
+# listener certificate, and core networking service startup types
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixRDP
 
 # Disable NLA (Network Level Authentication) — useful when certs/trust are broken
