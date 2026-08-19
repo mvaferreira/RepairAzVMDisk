@@ -130,6 +130,18 @@ You can also target a Hyper-V VM by name instead of disk number:
 # Run chkdsk on a specific partition
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixFileSystem -DriveLetter H:
 
+# Repair NTFS metafile attribute list entries that carry a non-canonical name offset.
+# Symptom: the volume fails to mount and the guest boot loops with bugcheck
+# 0x24 (NTFS_FILE_SYSTEM). chkdsk does not correct this — it discards the whole
+# attribute list instead of fixing the field — so -FixFileSystem refuses to run
+# chkdsk while these entries are present and points here first.
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixNtfsAttributeList
+
+# Repair a single volume instead of every NTFS volume on the disk.
+# The original bytes of every modified region are written to a restore manifest
+# next to the action log before anything is changed.
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixNtfsAttributeList -DriveLetter H:
+
 # Run SFC (System File Checker) offline
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -RunSFC
 

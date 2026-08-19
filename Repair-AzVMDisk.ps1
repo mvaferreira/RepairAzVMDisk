@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.6.2
+        Version: 0.6.4
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -61,6 +61,36 @@
         helper. Before changing the value, the exact AppCs owner and DACL are captured,
         SYSTEM temporarily obtains FullControl, and the captured owner and DACL are restored
         and verified afterward. Each mutation is written to the action log.
+
+    .PARAMETER FixNtfsAttributeList
+        Repairs ATTRIBUTE_LIST_ENTRY records in the reserved MFT range (file records 0-31)
+        whose NameOffset field is 0x1c where the canonical layout uses 0x1a. Older NTFS
+        revisions accept that representation; newer ones validate it, reject the record
+        while resolving the referenced stream and fail the volume mount. In the guest this
+        appears as a boot loop with bugcheck 0x24 (NTFS_FILE_SYSTEM), typically right after
+        a servicing operation, and the volume mounts again if that operation is reverted.
+
+        This is the repair to use instead of chkdsk. chkdsk discards the entire attribute
+        list rather than correcting the field, which orphans every child record the list
+        referenced - including the $Secure metafile's $SDS security-descriptor stream - and
+        leaves the volume with default security descriptors.
+
+        Only the NameOffset byte and the attribute name position change; record lengths and
+        allocation are untouched. Every modified region is written to a restore manifest
+        beside the action log before the first write. Without -DriveLetter every NTFS volume
+        on the disk is inspected. -SysCheck reports the same condition read-only.
+
+    .EXAMPLE
+        # Detect the condition as part of the full offline scan
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -SysCheck
+
+    .EXAMPLE
+        # Repair NTFS metafile attribute list name offsets on every NTFS volume of disk 3
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixNtfsAttributeList
+
+    .EXAMPLE
+        # Repair a single volume only
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixNtfsAttributeList -DriveLetter H:
 
     .EXAMPLE
         # Run a full diagnostic check on disk 3
@@ -119,6 +149,7 @@ param (
     [Parameter(ParameterSetName = 'Repair')][string]$VMName = "",
     [Parameter(ParameterSetName = 'Repair')][int]$DiskNumber = -1,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixFileSystem,
+    [Parameter(ParameterSetName = 'Repair')][switch]$FixNtfsAttributeList,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixBoot,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixSecureBootCodeIntegrity,
     [Parameter(ParameterSetName = 'Repair')][switch]$Force,
@@ -256,6 +287,7 @@ dynamicparam {
     # Other repair parameters remain valid when typed explicitly, preserving batch use.
     $subParameterParents = @(
         'FixFileSystem',
+        'FixNtfsAttributeList',
         'FixSecureBootCodeIntegrity',
         'RepairComponentStore',
         'GetServicesReport',
@@ -298,8 +330,8 @@ dynamicparam {
         }
     }
 
-    # -DriveLetter: sub-option of -FixFileSystem
-    if ($PSBoundParameters.ContainsKey('FixFileSystem')) {
+    # -DriveLetter: sub-option of -FixFileSystem and -FixNtfsAttributeList
+    if ($PSBoundParameters.ContainsKey('FixFileSystem') -or $PSBoundParameters.ContainsKey('FixNtfsAttributeList')) {
         & $addParam 'DriveLetter' ([string]) 'Repair' ''
     }
     # -CodeIntegrityPolicySourcePath: sub-option of -FixSecureBootCodeIntegrity
@@ -3611,9 +3643,556 @@ finally {
         return $result
     }
 
+    # -------------------------------------------------------------------------
+    # NTFS metafile $ATTRIBUTE_LIST helpers
+    #
+    # A reserved MFT record (file record 0-31) can carry an ATTRIBUTE_LIST_ENTRY
+    # whose NameOffset field is 0x1c where the canonical layout uses 0x1a. Older
+    # NTFS revisions accept that representation; newer ones validate it, reject
+    # the record while resolving the referenced stream and fail the volume mount.
+    # In the guest this surfaces as a boot loop with bugcheck 0x24
+    # (NTFS_FILE_SYSTEM), typically immediately after a servicing operation, and
+    # the volume mounts again if that servicing operation is reverted.
+    #
+    # The costly instance is the $Secure metafile (file record 9), whose
+    # attribute list references the $SDS security-descriptor stream. chkdsk is
+    # not a safe repair for this: it discards the entire attribute list instead
+    # of correcting the field, which orphans every child record the list pointed
+    # at - including $SDS - and leaves the volume with default security
+    # descriptors. The repair implemented here rewrites the single NameOffset
+    # byte and shifts the attribute name back two bytes, leaving record lengths,
+    # allocation and every other structure untouched.
+    # -------------------------------------------------------------------------
+
+    # Canonical vs. known-bad ATTRIBUTE_LIST_ENTRY.NameOffset values.
+    $script:NtfsAttrListGoodNameOffset = 0x1A
+    $script:NtfsAttrListBadNameOffset = 0x1C
+    # Reserved/system file record range scanned for the condition.
+    $script:NtfsAttrListMaxFrn = 31
+
+    function Initialize-NtfsRawVolumeIo {
+        # Raw volume read/write primitives. Loaded on demand so the script has no
+        # cost when no attribute-list operation is requested.
+        if (([System.Management.Automation.PSTypeName]'RepairAzVMDiskRawVolumeIo').Type) { return }
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class RepairAzVMDiskRawVolumeIo
+{
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern SafeFileHandle CreateFileW(
+        string lpFileName, uint dwDesiredAccess, uint dwShareMode,
+        IntPtr lpSecurityAttributes, uint dwCreationDisposition,
+        uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool ReadFile(SafeFileHandle hFile, byte[] lpBuffer,
+        uint nNumberOfBytesToRead, out uint lpNumberOfBytesRead, IntPtr lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool WriteFile(SafeFileHandle hFile, byte[] lpBuffer,
+        uint nNumberOfBytesToWrite, out uint lpNumberOfBytesWritten, IntPtr lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetFilePointerEx(SafeFileHandle hFile,
+        long liDistanceToMove, out long lpNewFilePointer, uint dwMoveMethod);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool FlushFileBuffers(SafeFileHandle hFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool DeviceIoControl(SafeFileHandle hDevice, uint dwIoControlCode,
+        IntPtr lpInBuffer, uint nInBufferSize, IntPtr lpOutBuffer, uint nOutBufferSize,
+        out uint lpBytesReturned, IntPtr lpOverlapped);
+
+    private const uint GENERIC_READ          = 0x80000000;
+    private const uint GENERIC_WRITE         = 0x40000000;
+    private const uint FILE_SHARE_RW         = 0x00000003;
+    private const uint OPEN_EXISTING         = 3;
+    private const uint FSCTL_LOCK_VOLUME     = 0x00090018;
+    private const uint FSCTL_UNLOCK_VOLUME   = 0x0009001C;
+    private const uint FSCTL_DISMOUNT_VOLUME = 0x00090020;
+
+    public static SafeFileHandle OpenVolume(string path, bool forWrite)
+    {
+        uint access = GENERIC_READ | (forWrite ? GENERIC_WRITE : 0);
+        SafeFileHandle handle = CreateFileW(path, access, FILE_SHARE_RW, IntPtr.Zero,
+                                            OPEN_EXISTING, 0, IntPtr.Zero);
+        if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+        return handle;
+    }
+
+    public static byte[] Read(SafeFileHandle handle, long offset, int size)
+    {
+        long position;
+        if (!SetFilePointerEx(handle, offset, out position, 0))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        byte[] buffer = new byte[size];
+        uint read;
+        if (!ReadFile(handle, buffer, (uint)size, out read, IntPtr.Zero))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        if (read != (uint)size)
+            throw new IOException("Short read at offset " + offset + ": expected " + size + " bytes, got " + read + ".");
+        return buffer;
+    }
+
+    public static void Write(SafeFileHandle handle, long offset, byte[] data)
+    {
+        long position;
+        if (!SetFilePointerEx(handle, offset, out position, 0))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        uint written;
+        if (!WriteFile(handle, data, (uint)data.Length, out written, IntPtr.Zero))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        if (written != (uint)data.Length)
+            throw new IOException("Short write at offset " + offset + ": expected " + data.Length + " bytes, wrote " + written + ".");
+    }
+
+    public static void Flush(SafeFileHandle handle)
+    {
+        if (!FlushFileBuffers(handle))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+    }
+
+    public static void LockVolume(SafeFileHandle handle)
+    {
+        uint returned;
+        if (!DeviceIoControl(handle, FSCTL_LOCK_VOLUME, IntPtr.Zero, 0, IntPtr.Zero, 0, out returned, IntPtr.Zero))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+    }
+
+    public static void DismountVolume(SafeFileHandle handle)
+    {
+        uint returned;
+        if (!DeviceIoControl(handle, FSCTL_DISMOUNT_VOLUME, IntPtr.Zero, 0, IntPtr.Zero, 0, out returned, IntPtr.Zero))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+    }
+
+    public static void UnlockVolume(SafeFileHandle handle)
+    {
+        uint returned;
+        DeviceIoControl(handle, FSCTL_UNLOCK_VOLUME, IntPtr.Zero, 0, IntPtr.Zero, 0, out returned, IntPtr.Zero);
+    }
+}
+'@
+    }
+
+    function Get-NtfsLeUInt16 { param([byte[]]$Buffer, [int]$Offset) return [BitConverter]::ToUInt16($Buffer, $Offset) }
+    function Get-NtfsLeUInt32 { param([byte[]]$Buffer, [int]$Offset) return [BitConverter]::ToUInt32($Buffer, $Offset) }
+    function Get-NtfsLeUInt64 { param([byte[]]$Buffer, [int]$Offset) return [BitConverter]::ToUInt64($Buffer, $Offset) }
+
+    function ConvertTo-NtfsVolumePath {
+        # Accepts 'F', 'F:', 'F:\' or '\\.\F:' and returns the raw device form '\\.\F:'.
+        param([Parameter(Mandatory)][string]$Volume)
+        $value = $Volume.Trim()
+        if ($value -match '^\\\\[.?]\\') { return ($value.TrimEnd('\')) }
+        $letter = $value.TrimEnd('\').TrimEnd(':')
+        if ($letter -notmatch '^[A-Za-z]$') { throw "Unsupported volume specification: $Volume" }
+        return "\\.\$($letter.ToUpperInvariant()):"
+    }
+
+    function Read-NtfsVolumeAligned {
+        # Raw volume handles only accept sector-aligned offsets and sector-multiple
+        # sizes. Reads the enclosing aligned window and returns just the requested slice.
+        param(
+            [Parameter(Mandatory)]$Handle,
+            [Parameter(Mandatory)][long]$Offset,
+            [Parameter(Mandatory)][int]$Size,
+            [Parameter(Mandatory)][int]$BytesPerSector
+        )
+        $start = [long]([math]::Floor($Offset / $BytesPerSector) * $BytesPerSector)
+        $delta = [int]($Offset - $start)
+        $span = [int]([math]::Ceiling(($delta + $Size) / [double]$BytesPerSector) * $BytesPerSector)
+        $window = [RepairAzVMDiskRawVolumeIo]::Read($Handle, $start, $span)
+        $result = New-Object byte[] $Size
+        [Array]::Copy($window, $delta, $result, 0, $Size)
+        # Comma operator: a bare 'return $result' unrolls the byte[] into the
+        # pipeline, so the caller receives an Object[]. Binding that to a
+        # [byte[]] parameter silently converts it to a *new* array, which would
+        # discard in-place multi-sector fixups applied by the callee.
+        return , $result
+    }
+
+    function Write-NtfsVolumeAligned {
+        # Sector-aligned read-modify-write so callers can patch arbitrary offsets.
+        param(
+            [Parameter(Mandatory)]$Handle,
+            [Parameter(Mandatory)][long]$Offset,
+            [Parameter(Mandatory)][byte[]]$Data,
+            [Parameter(Mandatory)][int]$BytesPerSector
+        )
+        $start = [long]([math]::Floor($Offset / $BytesPerSector) * $BytesPerSector)
+        $delta = [int]($Offset - $start)
+        $span = [int]([math]::Ceiling(($delta + $Data.Length) / [double]$BytesPerSector) * $BytesPerSector)
+        $window = [RepairAzVMDiskRawVolumeIo]::Read($Handle, $start, $span)
+        [Array]::Copy($Data, 0, $window, $delta, $Data.Length)
+        [RepairAzVMDiskRawVolumeIo]::Write($Handle, $start, $window)
+    }
+
+    function Convert-NtfsMappingPairs {
+        # Decodes an NTFS mapping-pairs run list into absolute LCN/cluster-count pairs.
+        param([byte[]]$Record, [int]$StartOffset)
+        $runs = [System.Collections.Generic.List[PSCustomObject]]::new()
+        $lcn = [long]0
+        $pos = $StartOffset
+        while ($pos -lt $Record.Length) {
+            $header = $Record[$pos]
+            if ($header -eq 0) { break }
+            $pos++
+            $lengthSize = $header -band 0x0F
+            $offsetSize = ($header -shr 4) -band 0x0F
+            if ($lengthSize -eq 0 -or ($pos + $lengthSize + $offsetSize) -gt $Record.Length) { break }
+
+            [long]$runLength = 0
+            for ($i = 0; $i -lt $lengthSize; $i++) { $runLength = $runLength -bor ([long]$Record[$pos + $i] -shl ($i * 8)) }
+            $pos += $lengthSize
+
+            if ($offsetSize -gt 0) {
+                [long]$runOffset = 0
+                for ($i = 0; $i -lt $offsetSize; $i++) { $runOffset = $runOffset -bor ([long]$Record[$pos + $i] -shl ($i * 8)) }
+                # Sign-extend the delta: run offsets are signed and may move backwards.
+                if ($Record[$pos + $offsetSize - 1] -band 0x80) {
+                    for ($i = $offsetSize; $i -lt 8; $i++) { $runOffset = $runOffset -bor ([long]0xFF -shl ($i * 8)) }
+                }
+                $pos += $offsetSize
+                $lcn += $runOffset
+            }
+            if ($runLength -le 0) { break }
+            $runs.Add([PSCustomObject]@{ Lcn = $lcn; Clusters = $runLength })
+        }
+        return $runs
+    }
+
+    function Get-NtfsAttributeTypeName {
+        param([uint32]$TypeCode)
+        switch ($TypeCode) {
+            0x10 { '$STANDARD_INFORMATION' }
+            0x20 { '$ATTRIBUTE_LIST' }
+            0x30 { '$FILE_NAME' }
+            0x40 { '$OBJECT_ID' }
+            0x50 { '$SECURITY_DESCRIPTOR' }
+            0x60 { '$VOLUME_NAME' }
+            0x70 { '$VOLUME_INFORMATION' }
+            0x80 { '$DATA' }
+            0x90 { '$INDEX_ROOT' }
+            0xA0 { '$INDEX_ALLOCATION' }
+            0xB0 { '$BITMAP' }
+            0xC0 { '$REPARSE_POINT' }
+            0x100 { '$LOGGED_UTILITY_STREAM' }
+            default { "0x$($TypeCode.ToString('x'))" }
+        }
+    }
+
+    function Resolve-NtfsUsaFixup {
+        # Applies the update-sequence-array fixup in place (on-disk -> in-memory).
+        # Returns $false when the record's sector tails do not carry the expected
+        # update sequence number, which means the record is not safe to interpret.
+        param([byte[]]$Record, [int]$BytesPerSector)
+        $usaOffset = Get-NtfsLeUInt16 $Record 4
+        $usaCount = Get-NtfsLeUInt16 $Record 6
+        if ($usaCount -lt 1 -or ($usaOffset + $usaCount * 2) -gt $Record.Length) { return $false }
+        $usn = Get-NtfsLeUInt16 $Record $usaOffset
+        for ($i = 1; $i -lt $usaCount; $i++) {
+            $sectorEnd = $i * $BytesPerSector - 2
+            if (($sectorEnd + 2) -gt $Record.Length) { return $false }
+            if ((Get-NtfsLeUInt16 $Record $sectorEnd) -ne $usn) { return $false }
+            $stored = Get-NtfsLeUInt16 $Record ($usaOffset + $i * 2)
+            $Record[$sectorEnd] = [byte]($stored -band 0xFF)
+            $Record[$sectorEnd + 1] = [byte](($stored -shr 8) -band 0xFF)
+        }
+        return $true
+    }
+
+    function Set-NtfsUsaFixup {
+        # Re-applies the update-sequence-array fixup in place (in-memory -> on-disk).
+        # Exact inverse of Resolve-NtfsUsaFixup, so a record can be patched in its
+        # readable form and written back without corrupting the sector tails.
+        param([byte[]]$Record, [int]$BytesPerSector)
+        $usaOffset = Get-NtfsLeUInt16 $Record 4
+        $usaCount = Get-NtfsLeUInt16 $Record 6
+        $usn = Get-NtfsLeUInt16 $Record $usaOffset
+        for ($i = 1; $i -lt $usaCount; $i++) {
+            $sectorEnd = $i * $BytesPerSector - 2
+            $real = Get-NtfsLeUInt16 $Record $sectorEnd
+            $Record[$usaOffset + $i * 2] = [byte]($real -band 0xFF)
+            $Record[$usaOffset + $i * 2 + 1] = [byte](($real -shr 8) -band 0xFF)
+            $Record[$sectorEnd] = [byte]($usn -band 0xFF)
+            $Record[$sectorEnd + 1] = [byte](($usn -shr 8) -band 0xFF)
+        }
+    }
+
+    function Get-NtfsAttributeListLocation {
+        # Locates the $ATTRIBUTE_LIST attribute inside a fixed-up file record and
+        # describes where its value lives (inside the record, or in disk runs).
+        param(
+            [byte[]]$FileRecord,
+            [long]$FileRecordOffset,
+            [int]$ClusterSize
+        )
+        $pos = Get-NtfsLeUInt16 $FileRecord 0x14
+        while (($pos + 8) -le $FileRecord.Length) {
+            $typeCode = Get-NtfsLeUInt32 $FileRecord $pos
+            # Compare against [uint32]::MaxValue: the literal 0xFFFFFFFF parses as
+            # Int32 -1, which never equals an unsigned type code.
+            if ($typeCode -eq [uint32]::MaxValue) { break }
+            $recordLength = Get-NtfsLeUInt32 $FileRecord ($pos + 4)
+            if ($recordLength -lt 16 -or ($pos + $recordLength) -gt $FileRecord.Length) { break }
+
+            if ($typeCode -eq 0x20) {
+                $isResident = ($FileRecord[$pos + 8] -eq 0)
+                if ($isResident) {
+                    $valueLength = Get-NtfsLeUInt32 $FileRecord ($pos + 0x10)
+                    $valueOffset = Get-NtfsLeUInt16 $FileRecord ($pos + 0x14)
+                    if (($pos + $valueOffset + $valueLength) -gt $FileRecord.Length) { return $null }
+                    return [PSCustomObject]@{
+                        IsResident       = $true
+                        DataSize         = [int]$valueLength
+                        RecordValueStart = [int]($pos + $valueOffset)
+                        Runs             = @()
+                    }
+                }
+                $mappingOffset = Get-NtfsLeUInt16 $FileRecord ($pos + 0x20)
+                $dataSize = Get-NtfsLeUInt64 $FileRecord ($pos + 0x30)
+                $runs = @(Convert-NtfsMappingPairs -Record $FileRecord -StartOffset ($pos + $mappingOffset))
+                if ($runs.Count -eq 0) { return $null }
+                return [PSCustomObject]@{
+                    IsResident       = $false
+                    DataSize         = [int]$dataSize
+                    RecordValueStart = -1
+                    Runs             = $runs
+                }
+            }
+            $pos += $recordLength
+        }
+        return $null
+    }
+
+    function Get-NtfsVolumeGeometry {
+        # Reads NTFS boot-sector geometry through an open raw volume handle.
+        param([Parameter(Mandatory)]$Handle)
+        # 4096 covers both 512-byte and 4Kn sector sizes in a single aligned read.
+        $boot = [RepairAzVMDiskRawVolumeIo]::Read($Handle, 0, 4096)
+        if ([System.Text.Encoding]::ASCII.GetString($boot, 3, 4) -ne 'NTFS') {
+            throw 'Volume does not carry an NTFS boot sector.'
+        }
+        $bytesPerSector = Get-NtfsLeUInt16 $boot 0x0B
+        # Sectors-per-cluster and clusters-per-record both switch to a signed
+        # representation once the value no longer fits a byte: N > 0x80 means
+        # 2^(256-N) rather than N literally.
+        $rawSectorsPerCluster = $boot[0x0D]
+        $sectorsPerCluster = if ($rawSectorsPerCluster -le 0x80) { [int]$rawSectorsPerCluster } else { 1 -shl (256 - $rawSectorsPerCluster) }
+        if ($bytesPerSector -le 0 -or $sectorsPerCluster -le 0) { throw 'Invalid NTFS boot sector geometry.' }
+        $clusterSize = $bytesPerSector * $sectorsPerCluster
+        $rawRecordSize = $boot[0x40]
+        $recordSize = if ($rawRecordSize -lt 0x80) { $rawRecordSize * $clusterSize } else { 1 -shl (256 - $rawRecordSize) }
+        return [PSCustomObject]@{
+            BytesPerSector = [int]$bytesPerSector
+            ClusterSize    = [int]$clusterSize
+            MftLcn         = [long](Get-NtfsLeUInt64 $boot 0x30)
+            RecordSize     = [int]$recordSize
+        }
+    }
+
+    function Get-NtfsMetafileAttrListState {
+        # Read-only scan of the reserved file records on one volume. Reports every
+        # ATTRIBUTE_LIST_ENTRY whose NameOffset is not the canonical 0x1a, split into
+        # entries this script can repair (0x1c) and entries it will not touch.
+        # Never writes; safe to call from diagnostic paths. Pass an already-open
+        # handle to scan under a lock the caller is holding.
+        param(
+            [Parameter(Mandatory)][string]$Volume,
+            $Handle = $null
+        )
+
+        Initialize-NtfsRawVolumeIo
+        $volumePath = ConvertTo-NtfsVolumePath -Volume $Volume
+        $result = [PSCustomObject]@{
+            Volume     = $volumePath
+            Label      = ($volumePath -replace '^\\\\[.?]\\', '')
+            Scanned    = $false
+            Geometry   = $null
+            Records    = @()
+            Fixable    = 0
+            Unfixable  = 0
+            Error      = ''
+        }
+
+        $ownsHandle = ($null -eq $Handle)
+        $handle = $Handle
+        try {
+            if ($ownsHandle) { $handle = [RepairAzVMDiskRawVolumeIo]::OpenVolume($volumePath, $false) }
+            $geometry = Get-NtfsVolumeGeometry -Handle $handle
+            $result.Geometry = $geometry
+            $records = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+            for ($frn = 0; $frn -le $script:NtfsAttrListMaxFrn; $frn++) {
+                $recordOffset = [long]$geometry.MftLcn * $geometry.ClusterSize + $frn * $geometry.RecordSize
+                $record = Read-NtfsVolumeAligned -Handle $handle -Offset $recordOffset -Size $geometry.RecordSize -BytesPerSector $geometry.BytesPerSector
+
+                if ([System.Text.Encoding]::ASCII.GetString($record, 0, 4) -ne 'FILE') { continue }
+                $flags = Get-NtfsLeUInt16 $record 0x16
+                if (($flags -band 0x01) -eq 0) { continue }
+                if (-not (Resolve-NtfsUsaFixup -Record $record -BytesPerSector $geometry.BytesPerSector)) { continue }
+
+                $location = Get-NtfsAttributeListLocation -FileRecord $record -FileRecordOffset $recordOffset -ClusterSize $geometry.ClusterSize
+                if ($null -eq $location) { continue }
+
+                # Materialise the attribute-list bytes. Resident lists come from the
+                # fixed-up record; non-resident lists are read from their runs, whole
+                # runs at a time so the write-back path stays cluster-aligned.
+                $listBytes = $null
+                if ($location.IsResident) {
+                    $listBytes = New-Object byte[] $location.DataSize
+                    [Array]::Copy($record, $location.RecordValueStart, $listBytes, 0, $location.DataSize)
+                }
+                else {
+                    $allocated = 0
+                    foreach ($run in $location.Runs) { $allocated += [int]($run.Clusters * $geometry.ClusterSize) }
+                    if ($allocated -lt $location.DataSize) { continue }
+                    $listBytes = New-Object byte[] $allocated
+                    $cursor = 0
+                    foreach ($run in $location.Runs) {
+                        $runBytes = [int]($run.Clusters * $geometry.ClusterSize)
+                        $chunk = Read-NtfsVolumeAligned -Handle $handle -Offset ([long]$run.Lcn * $geometry.ClusterSize) -Size $runBytes -BytesPerSector $geometry.BytesPerSector
+                        [Array]::Copy($chunk, 0, $listBytes, $cursor, $runBytes)
+                        $cursor += $runBytes
+                    }
+                }
+
+                $entries = [System.Collections.Generic.List[PSCustomObject]]::new()
+                $malformed = $false
+                $position = 0
+                while (($position + 8) -le $location.DataSize) {
+                    $typeCode = Get-NtfsLeUInt32 $listBytes $position
+                    if ($typeCode -eq 0 -or $typeCode -eq [uint32]::MaxValue) { break }
+                    $entryLength = Get-NtfsLeUInt16 $listBytes ($position + 4)
+                    if ($entryLength -lt 0x1A -or ($position + $entryLength) -gt $location.DataSize) { $malformed = $true; break }
+
+                    $nameLength = $listBytes[$position + 6]
+                    $nameOffset = $listBytes[$position + 7]
+                    $name = ''
+                    if ($nameLength -gt 0 -and ($nameOffset + $nameLength * 2) -le $entryLength) {
+                        $name = [System.Text.Encoding]::Unicode.GetString($listBytes, $position + $nameOffset, $nameLength * 2)
+                    }
+
+                    if ($nameOffset -ne $script:NtfsAttrListGoodNameOffset) {
+                        $canRepair = ($nameOffset -eq $script:NtfsAttrListBadNameOffset) -and
+                                     ($nameLength -gt 0) -and
+                                     (($script:NtfsAttrListGoodNameOffset + $nameLength * 2) -le $entryLength) -and
+                                     (($nameOffset + $nameLength * 2) -le $entryLength)
+                        $entries.Add([PSCustomObject]@{
+                            EntryOffset = $position
+                            TypeCode    = $typeCode
+                            TypeName    = Get-NtfsAttributeTypeName $typeCode
+                            NameLength  = $nameLength
+                            NameOffset  = $nameOffset
+                            Name        = $name
+                            CanRepair   = $canRepair
+                        })
+                    }
+                    $position += $entryLength
+                }
+
+                if ($entries.Count -gt 0 -or $malformed) {
+                    $records.Add([PSCustomObject]@{
+                        Frn              = $frn
+                        Name             = Get-NtfsMetafileName -Frn $frn
+                        IsResident       = $location.IsResident
+                        Malformed        = $malformed
+                        RecordOffset     = $recordOffset
+                        RecordValueStart = $location.RecordValueStart
+                        DataSize         = $location.DataSize
+                        Runs             = @($location.Runs)
+                        Entries          = @($entries)
+                    })
+                }
+            }
+
+            $result.Records = @($records)
+            $result.Fixable = @($records | ForEach-Object { $_.Entries } | Where-Object { $_.CanRepair }).Count
+            $result.Unfixable = @($records | ForEach-Object { $_.Entries } | Where-Object { -not $_.CanRepair }).Count
+            $result.Scanned = $true
+        }
+        catch {
+            $result.Error = $_.Exception.Message
+        }
+        finally {
+            if ($ownsHandle -and $handle -and -not $handle.IsClosed) { $handle.Close() }
+        }
+
+        return $result
+    }
+
+    function Get-NtfsMetafileName {
+        # Friendly name for the well-known reserved file records.
+        param([int]$Frn)
+        switch ($Frn) {
+            0 { '$MFT' }
+            1 { '$MFTMirr' }
+            2 { '$LogFile' }
+            3 { '$Volume' }
+            4 { '$AttrDef' }
+            5 { '. (root)' }
+            6 { '$Bitmap' }
+            7 { '$Boot' }
+            8 { '$BadClus' }
+            9 { '$Secure' }
+            10 { '$UpCase' }
+            11 { '$Extend' }
+            default { "file record $Frn" }
+        }
+    }
+
+    function Get-NtfsAttrListScanTargets {
+        # NTFS volumes on the attached guest disk that currently carry a drive
+        # letter. The condition is per-volume, so every NTFS partition is scanned
+        # rather than just the Windows partition.
+        param([int]$DiskNumber = -1)
+        $targets = [System.Collections.Generic.List[string]]::new()
+        $number = if ($DiskNumber -ge 0) { $DiskNumber } else { $script:DiskNumber }
+        if ($null -eq $number -or $number -lt 0) { return $targets }
+        foreach ($partition in (Get-Partition -DiskNumber $number -ErrorAction SilentlyContinue)) {
+            if (-not $partition.DriveLetter -or $partition.DriveLetter -eq "`0") { continue }
+            $volume = Get-Volume -Partition $partition -ErrorAction SilentlyContinue
+            if (-not $volume -or $volume.FileSystemType -ne 'NTFS') { continue }
+            $targets.Add("$($partition.DriveLetter):") | Out-Null
+        }
+        return $targets
+    }
+
     function FixDiskCorruption {
         param([string]$DriveLetter = '')
         $target = if ($DriveLetter) { $DriveLetter.TrimEnd('\') } else { $script:WinDriveLetter.TrimEnd('\') }
+
+        # chkdsk is not a safe repair when a reserved file record carries a
+        # non-canonical attribute list name offset: it discards the attribute list
+        # rather than correcting the field, which orphans every child record the
+        # list referenced - including the $Secure metafile's $SDS stream - and
+        # leaves the volume with default security descriptors. Repair that first.
+        try {
+            $attrGuard = Get-NtfsMetafileAttrListState -Volume $target
+            if ($attrGuard.Scanned -and ($attrGuard.Fixable -gt 0 -or $attrGuard.Unfixable -gt 0)) {
+                Write-Host ""
+                Write-Warning "$target carries NTFS metafile attribute list entries with a non-canonical name offset."
+                Show-NtfsAttrListFindings -State $attrGuard
+                Write-Warning "chkdsk was NOT run: it discards the whole attribute list instead of correcting the field, which drops the child records it referenced."
+                if ($attrGuard.Fixable -gt 0) {
+                    Write-Host "  Run -FixNtfsAttributeList -DriveLetter $target first, then repeat -FixFileSystem." -ForegroundColor Cyan
+                }
+                Write-ActionLog -Event 'FixDiskCorruptionBlocked' -Details @{
+                    Target    = $target
+                    Reason    = 'Non-canonical NTFS metafile attribute list name offset present'
+                    Fixable   = $attrGuard.Fixable
+                    Unfixable = $attrGuard.Unfixable
+                }
+                return
+            }
+        }
+        catch { Write-Warning "Attribute list pre-check failed for ${target}: $_" }
 
         # Inline helper: run the requested chkdsk mode against $target.
         $runChkdsk = {
@@ -3707,6 +4286,292 @@ finally {
             RepairBefore = $before.State.RepairState
             RepairAfter  = $after.State.RepairState
             HealthAfter  = $after.Health
+        }
+    }
+
+    function Set-NtfsAttrListEntryNameOffset {
+        # Rewrites one ATTRIBUTE_LIST_ENTRY to the canonical layout: shifts the
+        # attribute name back two bytes and sets NameOffset to 0x1a.
+        #
+        # RecordLength is deliberately left untouched. The entry keeps its original
+        # size and the two freed trailing bytes become zero padding, so neither the
+        # attribute list's length nor its on-disk allocation changes - which is what
+        # keeps this a single-record edit rather than a structural rewrite.
+        param(
+            [Parameter(Mandatory)][byte[]]$Buffer,
+            [Parameter(Mandatory)][int]$EntryStart,
+            [Parameter(Mandatory)][int]$NameLength
+        )
+        $good = $script:NtfsAttrListGoodNameOffset
+        $bad = $script:NtfsAttrListBadNameOffset
+        $byteCount = $NameLength * 2
+        $nameBytes = New-Object byte[] $byteCount
+        [Array]::Copy($Buffer, $EntryStart + $bad, $nameBytes, 0, $byteCount)
+        for ($i = 0; $i -lt $byteCount; $i++) { $Buffer[$EntryStart + $bad + $i] = 0 }
+        [Array]::Copy($nameBytes, 0, $Buffer, $EntryStart + $good, $byteCount)
+        $Buffer[$EntryStart + 7] = [byte]$good
+    }
+
+    function Show-NtfsAttrListFindings {
+        # Console rendering shared by the scan and repair paths.
+        param([Parameter(Mandatory)]$State)
+        if ($State.Records.Count -eq 0) {
+            Write-Host "  [OK] $($State.Label): all attribute list entries use the canonical name offset." -ForegroundColor Green
+            return
+        }
+        foreach ($record in $State.Records) {
+            if ($record.Malformed) {
+                Write-Host "  $($State.Label) $($record.Name): attribute list is truncated or malformed - not repairable here." -ForegroundColor Red
+            }
+            foreach ($entry in $record.Entries) {
+                $label = if ($entry.Name) { "$($entry.TypeName):$($entry.Name)" } else { $entry.TypeName }
+                $offsetText = "0x$($entry.NameOffset.ToString('x2'))"
+                if ($entry.CanRepair) {
+                    Write-Host "  $($State.Label) $($record.Name): $label  NameOffset=$offsetText (repairable)" -ForegroundColor Yellow
+                }
+                else {
+                    Write-Host "  $($State.Label) $($record.Name): $label  NameOffset=$offsetText (not repairable)" -ForegroundColor Red
+                }
+            }
+        }
+    }
+
+    function Repair-NtfsAttrListVolume {
+        # Applies the canonical name offset to one volume. The volume is locked and
+        # dismounted first, then re-scanned through the same handle so the repair
+        # acts on exactly the bytes it validated. Every region is captured to a
+        # restore manifest before the first write.
+        param([Parameter(Mandatory)][string]$Volume)
+
+        $volumePath = ConvertTo-NtfsVolumePath -Volume $Volume
+        $label = $volumePath -replace '^\\\\[.?]\\', ''
+        $handle = $null
+        $locked = $false
+        $repaired = 0
+        $backupPath = ''
+
+        try {
+            try {
+                $handle = [RepairAzVMDiskRawVolumeIo]::OpenVolume($volumePath, $true)
+                [RepairAzVMDiskRawVolumeIo]::LockVolume($handle)
+                $locked = $true
+                [RepairAzVMDiskRawVolumeIo]::DismountVolume($handle)
+            }
+            catch {
+                Write-Warning "$label could not be locked for exclusive access: $($_.Exception.Message)"
+                Write-Warning "Close any open handles to $label and unload offline hives (-UnloadHive SYSTEM, SOFTWARE, ...) before retrying."
+                return 0
+            }
+
+            $state = Get-NtfsMetafileAttrListState -Volume $volumePath -Handle $handle
+            if (-not $state.Scanned) { throw "Re-scan under volume lock failed: $($state.Error)" }
+            $geometry = $state.Geometry
+
+            # Pass 1: compute every byte range that will change. Nothing is written yet.
+            $operations = [System.Collections.Generic.List[PSCustomObject]]::new()
+            $planned = [System.Collections.Generic.List[string]]::new()
+
+            foreach ($record in $state.Records) {
+                $fixable = @($record.Entries | Where-Object { $_.CanRepair })
+                if ($fixable.Count -eq 0) { continue }
+
+                if ($record.IsResident) {
+                    $frs = Read-NtfsVolumeAligned -Handle $handle -Offset $record.RecordOffset -Size $geometry.RecordSize -BytesPerSector $geometry.BytesPerSector
+                    $original = $frs.Clone()
+                    if (-not (Resolve-NtfsUsaFixup -Record $frs -BytesPerSector $geometry.BytesPerSector)) {
+                        Write-Warning "  $label $($record.Name): update sequence check failed on re-read; skipped."
+                        continue
+                    }
+                    foreach ($entry in $fixable) {
+                        Set-NtfsAttrListEntryNameOffset -Buffer $frs -EntryStart ($record.RecordValueStart + $entry.EntryOffset) -NameLength $entry.NameLength
+                    }
+                    # Restore the sector tails so the record is written back in on-disk form.
+                    Set-NtfsUsaFixup -Record $frs -BytesPerSector $geometry.BytesPerSector
+                    $operations.Add([PSCustomObject]@{ Offset = [long]$record.RecordOffset; Original = $original; Updated = $frs }) | Out-Null
+                }
+                else {
+                    $allocated = 0
+                    foreach ($run in $record.Runs) { $allocated += [int]($run.Clusters * $geometry.ClusterSize) }
+                    $buffer = New-Object byte[] $allocated
+                    $cursor = 0
+                    foreach ($run in $record.Runs) {
+                        $runBytes = [int]($run.Clusters * $geometry.ClusterSize)
+                        $chunk = Read-NtfsVolumeAligned -Handle $handle -Offset ([long]$run.Lcn * $geometry.ClusterSize) -Size $runBytes -BytesPerSector $geometry.BytesPerSector
+                        [Array]::Copy($chunk, 0, $buffer, $cursor, $runBytes)
+                        $cursor += $runBytes
+                    }
+                    $original = $buffer.Clone()
+                    foreach ($entry in $fixable) {
+                        Set-NtfsAttrListEntryNameOffset -Buffer $buffer -EntryStart $entry.EntryOffset -NameLength $entry.NameLength
+                    }
+                    # Attribute list runs are not update-sequence protected; write them back verbatim.
+                    $cursor = 0
+                    foreach ($run in $record.Runs) {
+                        $runBytes = [int]($run.Clusters * $geometry.ClusterSize)
+                        $originalSlice = New-Object byte[] $runBytes
+                        $updatedSlice = New-Object byte[] $runBytes
+                        [Array]::Copy($original, $cursor, $originalSlice, 0, $runBytes)
+                        [Array]::Copy($buffer, $cursor, $updatedSlice, 0, $runBytes)
+                        $operations.Add([PSCustomObject]@{
+                            Offset   = [long]($run.Lcn * $geometry.ClusterSize)
+                            Original = $originalSlice
+                            Updated  = $updatedSlice
+                        }) | Out-Null
+                        $cursor += $runBytes
+                    }
+                }
+
+                foreach ($entry in $fixable) {
+                    $name = if ($entry.Name) { "$($entry.TypeName):$($entry.Name)" } else { $entry.TypeName }
+                    $planned.Add("$($record.Name) ($($entry.TypeName)$(if ($entry.Name) { ":$($entry.Name)" }))") | Out-Null
+                    $repaired++
+                }
+            }
+
+            if ($operations.Count -eq 0) {
+                Write-Host "  ${label}: nothing to repair." -ForegroundColor DarkGray
+                return 0
+            }
+
+            # Capture the pre-image of every region before the first write, so the
+            # volume can be put back byte for byte if the result is not what we want.
+            try {
+                $backupDir = Split-Path -Parent $script:ActionLogPath
+                $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+                $safeLabel = $label -replace '[^A-Za-z0-9]', ''
+                $backupPath = Join-Path $backupDir "Repair-AzVMDisk_attrlist_${safeLabel}_${stamp}.json"
+                $manifest = [ordered]@{
+                    Volume         = $volumePath
+                    CapturedUtc    = (Get-Date).ToUniversalTime().ToString('o')
+                    BytesPerSector = $geometry.BytesPerSector
+                    Regions        = @($operations | ForEach-Object {
+                            [ordered]@{ Offset = $_.Offset; Length = $_.Original.Length; OriginalBase64 = [Convert]::ToBase64String($_.Original) }
+                        })
+                }
+                $manifest | ConvertTo-Json -Depth 6 | Out-File -FilePath $backupPath -Encoding UTF8
+                Write-Host "  Saved pre-repair image of $($operations.Count) region(s) to $backupPath" -ForegroundColor DarkCyan
+            }
+            catch {
+                throw "Refusing to write: the pre-repair backup could not be saved ($($_.Exception.Message))."
+            }
+
+            # Pass 2: apply.
+            foreach ($operation in $operations) {
+                Write-NtfsVolumeAligned -Handle $handle -Offset $operation.Offset -Data $operation.Updated -BytesPerSector $geometry.BytesPerSector
+            }
+            [RepairAzVMDiskRawVolumeIo]::Flush($handle)
+
+            # Verify through the same locked handle before releasing the volume.
+            $verify = Get-NtfsMetafileAttrListState -Volume $volumePath -Handle $handle
+            if (-not $verify.Scanned) {
+                Write-Warning "  ${label}: repair written but the verification pass could not run - $($verify.Error)"
+            }
+            elseif ($verify.Fixable -gt 0) {
+                Write-Warning "  ${label}: $($verify.Fixable) entry/entries still report a non-canonical name offset after the repair."
+            }
+            else {
+                foreach ($item in $planned) {
+                    Write-Host "  [OK] $label $item  NameOffset 0x1c -> 0x1a" -ForegroundColor Green
+                }
+                Write-Host "  [OK] $label verified: all attribute list entries now use the canonical name offset." -ForegroundColor Green
+            }
+
+            Write-ActionLog -Event 'FixNtfsAttributeList' -Details @{
+                Volume         = $volumePath
+                EntriesFixed   = $repaired
+                RegionsWritten = $operations.Count
+                BackupPath     = $backupPath
+                VerifiedClean  = ($verify.Scanned -and $verify.Fixable -eq 0)
+            }
+
+            return $repaired
+        }
+        catch {
+            Write-Error "Attribute list repair failed on ${label}: $_"
+            if ($backupPath) { Write-Warning "The pre-repair image is available at $backupPath" }
+            return 0
+        }
+        finally {
+            if ($handle -and -not $handle.IsClosed) {
+                if ($locked) { try { [RepairAzVMDiskRawVolumeIo]::UnlockVolume($handle) } catch { } }
+                $handle.Close()
+            }
+        }
+    }
+
+    function FixNtfsAttributeList {
+        # Repairs reserved-file-record attribute list entries whose NameOffset is
+        # 0x1c instead of the canonical 0x1a. Newer NTFS revisions reject that
+        # layout while resolving the referenced stream and fail the volume mount,
+        # which the guest shows as a boot loop with bugcheck 0x24 (NTFS_FILE_SYSTEM).
+        param([string]$DriveLetter = '')
+
+        Write-Host "Inspecting NTFS metafile attribute lists..." -ForegroundColor Yellow
+        Initialize-NtfsRawVolumeIo
+
+        $targets = if ($DriveLetter) { @($DriveLetter.TrimEnd('\')) } else { @(Get-NtfsAttrListScanTargets -DiskNumber $script:DiskNumber) }
+        if ($targets.Count -eq 0) {
+            Write-Warning "No lettered NTFS volume was found on disk $script:DiskNumber to inspect."
+            return
+        }
+
+        $states = [System.Collections.Generic.List[PSCustomObject]]::new()
+        foreach ($target in $targets) {
+            $state = Get-NtfsMetafileAttrListState -Volume $target
+            if (-not $state.Scanned) {
+                Write-Warning "$($state.Label) could not be inspected: $($state.Error)"
+                continue
+            }
+            Show-NtfsAttrListFindings -State $state
+            $states.Add($state) | Out-Null
+        }
+
+        $repairable = @($states | Where-Object { $_.Fixable -gt 0 })
+        $blocked = @($states | Where-Object { $_.Unfixable -gt 0 -or ($_.Records | Where-Object { $_.Malformed }) })
+
+        if ($repairable.Count -eq 0) {
+            if ($blocked.Count -gt 0) {
+                Write-Host ""
+                Write-Warning "Non-canonical attribute list entries were found that this repair does not cover."
+                Write-Warning "Do not run chkdsk against the affected volume(s): it discards the attribute list rather than correcting it, which drops the child records it referenced."
+            }
+            else {
+                Write-Host "  [OK] No attribute list name offset problem found." -ForegroundColor Green
+            }
+            return
+        }
+
+        $detail = ($repairable | ForEach-Object {
+                $names = (@($_.Records | Where-Object { @($_.Entries | Where-Object { $_.CanRepair }).Count -gt 0 } | ForEach-Object { $_.Name }) -join ', ')
+                "  $($_.Label): $($_.Fixable) entry/entries in $names"
+            }) -join "`n"
+
+        if (-not (Confirm-CriticalOperation -Operation 'Repair NTFS metafile attribute list name offsets (-FixNtfsAttributeList)' -Details @"
+Rewrites ATTRIBUTE_LIST_ENTRY.NameOffset from 0x1c to the canonical 0x1a and
+shifts the attribute name back two bytes on:
+$detail
+
+Each affected volume is locked and dismounted for the write, then re-scanned to
+confirm the result. Record lengths, allocation and every other structure are left
+unchanged, and the original bytes of every region are written to a restore
+manifest next to the action log before anything is modified.
+
+The volume(s) will be dismounted during the write, so any offline registry hive
+loaded from them must be unloaded first.
+"@)) { return }
+
+        $total = 0
+        foreach ($state in $repairable) {
+            $total += [int](Repair-NtfsAttrListVolume -Volume $state.Volume)
+        }
+
+        Write-Host ""
+        if ($total -gt 0) {
+            Write-Host "COMPLETE: $total attribute list entry/entries repaired." -ForegroundColor Green
+            Write-Host "Reattach the disk and boot the guest to confirm the volume mounts." -ForegroundColor Cyan
+        }
+        else {
+            Write-Warning "No entry was repaired."
         }
     }
 
@@ -9043,6 +9908,8 @@ complete recovery.
         $sevDiskFsHealth = 1   # Partition filesystem is unhealthy (non-NTFS or undetermined)
         $sevDiskDirtyBit = 1   # NTFS volume dirty bit is set (autochk runs chkdsk at next boot)
         $sevDiskSpotFix = 1   # NTFS spot-verifier logged corruption ($corrupt) - needs chkdsk /spotfix
+        $sevNtfsAttrListNameOffset = 2   # Metafile attribute list entry uses a non-canonical name offset (mount failure, bugcheck 0x24)
+        $sevNtfsAttrListUnknown = 2   # Non-canonical name offset outside the pattern this script repairs
 
         # Crash & Boot artefacts
         $sevCrashMinidumps = 1   # Minidump (.dmp) files found
@@ -9276,6 +10143,43 @@ complete recovery.
             }
         }
         catch { Write-Warning "Disk check failed: $_" }
+
+        # -- 1a. NTFS metafile attribute lists ------------------------------------
+        # A reserved file record (0-31) can carry an ATTRIBUTE_LIST_ENTRY whose
+        # NameOffset is 0x1c where the canonical layout uses 0x1a. Older NTFS
+        # revisions accept it; newer ones validate it, reject the record while
+        # resolving the referenced stream and fail the volume mount - which the
+        # guest shows as a boot loop with bugcheck 0x24 (NTFS_FILE_SYSTEM).
+        # Read-only probe of every lettered NTFS volume on the disk.
+        try {
+            foreach ($attrTarget in (Get-NtfsAttrListScanTargets -DiskNumber $script:DiskNumber)) {
+                $attrState = Get-NtfsMetafileAttrListState -Volume $attrTarget
+                if (-not $attrState.Scanned) {
+                    Write-Warning "Attribute list check skipped for ${attrTarget}: $($attrState.Error)"
+                    continue
+                }
+                if ($attrState.Fixable -eq 0 -and $attrState.Unfixable -eq 0 -and -not (@($attrState.Records | Where-Object { $_.Malformed }).Count)) {
+                    & $emit 'Disk' 'OK' "$attrTarget metafile attribute lists use the canonical name offset"
+                    continue
+                }
+                foreach ($attrRecord in $attrState.Records) {
+                    foreach ($attrEntry in $attrRecord.Entries) {
+                        $attrLabel = if ($attrEntry.Name) { "$($attrEntry.TypeName):$($attrEntry.Name)" } else { $attrEntry.TypeName }
+                        $attrOffset = "0x$($attrEntry.NameOffset.ToString('x2'))"
+                        if ($attrEntry.CanRepair) {
+                            & $emit 'Disk' (& $toSev $sevNtfsAttrListNameOffset) "$attrTarget $($attrRecord.Name): $attrLabel NameOffset=$attrOffset (canonical is 0x1a) - newer NTFS fails the volume mount here and the guest boot loops with bugcheck 0x24 NTFS_FILE_SYSTEM. Do NOT run chkdsk: it discards the whole attribute list instead of correcting the field" "-FixNtfsAttributeList -DriveLetter $attrTarget"
+                        }
+                        else {
+                            & $emit 'Disk' (& $toSev $sevNtfsAttrListUnknown) "$attrTarget $($attrRecord.Name): $attrLabel NameOffset=$attrOffset (canonical is 0x1a) - outside the pattern this script repairs; do NOT run chkdsk on this volume"
+                        }
+                    }
+                    if ($attrRecord.Malformed) {
+                        & $emit 'Disk' (& $toSev $sevNtfsAttrListUnknown) "$attrTarget $($attrRecord.Name): attribute list is truncated or malformed; do NOT run chkdsk on this volume"
+                    }
+                }
+            }
+        }
+        catch { Write-Warning "NTFS attribute list check failed: $_" }
 
         # -- 1b. Disk Space (Windows partition only) ------------------------------
         # Only check the Windows partition; small boot/EFI/recovery partitions are expected to be nearly full.
@@ -15960,6 +16864,7 @@ No destructive file or registry cleanup is performed.
             [string]$VMName = "",
             [int]$DiskNumber = -1,
             [switch]$FixFileSystem,
+            [switch]$FixNtfsAttributeList,
             [switch]$FixBoot,
             [switch]$FixSecureBootCodeIntegrity,
             [string]$CodeIntegrityPolicySourcePath = '',
@@ -16152,6 +17057,13 @@ PARAMETERS:
     -RepairSource <path>     (sub-option) .wim, .iso, .msu, or .cab to use as repair source
   -FixFileSystem         Run chkdsk on the Windows partition
     -DriveLetter <letter>    (sub-option) target a specific drive letter instead of the auto-detected Windows partition
+  -FixNtfsAttributeList  Repair NTFS metafile attribute list entries whose name offset is 0x1c instead of
+                           the canonical 0x1a. Newer NTFS revisions reject that layout and fail the volume
+                           mount, which the guest shows as a boot loop with bugcheck 0x24 (NTFS_FILE_SYSTEM).
+                           Use this instead of chkdsk: chkdsk discards the whole attribute list rather than
+                           correcting the field, dropping the child records it referenced (including the
+                           `$Secure `$SDS security-descriptor stream).
+    -DriveLetter <letter>    (sub-option) repair one volume instead of every NTFS volume on the disk
   -FixSanPolicy          Set SAN policy to OnlineAll (fix offline disks after migration)
   -RepairSystemFile <name[,name,...]>  Replace missing/0-byte/wrong-architecture binary from WinSxS or DriverStore
   -RunSFC                Run SFC in offline mode
@@ -16312,6 +17224,7 @@ AVAILABLE DISKS:
 
         try {
             if ($FixFileSystem) { FixDiskCorruption -DriveLetter $DriveLetter }
+            if ($FixNtfsAttributeList) { FixNtfsAttributeList -DriveLetter $DriveLetter }
             if ($FixBoot) { RebuildBCD }
             if ($FixSecureBootCodeIntegrity) { RepairSecureBootCodeIntegrity -CodeIntegrityPolicySourcePath $CodeIntegrityPolicySourcePath }
             if ($FixBootSector) { FixBootSector }
