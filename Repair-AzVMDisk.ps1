@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.7.0
+        Version: 0.7.1
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -79,6 +79,60 @@
         allocation are untouched. Every modified region is written to a restore manifest
         beside the action log before the first write. Without -DriveLetter every NTFS volume
         on the disk is inspected. -SysCheck reports the same condition read-only.
+
+    .PARAMETER FixTxRLogs
+        Clears the CLFS/KTM transaction log files (.blf and .regtrans-ms) that Windows keeps
+        alongside its registry hives, without reverting any pending update. Use this when
+        servicing fails with 0x800719e4 (ERROR_LOG_FULL) or the guest hangs processing
+        updates at boot because the transaction logs are full or inconsistent. It is the
+        offline equivalent of step 2 of:
+        https://learn.microsoft.com/troubleshoot/windows-server/installing-updates-features-roles/error-0x800719e4-windows-update-fails
+
+        Prefer this over -FixPendingUpdates for that failure. -FixPendingUpdates additionally
+        runs DISM /RevertPendingActions, removes pending packages, renames pending.xml and
+        deletes CBS keys - it discards the servicing queue, which log exhaustion does not
+        require and which can leave the guest worse off.
+
+        Safety. Selection is an explicit .blf / .regtrans-ms whitelist, so hive recovery logs
+        (.LOG1 / .LOG2) are never in scope; deleting one of those from under a dirty hive is a
+        documented cause of 0xC0000218 at boot. Before any write, every protected hive is
+        loaded through RegLoadAppKey to record a baseline. That baseline is advisory and never
+        blocks the repair - application-hive loading rejects hives that Windows mounts without
+        complaint, so a failure there does not mean the hive is damaged. What is enforced is
+        the transition: a hive that loaded before and fails afterwards fails verification. Each
+        file is copied to Windows\Temp\RepairAzVMDisk\TransactionLogs_<timestamp> before it is
+        deleted in place; nothing is renamed or recreated, so the folders keep their own ACLs.
+
+        Afterwards the repair proves it did no collateral damage: exactly the planned files
+        were removed, every other file in the folder still matches its recorded size, modified
+        time and attributes, the folder was not recreated, its security descriptor is
+        unchanged, the backup is byte-identical, and every hive that loaded before still
+        loads. Any failure rolls the scope back from its backup and reports the result.
+
+    .PARAMETER TransactionLogScope
+        Sub-option of -FixTxRLogs. Which folders to clear: TxR (Windows\System32\config\TxR,
+        the default), Config (Windows\System32\config), SMI (Windows\System32\SMI\Store\Machine)
+        or All. Accepts several values.
+
+    .PARAMETER FixPendingUpdates
+        Reverts in-progress servicing: DISM /RevertPendingActions, removal of every package in
+        Pending state, renaming WinSxS\pending.xml, and deletion of the CBS PackagesPending /
+        RebootPending / SessionsPending keys. It also clears the transaction logs by calling the
+        same code as -FixTxRLogs, across TxR, config and SMI.
+
+        Note for anyone scripted around the older behaviour: the transaction log step no longer
+        renames config\TxR to config\TxR_OLD, no longer creates config\BackupCfg holding a copy
+        of the whole registry, and no longer creates SMI\Store\Machine\Backup. Only the deleted
+        log files are backed up, under Windows\Temp\RepairAzVMDisk. The guest-visible outcome is
+        the same: the same log files are gone from the same three folders.
+
+    .EXAMPLE
+        # Clear transaction logs for a 0x800719e4 / ERROR_LOG_FULL update failure
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixTxRLogs
+
+    .EXAMPLE
+        # Widen the cleanup to the config and SMI stores as well
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixTxRLogs -TransactionLogScope All
 
     .EXAMPLE
         # Detect the condition as part of the full offline scan
@@ -183,6 +237,7 @@ param (
     [Parameter(ParameterSetName = 'Repair')][switch]$FixRDPAuth,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixUserRights,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixPendingUpdates,
+    [Parameter(ParameterSetName = 'Repair')][switch]$FixTxRLogs,
     [Parameter(ParameterSetName = 'Repair')][switch]$DisableWindowsUpdate,
     [Parameter(ParameterSetName = 'Repair')][switch]$RestoreRegistryFromRegBack,
     [Parameter(ParameterSetName = 'Repair')][switch]$EnableRegBackup,
@@ -294,6 +349,7 @@ dynamicparam {
         'EnableDriverOrService',
         'FixDeviceFilters',
         'AnalyzeRecentChanges',
+        'FixTxRLogs',
         'ShowLastSession'
     )
     $hasSubParameterParent = @(
@@ -356,6 +412,11 @@ dynamicparam {
         $vs = [System.Management.Automation.ValidateSetAttribute]::new(
             'Boot', 'System', 'Automatic', 'Manual', 'Disabled')
         & $addParam 'DriverStartType' ([string]) 'Repair' $null @($vs) $true
+    }
+    # -TransactionLogScope: sub-option of -FixTxRLogs
+    if ($PSBoundParameters.ContainsKey('FixTxRLogs')) {
+        $vs = [System.Management.Automation.ValidateSetAttribute]::new('TxR', 'Config', 'SMI', 'All')
+        & $addParam 'TransactionLogScope' ([string[]]) 'Repair' @('TxR') @($vs)
     }
     # -RecentChangeDays: sub-option of -AnalyzeRecentChanges
     if ($PSBoundParameters.ContainsKey('AnalyzeRecentChanges')) {
@@ -6330,11 +6391,930 @@ Remove-Item -Path C:\temp\rds.pfx -Force
         }
     }
 
+    # ==========================================================================
+    # Servicing transaction log cleanup
+    # ==========================================================================
+    # Windows keeps CLFS/KTM transaction logs (.blf and .regtrans-ms) next to the
+    # registry hives they protect. When those logs fill up, or are left inconsistent
+    # by an interrupted servicing operation, updates fail with 0x800719e4
+    # (ERROR_LOG_FULL) or the guest hangs processing updates at boot. The documented
+    # repair is to delete the log files and let Windows recreate them at next boot:
+    # https://learn.microsoft.com/troubleshoot/windows-server/installing-updates-features-roles/error-0x800719e4-windows-update-fails
+    #
+    # None of the three folders involved holds only transaction logs:
+    #   Windows\System32\config             SYSTEM, SOFTWARE, SAM, SECURITY, DEFAULT
+    #   Windows\System32\SMI\Store\Machine  SCHEMA.DAT
+    #   Windows\System32\config\TxR         resource manager logs; ACL-restricted
+    #
+    # .LOG1 and .LOG2 are hive RECOVERY logs, not transaction logs. Removing one from
+    # under a dirty hive turns a recoverable installation into a 0xC0000218 at boot.
+    # Selection is therefore an explicit extension whitelist rather than a wildcard
+    # filter, and the attribute change, the backup and the deletion all operate on
+    # that one list - never on a re-enumeration of the folder.
+    $script:TransactionLogExtensions = @('.blf', '.regtrans-ms')
+
+    # Test-RegistryHiveFile copies a hive to validate it, and runs twice per repair
+    # (baseline and verification). Above this size the hive is reported as skipped
+    # rather than copied; the file-level comparison still proves it was not modified.
+    $script:TransactionLogHiveTestMaxBytes = 512MB
+
+    function Get-TransactionLogScopeInfo {
+        # Target folder and the hives protected by that folder's resource manager.
+        param([Parameter(Mandatory = $true)][ValidateSet('TxR', 'Config', 'SMI')][string]$Scope)
+
+        $configFolder = Join-Path $script:WinDriveLetter 'Windows\System32\config'
+        $registryHives = @('SYSTEM', 'SOFTWARE', 'SAM', 'SECURITY', 'DEFAULT', 'COMPONENTS')
+
+        switch ($Scope) {
+            'TxR' {
+                return [pscustomobject]@{
+                    Scope      = 'TxR'
+                    Label      = 'config\TxR'
+                    Path       = (Join-Path $configFolder 'TxR')
+                    HiveFolder = $configFolder
+                    HiveNames  = $registryHives
+                }
+            }
+            'Config' {
+                return [pscustomobject]@{
+                    Scope      = 'Config'
+                    Label      = 'config'
+                    Path       = $configFolder
+                    HiveFolder = $configFolder
+                    HiveNames  = $registryHives
+                }
+            }
+            'SMI' {
+                $smiFolder = Join-Path $script:WinDriveLetter 'Windows\System32\SMI\Store\Machine'
+                return [pscustomobject]@{
+                    Scope      = 'SMI'
+                    Label      = 'SMI\Store\Machine'
+                    Path       = $smiFolder
+                    HiveFolder = $smiFolder
+                    HiveNames  = @('SCHEMA.DAT')
+                }
+            }
+        }
+    }
+
+    function Get-TransactionLogFileHash {
+        param([Parameter(Mandatory = $true)][string]$Path)
+        try { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash }
+        catch { return $null }
+    }
+
+    function Get-TransactionLogFolderSnapshot {
+        # Records everything needed to prove afterwards that only the intended files
+        # changed: the log files themselves, every other file in the folder, and the
+        # folder's own identity (creation time and security descriptor).
+        param(
+            [Parameter(Mandatory = $true)][string]$Path,
+            [switch]$IncludeHash
+        )
+
+        $snapshot = [pscustomobject]@{
+            Path        = $Path
+            Present     = $false
+            Accessible  = $false
+            AccessError = ''
+            CreatedUtc  = $null
+            Sddl        = $null
+            LogFiles    = @()
+            OtherFiles  = @()
+        }
+
+        # Directory.Exists reports presence from the parent entry, so a folder that
+        # denies enumeration is still correctly reported as present rather than missing.
+        if (-not [System.IO.Directory]::Exists($Path)) { return $snapshot }
+        $snapshot.Present = $true
+
+        try { $snapshot.CreatedUtc = (Get-Item -LiteralPath $Path -Force -ErrorAction Stop).CreationTimeUtc }
+        catch { }
+
+        try {
+            $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+            $snapshot.Sddl = $acl.GetSecurityDescriptorSddlForm(
+                [System.Security.AccessControl.AccessControlSections]::Owner -bor
+                [System.Security.AccessControl.AccessControlSections]::Access)
+        }
+        catch {
+            # config\TxR restricts its descriptor on some builds. An unreadable SDDL is
+            # recorded as $null; folder identity is then asserted via CreationTimeUtc.
+            $snapshot.Sddl = $null
+        }
+
+        $logFiles = [System.Collections.Generic.List[object]]::new()
+        $otherFiles = [System.Collections.Generic.List[object]]::new()
+        try {
+            $children = @(Get-ChildItem -LiteralPath $Path -File -Force -ErrorAction Stop)
+            $snapshot.Accessible = $true
+            foreach ($child in $children) {
+                $entry = [pscustomobject]@{
+                    Name             = $child.Name
+                    FullName         = $child.FullName
+                    Length           = $child.Length
+                    LastWriteTimeUtc = $child.LastWriteTimeUtc
+                    Attributes       = [string]$child.Attributes
+                    Sha256           = $null
+                }
+                if ($script:TransactionLogExtensions -contains $child.Extension.ToLowerInvariant()) {
+                    if ($IncludeHash) { $entry.Sha256 = Get-TransactionLogFileHash -Path $child.FullName }
+                    $logFiles.Add($entry) | Out-Null
+                }
+                else {
+                    $otherFiles.Add($entry) | Out-Null
+                }
+            }
+        }
+        catch {
+            $snapshot.Accessible = $false
+            $snapshot.AccessError = $_.Exception.Message
+        }
+
+        $snapshot.LogFiles = $logFiles.ToArray()
+        $snapshot.OtherFiles = $otherFiles.ToArray()
+        return $snapshot
+    }
+
+    function Get-TransactionLogHiveState {
+        # Loads each protected hive through RegLoadAppKey so a genuinely damaged hive is
+        # detected rather than assumed healthy from its header alone.
+        param([Parameter(Mandatory = $true)]$ScopeInfo)
+
+        $results = [System.Collections.Generic.List[object]]::new()
+        foreach ($hiveName in $ScopeInfo.HiveNames) {
+            $hivePath = Join-Path $ScopeInfo.HiveFolder $hiveName
+            $entry = [pscustomobject]@{
+                Name    = $hiveName
+                Path    = $hivePath
+                Present = $false
+                Tested  = $false
+                IsValid = $null
+                Size    = 0
+                Reason  = ''
+            }
+
+            if (-not [System.IO.File]::Exists($hivePath)) {
+                $entry.Reason = 'not present'
+                $results.Add($entry) | Out-Null
+                continue
+            }
+            $entry.Present = $true
+            try { $entry.Size = (Get-Item -LiteralPath $hivePath -Force -ErrorAction Stop).Length } catch { }
+
+            if ($entry.Size -gt $script:TransactionLogHiveTestMaxBytes) {
+                $entry.Reason = 'skipped - {0} MB exceeds the {1} MB validation limit' -f `
+                    [math]::Round($entry.Size / 1MB), [math]::Round($script:TransactionLogHiveTestMaxBytes / 1MB)
+                $results.Add($entry) | Out-Null
+                continue
+            }
+
+            try {
+                $test = Test-RegistryHiveFile -Path $hivePath
+                $entry.Tested = $true
+                $entry.IsValid = [bool]$test.IsValid
+                if (-not $entry.IsValid) { $entry.Reason = [string]$test.Reason }
+            }
+            catch {
+                $entry.Reason = "validation could not run: $($_.Exception.Message)"
+            }
+
+            $results.Add($entry) | Out-Null
+        }
+        return $results.ToArray()
+    }
+
+    function Get-TransactionLogCleanupPlan {
+        # Read-only. Produces everything the repair and its verification need, and
+        # writes nothing, so it is safe to call for reporting on its own.
+        param(
+            [Parameter(Mandatory = $true)][ValidateSet('TxR', 'Config', 'SMI')][string[]]$Scope,
+            [switch]$SkipHiveState
+        )
+
+        $plans = [System.Collections.Generic.List[object]]::new()
+        foreach ($scopeName in $Scope) {
+            $info = Get-TransactionLogScopeInfo -Scope $scopeName
+            $snapshot = Get-TransactionLogFolderSnapshot -Path $info.Path -IncludeHash
+            $hives = if ($SkipHiveState) { @() } else { @(Get-TransactionLogHiveState -ScopeInfo $info) }
+            $bytes = 0
+            if ($snapshot.LogFiles.Count -gt 0) {
+                $bytes = [long](($snapshot.LogFiles | Measure-Object -Property Length -Sum).Sum)
+            }
+
+            $plans.Add([pscustomobject]@{
+                    Scope       = $info.Scope
+                    Label       = $info.Label
+                    Path        = $info.Path
+                    Snapshot    = $snapshot
+                    Hives       = $hives
+                    BackupBytes = $bytes
+                }) | Out-Null
+        }
+        return $plans.ToArray()
+    }
+
+    function Show-TransactionLogCleanupPlan {
+        param([Parameter(Mandatory = $true)]$Plan)
+
+        foreach ($scopePlan in $Plan) {
+            if (-not $scopePlan.Snapshot.Present) {
+                Write-Host "  $($scopePlan.Label): folder not found, skipping." -ForegroundColor DarkGray
+                continue
+            }
+            if (-not $scopePlan.Snapshot.Accessible) {
+                Write-Warning "  $($scopePlan.Label): folder could not be read - $($scopePlan.Snapshot.AccessError)"
+                continue
+            }
+
+            $count = $scopePlan.Snapshot.LogFiles.Count
+            if ($count -eq 0) {
+                Write-Host "  $($scopePlan.Label): no .blf/.regtrans-ms files - nothing to do." -ForegroundColor Green
+                continue
+            }
+
+            Write-Host "  $($scopePlan.Label): $count transaction log file(s), $([math]::Round($scopePlan.BackupBytes / 1KB)) KB" -ForegroundColor Yellow
+            foreach ($file in $scopePlan.Snapshot.LogFiles) {
+                Write-Host "      $($file.Name)" -ForegroundColor DarkGray
+            }
+            $keep = $scopePlan.Snapshot.OtherFiles.Count
+            if ($keep -gt 0) {
+                Write-Host "      ($keep other file(s) in this folder will not be touched)" -ForegroundColor DarkGray
+            }
+        }
+    }
+
+    function Test-TransactionLogCleanupResult {
+        # The gate that decides pass or rollback. Re-reads each folder and compares it
+        # against the pre-flight snapshot. Every way this repair could break a guest is
+        # asserted here: hive damage, a lost folder ACL, and deletion of a recovery log.
+        param(
+            [Parameter(Mandatory = $true)]$ScopePlan,
+            [Parameter(Mandatory = $true)][string]$BackupPath
+        )
+
+        $checks = [System.Collections.Generic.List[object]]::new()
+        $addCheck = {
+            param([string]$Name, [bool]$Passed, [string]$Detail)
+            $checks.Add([pscustomobject]@{ Name = $Name; Passed = $Passed; Detail = $Detail }) | Out-Null
+        }
+
+        $before = $ScopePlan.Snapshot
+        $info = Get-TransactionLogScopeInfo -Scope $ScopePlan.Scope
+        $after = Get-TransactionLogFolderSnapshot -Path $ScopePlan.Path
+
+        # 1. The folder still exists and is the same directory. A recreated folder gets a
+        #    new creation time, which is exactly the defect this repair removed.
+        if (-not $after.Present) {
+            & $addCheck 'Folder still present' $false "$($ScopePlan.Path) is gone"
+        }
+        else {
+            & $addCheck 'Folder still present' $true ''
+            if ($before.CreatedUtc -and $after.CreatedUtc) {
+                $sameFolder = ($before.CreatedUtc -eq $after.CreatedUtc)
+                & $addCheck 'Folder not recreated' $sameFolder $(if ($sameFolder) { '' } else { "creation time changed from $($before.CreatedUtc.ToString('o')) to $($after.CreatedUtc.ToString('o'))" })
+            }
+        }
+
+        # 2. The security descriptor is unchanged. Skipped, not failed, when the
+        #    descriptor was unreadable to begin with.
+        if ($null -eq $before.Sddl) {
+            & $addCheck 'Folder ACL unchanged' $true 'skipped - descriptor not readable on this host'
+        }
+        else {
+            $sameAcl = ($before.Sddl -eq $after.Sddl)
+            & $addCheck 'Folder ACL unchanged' $sameAcl $(if ($sameAcl) { '' } else { 'security descriptor differs from the pre-repair capture' })
+        }
+
+        # 3. Exactly the planned files were removed - no more, no fewer.
+        $plannedNames = @($before.LogFiles | ForEach-Object { $_.Name })
+        $remainingNames = @($after.LogFiles | ForEach-Object { $_.Name })
+        $unexpectedlyLeft = @($remainingNames | Where-Object { $plannedNames -contains $_ })
+        & $addCheck 'Planned log files removed' ($unexpectedlyLeft.Count -eq 0) $(if ($unexpectedlyLeft.Count -eq 0) { "$($plannedNames.Count) removed" } else { "still present: $($unexpectedlyLeft -join ', ')" })
+
+        # 4. Nothing else in the folder was modified. This is the direct proof that the
+        #    hives and their .LOG1/.LOG2 were neither deleted nor stripped of
+        #    System/Hidden by the attribute step.
+        $afterOthers = @{}
+        foreach ($file in $after.OtherFiles) { $afterOthers[$file.Name] = $file }
+        $drift = [System.Collections.Generic.List[string]]::new()
+        foreach ($file in $before.OtherFiles) {
+            if (-not $afterOthers.ContainsKey($file.Name)) {
+                $drift.Add("$($file.Name) is missing") | Out-Null
+                continue
+            }
+            $now = $afterOthers[$file.Name]
+            if ($now.Length -ne $file.Length) { $drift.Add("$($file.Name) size $($file.Length) -> $($now.Length)") | Out-Null }
+            if ($now.LastWriteTimeUtc -ne $file.LastWriteTimeUtc) { $drift.Add("$($file.Name) modified time changed") | Out-Null }
+            if ($now.Attributes -ne $file.Attributes) { $drift.Add("$($file.Name) attributes $($file.Attributes) -> $($now.Attributes)") | Out-Null }
+        }
+        & $addCheck 'Other files untouched' ($drift.Count -eq 0) $(if ($drift.Count -eq 0) { "$($before.OtherFiles.Count) file(s) unchanged" } else { ($drift -join '; ') })
+
+        # 5. The backup holds a byte-identical copy of everything that was deleted, so
+        #    the change is reversible.
+        $backupProblems = [System.Collections.Generic.List[string]]::new()
+        foreach ($file in $before.LogFiles) {
+            $backupFile = Join-Path $BackupPath $file.Name
+            if (-not [System.IO.File]::Exists($backupFile)) {
+                $backupProblems.Add("$($file.Name) was not backed up") | Out-Null
+                continue
+            }
+            $backupItem = Get-Item -LiteralPath $backupFile -Force -ErrorAction SilentlyContinue
+            if ($null -eq $backupItem -or $backupItem.Length -ne $file.Length) {
+                $backupProblems.Add("$($file.Name) backup size differs") | Out-Null
+                continue
+            }
+            if ($file.Sha256) {
+                $backupHash = Get-TransactionLogFileHash -Path $backupFile
+                if ($backupHash -ne $file.Sha256) { $backupProblems.Add("$($file.Name) backup hash differs") | Out-Null }
+            }
+        }
+        & $addCheck 'Backup complete and restorable' ($backupProblems.Count -eq 0) $(if ($backupProblems.Count -eq 0) { "$($before.LogFiles.Count) file(s) in $BackupPath" } else { ($backupProblems -join '; ') })
+
+        # 6. Every hive that loaded before still loads. A hive going PASS -> FAIL is the
+        #    condition that must trigger a rollback.
+        if ($ScopePlan.Hives.Count -gt 0) {
+            $hivesAfter = @{}
+            foreach ($hive in (Get-TransactionLogHiveState -ScopeInfo $info)) { $hivesAfter[$hive.Name] = $hive }
+            $regressed = [System.Collections.Generic.List[string]]::new()
+            $revalidated = 0
+            foreach ($hive in $ScopePlan.Hives) {
+                if (-not $hive.Tested -or $hive.IsValid -ne $true) { continue }
+                $revalidated++
+                $now = $hivesAfter[$hive.Name]
+                if ($null -eq $now -or $now.IsValid -ne $true) {
+                    $regressed.Add("$($hive.Name) no longer loads") | Out-Null
+                }
+            }
+            & $addCheck 'Registry hives still load' ($regressed.Count -eq 0) $(if ($regressed.Count -eq 0) { "$revalidated hive(s) revalidated" } else { ($regressed -join '; ') })
+        }
+
+        return [pscustomobject]@{
+            Scope  = $ScopePlan.Scope
+            Label  = $ScopePlan.Label
+            Checks = $checks.ToArray()
+            Passed = (@($checks | Where-Object { -not $_.Passed }).Count -eq 0)
+        }
+    }
+
+    function Show-TransactionLogVerification {
+        param([Parameter(Mandatory = $true)]$Result)
+
+        foreach ($scopeResult in $Result) {
+            $header = if ($scopeResult.Passed) { 'PASS' } else { 'FAIL' }
+            $headerColor = if ($scopeResult.Passed) { 'Green' } else { 'Red' }
+            Write-Host "  [$header] $($scopeResult.Label)" -ForegroundColor $headerColor
+            foreach ($check in $scopeResult.Checks) {
+                $mark = if ($check.Passed) { 'ok  ' } else { 'FAIL' }
+                $color = if ($check.Passed) { 'DarkGray' } else { 'Red' }
+                $detail = if ($check.Detail) { " - $($check.Detail)" } else { '' }
+                Write-Host "         [$mark] $($check.Name)$detail" -ForegroundColor $color
+            }
+        }
+    }
+
+    function Restore-TransactionLogBackup {
+        # Rollback path. Copies the backed-up log files back and restores the exact
+        # attributes they carried before the repair.
+        param(
+            [Parameter(Mandatory = $true)]$ScopePlan,
+            [Parameter(Mandatory = $true)][string]$BackupPath
+        )
+
+        Write-Warning "Rolling back transaction log cleanup for $($ScopePlan.Label)..."
+        $restored = 0
+        $failed = [System.Collections.Generic.List[string]]::new()
+        foreach ($file in $ScopePlan.Snapshot.LogFiles) {
+            $backupFile = Join-Path $BackupPath $file.Name
+            if (-not [System.IO.File]::Exists($backupFile)) {
+                $failed.Add("$($file.Name) has no backup copy") | Out-Null
+                continue
+            }
+            try {
+                Copy-Item-Logged -Path $backupFile -Destination $file.FullName -Force
+                $restoredItem = Get-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+                $restoredItem.Attributes = [System.IO.FileAttributes]$file.Attributes
+                $restored++
+            }
+            catch {
+                $failed.Add("$($file.Name): $($_.Exception.Message)") | Out-Null
+            }
+        }
+
+        Write-ActionLog -Event 'ClearTransactionLogsRollback' -Details @{
+            Scope    = $ScopePlan.Scope
+            Path     = $ScopePlan.Path
+            Backup   = $BackupPath
+            Restored = $restored
+            Failed   = $failed.ToArray()
+        }
+
+        if ($failed.Count -gt 0) {
+            Write-Error "Rollback did not fully complete for $($ScopePlan.Label): $($failed -join '; ')"
+            Write-Host "  Restore manually from: $BackupPath" -ForegroundColor Yellow
+            Write-Host "    Copy-Item '$BackupPath\*' '$($ScopePlan.Path)' -Force" -ForegroundColor Yellow
+            return $false
+        }
+
+        Write-Host "  Rolled back $restored file(s) to $($ScopePlan.Path)." -ForegroundColor Yellow
+        return $true
+    }
+
+    function Enable-ServicingRepairPrivilege {
+        # WinSxS, pending.xml and the CBS pending keys are owned by TrustedInstaller and
+        # deny write to Administrators. Taking ownership requires these privileges to be
+        # enabled in the token, not merely held, which is not the default.
+        if (-not ('RepairAzVmDiskServicingPrivilege' -as [type])) {
+            $privilegeSource = @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class RepairAzVmDiskServicingPrivilege
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LUID { public UInt32 LowPart; public Int32 HighPart; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LUID_AND_ATTRIBUTES { public LUID Luid; public UInt32 Attributes; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TOKEN_PRIVILEGES { public UInt32 PrivilegeCount; public LUID_AND_ATTRIBUTES Privilege; }
+
+    private const UInt32 TOKEN_ADJUST_PRIVILEGES = 0x0020;
+    private const UInt32 TOKEN_QUERY = 0x0008;
+    private const UInt32 SE_PRIVILEGE_ENABLED = 0x0002;
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool OpenProcessToken(IntPtr processHandle, UInt32 desiredAccess, out IntPtr tokenHandle);
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool LookupPrivilegeValue(string systemName, string privilegeName, out LUID luid);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool AdjustTokenPrivileges(IntPtr tokenHandle, bool disableAll, ref TOKEN_PRIVILEGES newState, UInt32 bufferLength, IntPtr previousState, IntPtr returnLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
+
+    public static bool Enable(string privilegeName)
+    {
+        IntPtr token;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out token))
+        {
+            return false;
+        }
+        try
+        {
+            LUID luid;
+            if (!LookupPrivilegeValue(null, privilegeName, out luid))
+            {
+                return false;
+            }
+            TOKEN_PRIVILEGES privileges = new TOKEN_PRIVILEGES();
+            privileges.PrivilegeCount = 1;
+            privileges.Privilege.Luid = luid;
+            privileges.Privilege.Attributes = SE_PRIVILEGE_ENABLED;
+            if (!AdjustTokenPrivileges(token, false, ref privileges, 0, IntPtr.Zero, IntPtr.Zero))
+            {
+                return false;
+            }
+            return Marshal.GetLastWin32Error() == 0;
+        }
+        finally
+        {
+            CloseHandle(token);
+        }
+    }
+}
+'@
+            Add-Type -TypeDefinition $privilegeSource -ErrorAction Stop
+        }
+
+        foreach ($privilege in @('SeTakeOwnershipPrivilege', 'SeRestorePrivilege', 'SeBackupPrivilege', 'SeSecurityPrivilege')) {
+            [void][RepairAzVmDiskServicingPrivilege]::Enable($privilege)
+        }
+    }
+
+    function Grant-ProtectedPathAccess {
+        # Takes ownership of a TrustedInstaller-owned file or folder and grants this
+        # account FullControl, returning the original descriptor in SDDL form so it can
+        # be replayed verbatim afterwards.
+        #
+        # The descriptor is captured and replayed whole on purpose. Rebuilding one of
+        # these ACLs rule by rule - or removing a granted ACE with icacls /remove:g -
+        # also removes the ACEs Windows shipped, which silently damages WinSxS.
+        param([Parameter(Mandatory = $true)][string]$Path)
+
+        Enable-ServicingRepairPrivilege
+
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        $isDirectory = $item.PSIsContainer
+        $sections = 'Owner,Group,Access'
+
+        $originalSddl = $null
+        try { $originalSddl = (Get-Acl -LiteralPath $Path).GetSecurityDescriptorSddlForm($sections) }
+        catch { Write-Warning "Could not read the security descriptor of $Path : $($_.Exception.Message)" }
+
+        $me = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User
+
+        # Only the owner section is set here, so the existing DACL is left intact. The
+        # DACL cannot be written until ownership is held.
+        if ($isDirectory) {
+            $ownerOnly = [System.Security.AccessControl.DirectorySecurity]::new()
+            $ownerOnly.SetOwner($me)
+            [System.IO.Directory]::SetAccessControl($Path, $ownerOnly)
+        }
+        else {
+            $ownerOnly = [System.Security.AccessControl.FileSecurity]::new()
+            $ownerOnly.SetOwner($me)
+            [System.IO.File]::SetAccessControl($Path, $ownerOnly)
+        }
+
+        $acl = Get-Acl -LiteralPath $Path
+        $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+                $me, 'FullControl', 'None', 'None', 'Allow'))
+        if ($isDirectory) { [System.IO.Directory]::SetAccessControl($Path, $acl) }
+        else { [System.IO.File]::SetAccessControl($Path, $acl) }
+
+        return $originalSddl
+    }
+
+    function Restore-ProtectedPathAccess {
+        # Replays a descriptor captured by Grant-ProtectedPathAccess. Missing paths are
+        # ignored so the caller can offer both the original and the renamed path without
+        # having to work out which one survived.
+        param(
+            [Parameter(Mandatory = $true)][string]$Path,
+            [string]$Sddl = ''
+        )
+
+        if (-not $Sddl) { return }
+        if (-not (Test-Path -LiteralPath $Path)) { return }
+
+        try {
+            if ((Get-Item -LiteralPath $Path -Force).PSIsContainer) {
+                $sd = [System.Security.AccessControl.DirectorySecurity]::new()
+                $sd.SetSecurityDescriptorSddlForm($Sddl, 'Owner,Group,Access')
+                [System.IO.Directory]::SetAccessControl($Path, $sd)
+            }
+            else {
+                $sd = [System.Security.AccessControl.FileSecurity]::new()
+                $sd.SetSecurityDescriptorSddlForm($Sddl, 'Owner,Group,Access')
+                [System.IO.File]::SetAccessControl($Path, $sd)
+            }
+        }
+        catch {
+            Write-Warning "Could not restore the original ACL on $Path : $($_.Exception.Message)"
+            Write-Host "  Restore it manually with: icacls '$Path' /setowner 'NT SERVICE\TrustedInstaller'" -ForegroundColor Yellow
+        }
+    }
+
+    function ConvertTo-HklmSubKeyPath {
+        # 'HKLM:\BROKENSOFTWARE\...' or a provider PSPath to the native subkey string the
+        # Microsoft.Win32.Registry APIs expect.
+        param([Parameter(Mandatory = $true)][string]$Path)
+
+        if ($Path -match 'HKEY_LOCAL_MACHINE\\(.+)$') { return $Matches[1] }
+        if ($Path -match '^HKLM:\\(.+)$') { return $Matches[1] }
+        return $null
+    }
+
+    function Grant-ProtectedRegistryKeyAccess {
+        # Takes ownership of an offline-hive key and every key below it. Deleting a key
+        # requires delete rights on that key and on all of its subkeys, so the whole
+        # subtree is covered. The parent is owned first, because its children cannot be
+        # enumerated reliably until it is readable.
+        param([Parameter(Mandatory = $true)][string]$Path)
+
+        Enable-ServicingRepairPrivilege
+        $me = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User
+
+        $grantOne = {
+            param([string]$KeyPath)
+
+            $subKey = ConvertTo-HklmSubKeyPath -Path $KeyPath
+            if (-not $subKey) { return }
+
+            $root = [Microsoft.Win32.Registry]::LocalMachine
+            $ownerKey = $null
+            try {
+                $ownerKey = $root.OpenSubKey(
+                    $subKey,
+                    [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+                    [System.Security.AccessControl.RegistryRights]::TakeOwnership)
+                if ($ownerKey) {
+                    $ownerSecurity = [System.Security.AccessControl.RegistrySecurity]::new()
+                    $ownerSecurity.SetOwner($me)
+                    $ownerKey.SetAccessControl($ownerSecurity)
+                }
+            }
+            finally {
+                # Every handle must be closed or the hive will refuse to unload later.
+                if ($ownerKey) { $ownerKey.Close() }
+            }
+
+            $accessKey = $null
+            try {
+                $rights = [System.Security.AccessControl.RegistryRights]::ReadPermissions -bor
+                [System.Security.AccessControl.RegistryRights]::ChangePermissions
+                $accessKey = $root.OpenSubKey(
+                    $subKey,
+                    [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+                    $rights)
+                if ($accessKey) {
+                    $accessSecurity = $accessKey.GetAccessControl(
+                        [System.Security.AccessControl.AccessControlSections]::Access)
+                    $accessSecurity.AddAccessRule(
+                        [System.Security.AccessControl.RegistryAccessRule]::new(
+                            $me, 'FullControl', 'None', 'None', 'Allow'))
+                    $accessKey.SetAccessControl($accessSecurity)
+                }
+            }
+            finally {
+                if ($accessKey) { $accessKey.Close() }
+            }
+        }
+
+        & $grantOne $Path
+
+        $children = @(Get-ChildItem -LiteralPath $Path -Recurse -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.PSPath })
+        foreach ($child in $children) { & $grantOne $child }
+
+        # The provider opens keys of its own while enumerating; releasing them keeps the
+        # later reg unload from failing.
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
+    }
+
+    function Remove-ProtectedRegistryKey {
+        # Remove-Item-Logged runs with -ErrorAction SilentlyContinue, so an access-denied
+        # delete is silent. The CBS pending keys are owned by TrustedInstaller and deny
+        # delete to Administrators on a real machine, so the plain attempt is verified
+        # and ownership is taken only when it is actually needed.
+        param(
+            [Parameter(Mandatory = $true)][string]$Path,
+            [string]$Label = ''
+        )
+
+        if (-not $Label) { $Label = $Path }
+        if (-not (Test-Path -LiteralPath $Path)) { return $true }
+
+        Remove-Item-Logged -Path $Path -Recurse -Force
+        if (-not (Test-Path -LiteralPath $Path)) { return $true }
+
+        Write-Host "  $Label is protected by its own ACL; taking ownership and retrying." -ForegroundColor DarkGray
+        try {
+            Grant-ProtectedRegistryKeyAccess -Path $Path
+        }
+        catch {
+            Write-Warning "Could not take ownership of $Label : $($_.Exception.Message)"
+            return $false
+        }
+
+        Remove-Item-Logged -Path $Path -Recurse -Force
+        if (Test-Path -LiteralPath $Path) {
+            Write-Warning "$Label could not be deleted even after taking ownership of it."
+            return $false
+        }
+
+        Write-Host "  $Label removed after taking ownership." -ForegroundColor Green
+        return $true
+    }
+
+    function Clear-ServicingTransactionLogs {
+        # Deletes CLFS/KTM transaction logs in place, after backing them up, and proves
+        # afterwards that nothing else in the folder changed. Callers own their own
+        # confirmation prompt; this function does not prompt.
+        param(
+            [ValidateSet('TxR', 'Config', 'SMI')][string[]]$Scope = @('TxR', 'Config', 'SMI'),
+            [string]$BackupRoot = ''
+        )
+
+        if (-not $BackupRoot) {
+            $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+            $BackupRoot = Join-Path $script:WinDriveLetter "Windows\Temp\RepairAzVMDisk\TransactionLogs_$stamp"
+        }
+
+        Write-Host "Inspecting servicing transaction logs..." -ForegroundColor Yellow
+        $plan = Get-TransactionLogCleanupPlan -Scope $Scope
+        Show-TransactionLogCleanupPlan -Plan $plan
+
+        # Pre-flight baseline: record which hives load BEFORE anything is written.
+        #
+        # This is deliberately advisory and never aborts the run. Test-RegistryHiveFile
+        # validates a copy of the hive through RegLoadAppKey, and application-hive loading
+        # rejects hives that Windows itself mounts without complaint. Measured on healthy,
+        # bootable Server 2012 R2 and Server 2016 disks, it reports SYSTEM, SAM, SECURITY
+        # and DEFAULT as "corrupt" (error 1009) while `reg load` succeeds on the very same
+        # files and the guests boot normally. Treating that as a stop condition would
+        # refuse to run on precisely the machines this repair exists for.
+        #
+        # The baseline is still worth taking because the result is deterministic per file.
+        # What carries meaning is the transition: a hive that loaded before and fails
+        # afterwards is a real regression, and the post-repair verification treats it as a
+        # hard failure. A hive that already failed is not a reason to stop, because this
+        # repair removes only .blf / .regtrans-ms files and touches neither the hives nor
+        # their .LOG1 / .LOG2 recovery logs.
+        $brokenHives = [System.Collections.Generic.List[string]]::new()
+        foreach ($scopePlan in $plan) {
+            foreach ($hive in $scopePlan.Hives) {
+                if ($hive.Tested -and $hive.IsValid -ne $true) {
+                    $brokenHives.Add("$($hive.Name)") | Out-Null
+                }
+            }
+        }
+        if ($brokenHives.Count -gt 0) {
+            $unique = @($brokenHives | Select-Object -Unique)
+            Write-Host "  Baseline: $($unique -join ', ') did not load as application hives." -ForegroundColor DarkGray
+            Write-Host "  This is recorded for the before/after comparison only and does not block the repair;" -ForegroundColor DarkGray
+            Write-Host "  no hive or .LOG1/.LOG2 recovery log is modified. Use -CheckRegistryHealth for a" -ForegroundColor DarkGray
+            Write-Host "  genuine registry health assessment." -ForegroundColor DarkGray
+        }
+
+        $actionable = @($plan | Where-Object { $_.Snapshot.Present -and $_.Snapshot.Accessible -and $_.Snapshot.LogFiles.Count -gt 0 })
+        $unreadable = @($plan | Where-Object { $_.Snapshot.Present -and -not $_.Snapshot.Accessible })
+        foreach ($scopePlan in $unreadable) {
+            Write-Warning "$($scopePlan.Label) could not be enumerated and was skipped: $($scopePlan.Snapshot.AccessError)"
+        }
+
+        if ($actionable.Count -eq 0) {
+            Write-Host "No transaction log files to remove - no changes made." -ForegroundColor Green
+            return @()
+        }
+
+        # Pre-flight gate 2: the backup must fit. The logs are small, but a full OS disk
+        # is exactly the situation this repair is called into.
+        $requiredBytes = [long](($actionable | Measure-Object -Property BackupBytes -Sum).Sum)
+        try {
+            $driveLetter = ([System.IO.Path]::GetPathRoot($BackupRoot)).Substring(0, 1)
+            $freeBytes = (Get-PSDrive -Name $driveLetter -ErrorAction Stop).Free
+            if ($null -ne $freeBytes -and $freeBytes -lt ($requiredBytes * 2)) {
+                Write-Error "Not enough free space on ${driveLetter}: for the backup ($([math]::Round($requiredBytes / 1KB)) KB needed, $([math]::Round($freeBytes / 1MB)) MB free)."
+                return @()
+            }
+        }
+        catch { Write-Warning "Free space could not be confirmed for $BackupRoot; continuing." }
+
+        $results = [System.Collections.Generic.List[object]]::new()
+        foreach ($scopePlan in $actionable) {
+            $backupPath = Join-Path $BackupRoot $scopePlan.Scope
+            Write-Host "Clearing transaction logs from $($scopePlan.Label)..." -ForegroundColor Yellow
+            # Out-Null is load-bearing. New-Item-Logged returns Invoke-Logged's captured
+            # output string, which would otherwise join this function's output stream and
+            # be mistaken for a scope result by the callers below.
+            New-Item-Logged -Path $backupPath -ItemType Directory -Force | Out-Null
+
+            # Every step below walks the planned file list, never a fresh enumeration,
+            # so the set whose attributes are changed, that is backed up, and that is
+            # deleted is provably identical.
+            $files = $scopePlan.Snapshot.LogFiles
+            $removed = 0
+            $failures = [System.Collections.Generic.List[string]]::new()
+
+            Invoke-Logged -Description 'Clear transaction log file attributes' -Details @{
+                Path = $scopePlan.Path; Files = @($files | ForEach-Object { $_.Name })
+            } -ScriptBlock {
+                foreach ($file in $files) {
+                    try { (Get-Item -LiteralPath $file.FullName -Force).Attributes = 'Normal' } catch { }
+                }
+            } | Out-Null
+
+            foreach ($file in $files) {
+                try {
+                    Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $backupPath $file.Name) -Force -ErrorAction Stop
+                }
+                catch {
+                    $failures.Add("backup of $($file.Name) failed: $($_.Exception.Message)") | Out-Null
+                }
+            }
+            Write-ActionLog -Event 'ClearTransactionLogsBackup' -Details @{
+                Scope = $scopePlan.Scope; Path = $scopePlan.Path; Backup = $backupPath
+                Files = @($files | ForEach-Object { $_.Name })
+            }
+
+            if ($failures.Count -gt 0) {
+                Write-Error "Backup incomplete for $($scopePlan.Label); nothing was deleted. $($failures -join '; ')"
+                continue
+            }
+
+            Invoke-Logged -Description 'Remove transaction log files' -Details @{
+                Path = $scopePlan.Path; Files = @($files | ForEach-Object { $_.Name })
+            } -ScriptBlock {
+                foreach ($file in $files) {
+                    Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+                }
+            } | Out-Null
+            $removed = @($files | Where-Object { -not [System.IO.File]::Exists($_.FullName) }).Count
+
+            $verification = Test-TransactionLogCleanupResult -ScopePlan $scopePlan -BackupPath $backupPath
+            $rolledBack = $false
+            if (-not $verification.Passed) {
+                $rolledBack = Restore-TransactionLogBackup -ScopePlan $scopePlan -BackupPath $backupPath
+            }
+
+            $results.Add([pscustomobject]@{
+                    Scope        = $scopePlan.Scope
+                    Label        = $scopePlan.Label
+                    Path         = $scopePlan.Path
+                    Present      = $true
+                    FilesFound   = $files.Count
+                    FilesRemoved = $removed
+                    BackupPath   = $backupPath
+                    Verification = $verification
+                    RolledBack   = $rolledBack
+                }) | Out-Null
+        }
+
+        $summary = $results.ToArray()
+        Write-Host ""
+        Write-Host "Verifying the guest was left in a good state..." -ForegroundColor Yellow
+        Show-TransactionLogVerification -Result @($summary | ForEach-Object { $_.Verification })
+
+        Write-ActionLog -Event 'ClearTransactionLogs' -Details @{
+            BackupRoot = $BackupRoot
+            Scopes     = @($summary | ForEach-Object {
+                    @{
+                        Scope        = $_.Scope
+                        Path         = $_.Path
+                        FilesFound   = $_.FilesFound
+                        FilesRemoved = $_.FilesRemoved
+                        BackupPath   = $_.BackupPath
+                        Passed       = $_.Verification.Passed
+                        RolledBack   = $_.RolledBack
+                    }
+                })
+        }
+
+        return $summary
+    }
+
+    function ClearTxRLogs {
+        # KB 0x800719e4 (ERROR_LOG_FULL) step 2 as a repair in its own right: clear the
+        # transaction logs and let the update retry, without reverting pending servicing.
+        param([string[]]$Scope = @('TxR'))
+
+        $resolved = if ($Scope -contains 'All') { @('TxR', 'Config', 'SMI') } else { @($Scope) }
+        $labels = @()
+        foreach ($scopeName in $resolved) { $labels += (Get-TransactionLogScopeInfo -Scope $scopeName).Label }
+
+        if (-not (Confirm-CriticalOperation -Operation 'Clear servicing transaction logs (-FixTxRLogs)' -Details @"
+Removes CLFS/KTM transaction log files (.blf and .regtrans-ms) from:
+  $($labels -join "`n  ")
+Each file is backed up to Windows\Temp\RepairAzVMDisk before it is deleted.
+Registry hives and their .LOG1/.LOG2 recovery logs are NOT touched.
+The folders keep their existing ACLs; nothing is renamed or recreated.
+
+This does NOT revert pending updates, remove packages, rename pending.xml
+or delete CBS registry keys. Use -FixPendingUpdates for that.
+"@)) { return }
+
+        # Only real scope results carry a Verification property. Anything else that reaches
+        # the output stream would read as $null.Passed, i.e. as a failed scope, and abort a
+        # repair that actually succeeded.
+        $summary = @(Clear-ServicingTransactionLogs -Scope $resolved | Where-Object { $null -ne $_ -and $_.PSObject.Properties['Verification'] })
+        if (-not $summary -or @($summary).Count -eq 0) { return }
+
+        $failed = @($summary | Where-Object { -not $_.Verification.Passed })
+        if ($failed.Count -gt 0) {
+            Write-Error "Transaction log cleanup did not verify cleanly. Review the checks above; affected scopes were rolled back where a backup existed."
+            return
+        }
+
+        $totalRemoved = ($summary | Measure-Object -Property FilesRemoved -Sum).Sum
+        Write-Host ""
+        Write-Host "COMPLETE: $totalRemoved transaction log file(s) removed and verified." -ForegroundColor Green
+        Write-Host "Windows recreates these logs on the next boot; that is expected and self-healing." -ForegroundColor DarkCyan
+        Write-Host "Boot the VM and retry the update." -ForegroundColor DarkCyan
+
+        # Only mention the heavier repair when there is actually pending servicing left.
+        $pendingMarkers = [System.Collections.Generic.List[string]]::new()
+        if (Test-Path -LiteralPath (Join-Path $script:WinDriveLetter 'Windows\WinSxS\pending.xml')) {
+            $pendingMarkers.Add('WinSxS\pending.xml') | Out-Null
+        }
+        Invoke-WithHive 'SOFTWARE' {
+            $cbs = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing'
+            foreach ($keyName in @('PackagesPending', 'RebootPending', 'SessionsPending')) {
+                if (Test-Path (Join-Path $cbs $keyName)) { $pendingMarkers.Add("CBS\$keyName") | Out-Null }
+            }
+        }
+        if ($pendingMarkers.Count -gt 0) {
+            Write-Host ""
+            Write-Host "Pending servicing markers are still present: $($pendingMarkers -join ', ')" -ForegroundColor Yellow
+            Write-Host "  If the guest still loops in the update stage, run -AnalyzeServicingState, then -FixPendingUpdates." -ForegroundColor DarkCyan
+        }
+    }
+
     function ClearPendingUpdates {
         if (-not (Confirm-CriticalOperation -Operation 'Fix Pending Updates (-FixPendingUpdates)' -Details @"
 Runs DISM /RevertPendingActions to undo in-progress servicing operations.
 Removes pending update packages found by DISM /Get-Packages.
-Removes TxR and SMI transaction log files (.blf/.regtrans-ms).
+Removes TxR, config and SMI transaction log files (.blf/.regtrans-ms).
+  Each file is backed up first and deleted in place; the folders keep their
+  ACLs, and registry hives and their .LOG1/.LOG2 recovery logs are not touched.
 Renames pending.xml in WinSxS.
 Clears CBS registry keys (PackagesPending, RebootPending, SessionsPending).
 Runs DISM /StartComponentCleanup only if no pending servicing markers remain.
@@ -6378,78 +7358,57 @@ Runs DISM /StartComponentCleanup only if no pending servicing markers remain.
             $removePackageResult.Output | Out-Host
         }
 
-        Write-Host "Clearing transactions from TxR folder..." -ForegroundColor Yellow
-        $TxRFolder = Join-Path $WinDriveLetter "Windows\system32\config\TxR"
-        if (Test-Path $TxRFolder) {
-            $BackupFolder = Join-Path $TxRFolder "Backup"
-            Invoke-Logged -Description 'Clear TxR file attributes' -Details @{ Path = $TxRFolder } -ScriptBlock {
-                Get-ChildItem -Path $TxRFolder -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.Attributes = 'Normal' }
-            } | Out-Null
-            New-Item-Logged -Path $TxRFolder -Name "Backup" -ItemType Directory -Force
-            Copy-Item-Logged -Path (Join-Path $TxRFolder '*') -Destination $BackupFolder -Force
-            Invoke-Logged -Description 'Remove TxR blf/regtrans files' -Details @{ Path = $TxRFolder } -ScriptBlock {
-                Get-ChildItem -Path $TxRFolder -File -Filter *.blf -Force | Remove-Item -Force -ErrorAction SilentlyContinue
-                Get-ChildItem -Path $TxRFolder -File -Filter *.regtrans-ms -Force | Remove-Item -Force -ErrorAction SilentlyContinue
-            }
-
-            # Remove any leftover TxR_OLD from a previous run before renaming
-            $TxROld = Join-Path $WinDriveLetter "Windows\system32\config\TxR_OLD"
-            if (Test-Path $TxROld) {
-                Remove-Item-Logged -Path $TxROld -Recurse -Force
-            }
-            Rename-Item-Logged -Path $TxRFolder -NewName "TxR_OLD"
-            New-Item-Logged -Path (Join-Path $WinDriveLetter "Windows\system32\config") -Name "TxR" -ItemType Directory -Force
-        }
-        else {
-            Write-Host "  TxR folder not found, skipping." -ForegroundColor DarkGray
-        }
-
-        Write-Host "Clearing transactions from Config folder..." -ForegroundColor Yellow
-        $ConfigFolder = Join-Path $WinDriveLetter "Windows\system32\config"
-        $BackupFolder = Join-Path $ConfigFolder "BackupCfg"
-        Invoke-Logged -Description 'Clear Config file attributes' -Details @{ Path = $ConfigFolder } -ScriptBlock {
-            Get-ChildItem -Path $ConfigFolder -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'BackupCfg' } | ForEach-Object { try { $_.Attributes = 'Normal' } catch {} }
-        } | Out-Null
-        if (Test-Path $BackupFolder) {
-            Remove-Item-Logged -Path $BackupFolder -Recurse -Force
-        }
-        New-Item-Logged -Path $ConfigFolder -Name "BackupCfg" -ItemType Directory -Force
-        Copy-Item-Logged -Path (Join-Path $ConfigFolder '*') -Destination $BackupFolder -Force
-        Invoke-Logged -Description 'Remove Config blf/regtrans files' -Details @{ Path = $ConfigFolder } -ScriptBlock {
-            Get-ChildItem -Path $ConfigFolder -File -Filter *.blf -Force | Remove-Item -Force -ErrorAction SilentlyContinue
-            Get-ChildItem -Path $ConfigFolder -File -Filter *.regtrans-ms -Force | Remove-Item -Force -ErrorAction SilentlyContinue
-        }
-
-        Write-Host "Clearing transactions from SMI folder..." -ForegroundColor Yellow
-        $SMIFolder = Join-Path $WinDriveLetter "Windows\System32\SMI\Store\Machine"
-        if (Test-Path $SMIFolder) {
-            $BackupFolder = Join-Path $SMIFolder "Backup"
-            Invoke-Logged -Description 'Clear SMI file attributes' -Details @{ Path = $SMIFolder } -ScriptBlock {
-                Get-ChildItem -Path $SMIFolder -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'Backup' } | ForEach-Object { try { $_.Attributes = 'Normal' } catch {} }
-            } | Out-Null
-            if (Test-Path $BackupFolder) {
-                Remove-Item-Logged -Path $BackupFolder -Recurse -Force
-            }
-            New-Item-Logged -Path $SMIFolder -Name "Backup" -ItemType Directory -Force
-            Copy-Item-Logged -Path (Join-Path $SMIFolder '*') -Destination $BackupFolder -Force
-            Invoke-Logged -Description 'Remove SMI blf/regtrans files' -Details @{ Path = $SMIFolder } -ScriptBlock {
-                Get-ChildItem -Path $SMIFolder -File -Filter *.blf -Force | Remove-Item -Force -ErrorAction SilentlyContinue
-                Get-ChildItem -Path $SMIFolder -File -Filter *.regtrans-ms -Force | Remove-Item -Force -ErrorAction SilentlyContinue
-            }
-        }
-        else {
-            Write-Host "  SMI folder not found, skipping." -ForegroundColor DarkGray
+        # Shared with -FixTxRLogs. Same three folders, same file selection; the helper
+        # backs each log file up, deletes it in place, and then verifies that the
+        # registry hives, their .LOG1/.LOG2 recovery logs and the folder ACLs were left
+        # alone. A scope that fails verification is rolled back from its backup.
+        # See ClearTxRLogs: only objects carrying a Verification property are scope results.
+        $logCleanup = @(Clear-ServicingTransactionLogs -Scope 'TxR', 'Config', 'SMI' | Where-Object { $null -ne $_ -and $_.PSObject.Properties['Verification'] })
+        $logCleanupFailed = @($logCleanup | Where-Object { -not $_.Verification.Passed })
+        if ($logCleanupFailed.Count -gt 0) {
+            Write-Error "Transaction log cleanup failed verification for: $(($logCleanupFailed | ForEach-Object { $_.Label }) -join ', ')."
+            Write-Host "Stopping before pending.xml and the CBS registry changes - the guest just failed a safety check." -ForegroundColor Yellow
+            Write-Host "Review the checks above, then re-run once the underlying problem is understood." -ForegroundColor Yellow
+            return
         }
 
         Write-Host "Renaming pending.xml..." -ForegroundColor Yellow
         $pendingXmlPath = Join-Path $WinDriveLetter "Windows\WinSxS\pending.xml"
         if (Test-Path $pendingXmlPath) {
-            # Remove stale pending.old from a previous run
+            $winSxsPath = Join-Path $WinDriveLetter "Windows\WinSxS"
             $pendingOld = Join-Path $WinDriveLetter "Windows\WinSxS\pending.old"
-            if (Test-Path $pendingOld) {
-                Remove-Item-Logged -Path $pendingOld -Force
+            $winSxsSddl = $null
+            $pendingSddl = $null
+            try {
+                # WinSxS and pending.xml are owned by TrustedInstaller and deny write to
+                # Administrators, so this rename fails with access denied on a real
+                # machine unless ownership is taken first. Renaming a file needs delete
+                # rights on the file and add-file rights on the directory, so both are
+                # taken. Both descriptors are put back in the finally block.
+                $winSxsSddl = Grant-ProtectedPathAccess -Path $winSxsPath
+                $pendingSddl = Grant-ProtectedPathAccess -Path $pendingXmlPath
+
+                # Remove stale pending.old from a previous run
+                if (Test-Path $pendingOld) {
+                    [void](Grant-ProtectedPathAccess -Path $pendingOld)
+                    Remove-Item-Logged -Path $pendingOld -Force
+                }
+                Rename-Item-Logged -Path $pendingXmlPath -NewName "pending.old"
             }
-            Rename-Item-Logged -Path $pendingXmlPath -NewName "pending.old"
+            finally {
+                # Exactly one of these two paths exists, depending on whether the rename
+                # succeeded, and the other call is a no-op.
+                Restore-ProtectedPathAccess -Path $pendingOld -Sddl $pendingSddl
+                Restore-ProtectedPathAccess -Path $pendingXmlPath -Sddl $pendingSddl
+                Restore-ProtectedPathAccess -Path $winSxsPath -Sddl $winSxsSddl
+            }
+
+            if (Test-Path $pendingXmlPath) {
+                Write-Warning "pending.xml is still present at $pendingXmlPath - the rename did not take effect."
+            }
+            else {
+                Write-Host "  pending.xml renamed to pending.old." -ForegroundColor Green
+            }
         }
         else {
             Write-Host "  pending.xml not present, skipping." -ForegroundColor DarkGray
@@ -6469,9 +7428,9 @@ Runs DISM /StartComponentCleanup only if no pending servicing markers remain.
             Remove-ItemProperty-Logged -Path $ComponentsReg -Name "StoreDirty" -Force -ErrorAction SilentlyContinue
 
             Write-Host "Deleting SOFTWARE registry keys..." -ForegroundColor Yellow
-            Remove-Item-Logged -Path (Join-Path $CbsSoftwareReg "PackagesPending") -Recurse -Force
-            Remove-Item-Logged -Path (Join-Path $CbsSoftwareReg "RebootPending") -Recurse -Force
-            Remove-Item-Logged -Path (Join-Path $CbsSoftwareReg "SessionsPending") -Recurse -Force
+            foreach ($cbsKeyName in @('PackagesPending', 'RebootPending', 'SessionsPending')) {
+                [void](Remove-ProtectedRegistryKey -Path (Join-Path $CbsSoftwareReg $cbsKeyName) -Label "CBS\$cbsKeyName")
+            }
         }
 
         $remainingPendingMarkers = [System.Collections.Generic.List[string]]::new()
@@ -9947,6 +10906,7 @@ complete recovery.
         $sevUpdatePendingXml = 1   # pending.xml found (update boot loop risk)
         $sevUpdateTxRLogs = 1   # TxR transaction log files found
         $sevUpdateSmiLogs = 1   # SMI Store transaction log files found
+        $sevUpdateLogFull = 2   # CBS.log reports 0x800719e4 / ERROR_LOG_FULL
         $sevSetupMode = 0   # SetupType active (Setup CmdLine will run at boot)
 
         # BCD / Boot Configuration
@@ -10257,25 +11217,73 @@ complete recovery.
             & $emit 'Boot' (& $toSev $sevBootNtbtlog) "$($ntbtlogpath) present - check for DIDNOTLOAD entries" "-CollectEventLogs"
         }
 
-        if (Test-Path (Join-Path $script:WinDriveLetter 'Windows\WinSxS\pending.xml')) {
+        $pendingXmlPresent = Test-Path (Join-Path $script:WinDriveLetter 'Windows\WinSxS\pending.xml')
+        if ($pendingXmlPresent) {
             & $emit 'WindowsUpdate' (& $toSev $sevUpdatePendingXml) 'Pending Windows Update transaction (pending.xml) - may cause boot loop on Configuring Updates screen' "-FixPendingUpdates"
         }
 
-        # TxR transaction log files (leftover .blf/.regtrans-ms cause stuck update processing)
+        # 0x800719e4 / ERROR_LOG_FULL - the CLFS/KTM transaction logs are exhausted, so
+        # servicing cannot commit. Clearing the logs is the documented repair; reverting
+        # pending updates is not needed and is heavier than the scenario calls for.
+        # Evaluated before the TxR/SMI checks below because it is what makes the presence
+        # of those files meaningful.
+        # https://learn.microsoft.com/troubleshoot/windows-server/installing-updates-features-roles/error-0x800719e4-windows-update-fails
+        $logFullHits = @()
+        $cbsLogPath = Join-Path $script:WinDriveLetter 'Windows\Logs\CBS\CBS.log'
+        if (Test-Path $cbsLogPath) {
+            try {
+                $cbsTail = Get-Content -LiteralPath $cbsLogPath -Tail 4000 -ErrorAction Stop
+                $logFullHits = @($cbsTail | Where-Object {
+                        $_ -match '0x800719e4' -or
+                        $_ -match 'ERROR_LOG_FULL' -or
+                        $_ -match 'Failed while processing non-critical driver operations queue'
+                    })
+                if ($logFullHits.Count -gt 0) {
+                    & $emit 'WindowsUpdate' (& $toSev $sevUpdateLogFull) "CBS.log reports transaction log exhaustion ($($logFullHits.Count) hit(s), e.g. 0x800719e4/ERROR_LOG_FULL) - see KB error-0x800719e4-windows-update-fails" "-FixTxRLogs"
+                }
+            }
+            catch {
+                # SysCheck is read-only; a locked or unreadable CBS.log must not fail it.
+                Write-Verbose "CBS.log could not be read for transaction log analysis: $($_.Exception.Message)"
+            }
+        }
+        $servicingStuck = ($logFullHits.Count -gt 0) -or $pendingXmlPresent
+
+        # Transaction log files in config\TxR and SMI\Store\Machine.
+        #
+        # Presence alone is NOT a fault. Every healthy Windows installation keeps these
+        # files - verified on clean Server 2012 R2, 2016, 2019 and 2022 images, all of
+        # which carry a full set. Reporting them as a problem produces a warning on every
+        # machine ever scanned, so they are reported as INFO and only become actionable
+        # when something else shows servicing is genuinely stuck.
+        #
+        # Note the -Force on the enumeration. These files are Hidden+System, so a plain
+        # Get-ChildItem returns nothing at all and the check can never fire.
         $txrFolder = Join-Path $script:WinDriveLetter 'Windows\System32\config\TxR'
         if (Test-Path $txrFolder) {
-            $txrFiles = @(Get-ChildItem $txrFolder -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @('.blf', '.regtrans-ms') })
+            $txrFiles = @(Get-ChildItem $txrFolder -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @('.blf', '.regtrans-ms') })
             if ($txrFiles.Count -gt 0) {
-                & $emit 'WindowsUpdate' (& $toSev $sevUpdateTxRLogs) "$($txrFiles.Count) TxR transaction log file(s) found in config\TxR (.blf/.regtrans-ms) - may cause update processing to hang at boot" "-FixPendingUpdates"
+                $txrKB = [math]::Round((($txrFiles | Measure-Object -Property Length -Sum).Sum) / 1KB)
+                if ($servicingStuck) {
+                    & $emit 'WindowsUpdate' (& $toSev $sevUpdateTxRLogs) "$($txrFiles.Count) TxR transaction log file(s) in config\TxR ($txrKB KB) alongside evidence that servicing is stuck - clearing them is the documented repair" "-FixTxRLogs"
+                }
+                else {
+                    & $emit 'WindowsUpdate' 'INFO' "config\TxR holds $($txrFiles.Count) transaction log file(s) ($txrKB KB) - normal for a healthy installation, no action needed"
+                }
             }
         }
 
-        # SMI Store transaction files
         $smiFolder = Join-Path $script:WinDriveLetter 'Windows\System32\SMI\Store\Machine'
         if (Test-Path $smiFolder) {
-            $smiFiles = @(Get-ChildItem $smiFolder -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @('.blf', '.regtrans-ms') })
+            $smiFiles = @(Get-ChildItem $smiFolder -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @('.blf', '.regtrans-ms') })
             if ($smiFiles.Count -gt 0) {
-                & $emit 'WindowsUpdate' (& $toSev $sevUpdateSmiLogs) "$($smiFiles.Count) SMI Store transaction log file(s) found (.blf/.regtrans-ms) - may cause update boot loop" "-FixPendingUpdates"
+                $smiKB = [math]::Round((($smiFiles | Measure-Object -Property Length -Sum).Sum) / 1KB)
+                if ($servicingStuck) {
+                    & $emit 'WindowsUpdate' (& $toSev $sevUpdateSmiLogs) "$($smiFiles.Count) SMI Store transaction log file(s) ($smiKB KB) alongside evidence that servicing is stuck" "-FixTxRLogs -TransactionLogScope SMI"
+                }
+                else {
+                    & $emit 'WindowsUpdate' 'INFO' "SMI\Store\Machine holds $($smiFiles.Count) transaction log file(s) ($smiKB KB) - normal for a healthy installation, no action needed"
+                }
             }
         }
 
@@ -15720,7 +16728,7 @@ public static class RepairAzVmDiskRegistryLastWrite {
         }
 
         $cbsLog = Join-Path $windowsRoot 'Logs\CBS\CBS.log'
-        foreach ($entry in (Read-RecentChangeLogMatches -Path $cbsLog -Pattern 'Package_for_|KB\d{6,}|Failed|failure|error|Reboot required|corrupt|rollback|Session:' -Cutoff $Cutoff -Tail 8000 -Limit 40)) {
+        foreach ($entry in (Read-RecentChangeLogMatches -Path $cbsLog -Pattern 'Package_for_|KB\d{6,}|Failed|failure|error|0x800719e4|ERROR_LOG_FULL|Reboot required|corrupt|rollback|Session:' -Cutoff $Cutoff -Tail 8000 -Limit 40)) {
             $line = [string]$entry.Line
             $severity = 'INFO'
             $priority = 70
@@ -15729,6 +16737,15 @@ public static class RepairAzVmDiskRegistryLastWrite {
             $switch = '-AnalyzeServicingState'
             if ($line -match 'CSI Payload Corrupt|CSI Manifest Corrupt|CBS_E_STORE_CORRUPTION|Mark store corruption') {
                 $severity = 'CRITICAL'; $priority = 15; $impact = 'Component store corruption can block updates, repair, or boot.'; $switch = '-AnalyzeComponentStore'
+            }
+            # Must stay above the generic Failed/error branch: an ERROR_LOG_FULL line
+            # also matches 'error', and the generic branch would mis-route it to
+            # -AnalyzeServicingState instead of the transaction log repair.
+            elseif ($line -match '0x800719e4|ERROR_LOG_FULL') {
+                $severity = 'CRITICAL'; $priority = 20
+                $impact = 'The CLFS/KTM transaction logs are full, so servicing cannot commit. Updates fail and the guest can hang in the update stage.'
+                $nextStep = 'Clear the transaction logs, then boot and retry the update. Reverting pending updates is not required for this failure.'
+                $switch = '-FixTxRLogs'
             }
             elseif ($line -match 'Failed|failure|\[HRESULT = 0x(?!00000000)|CBS_E_|error') {
                 $severity = 'WARN'; $priority = 35; $impact = 'A recent CBS package or session error may be related to update rollback or boot loops.'; $switch = '-AnalyzeServicingState'
@@ -16455,6 +17472,23 @@ public static class RepairAzVmDiskRegistryLastWrite {
         $pendingXml = Join-Path $script:WinDriveLetter 'Windows\WinSxS\pending.xml'
         $hasPendingXml = Test-Path -LiteralPath $pendingXml
 
+        # Transaction log inventory. Read-only, and reported alongside the pending
+        # markers so the two failure modes can be told apart: log exhaustion needs
+        # -FixTxRLogs, an interrupted install needs -FixPendingUpdates.
+        $logPlan = @(Get-TransactionLogCleanupPlan -Scope 'TxR', 'Config', 'SMI' -SkipHiveState)
+        $totalLogFiles = 0
+        foreach ($scopePlan in $logPlan) { $totalLogFiles += $scopePlan.Snapshot.LogFiles.Count }
+
+        $logFullHits = 0
+        $cbsLog = Join-Path $script:WinDriveLetter 'Windows\Logs\CBS\CBS.log'
+        if (Test-Path -LiteralPath $cbsLog) {
+            try {
+                $logFullHits = @(Get-Content -LiteralPath $cbsLog -Tail 4000 -ErrorAction Stop |
+                        Where-Object { $_ -match '0x800719e4' -or $_ -match 'ERROR_LOG_FULL' }).Count
+            }
+            catch { Write-Verbose "CBS.log could not be read: $($_.Exception.Message)" }
+        }
+
         Invoke-WithHive 'SOFTWARE', 'COMPONENTS' {
             $cbs = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing'
             $counts = @{}
@@ -16474,12 +17508,28 @@ public static class RepairAzVmDiskRegistryLastWrite {
                 PendingXmlIdentifier = $cp.PendingXmlIdentifier
                 NextQueueEntryIndex  = $cp.NextQueueEntryIndex
                 StoreDirty           = $cp.StoreDirty
+                TxRLogFiles          = ($logPlan | Where-Object { $_.Scope -eq 'TxR' }).Snapshot.LogFiles.Count
+                ConfigLogFiles       = ($logPlan | Where-Object { $_.Scope -eq 'Config' }).Snapshot.LogFiles.Count
+                SmiLogFiles          = ($logPlan | Where-Object { $_.Scope -eq 'SMI' }).Snapshot.LogFiles.Count
+                LogFullErrors        = $logFullHits
             } | Format-List
 
-            if ($hasPendingXml -or $counts['PackagesPending'] -gt 0 -or $counts['SessionsPending'] -gt 0 -or $counts['RebootPending'] -gt 0) {
+            $hasPendingMarkers = ($hasPendingXml -or $counts['PackagesPending'] -gt 0 -or $counts['SessionsPending'] -gt 0 -or $counts['RebootPending'] -gt 0)
+
+            if ($logFullHits -gt 0) {
+                Write-Warning "CBS.log reports transaction log exhaustion ($logFullHits hit(s) of 0x800719e4/ERROR_LOG_FULL)."
+                Write-Host "  Run -FixTxRLogs to clear the transaction logs, then boot and retry the update." -ForegroundColor DarkCyan
+                Write-Host "  See: https://learn.microsoft.com/troubleshoot/windows-server/installing-updates-features-roles/error-0x800719e4-windows-update-fails" -ForegroundColor DarkCyan
+            }
+
+            if ($hasPendingMarkers) {
                 Write-Warning "Servicing pending markers detected. If boot loops in update stage, consider -FixPendingUpdates."
             }
-            else {
+            elseif ($totalLogFiles -gt 0 -and $logFullHits -eq 0) {
+                Write-Host "No pending servicing markers, but $totalLogFiles transaction log file(s) are present." -ForegroundColor Yellow
+                Write-Host "  If the guest hangs in the update stage, -FixTxRLogs clears them without reverting any update." -ForegroundColor DarkCyan
+            }
+            elseif (-not $hasPendingMarkers) {
                 Write-Host "No major pending servicing markers detected." -ForegroundColor Green
             }
         }
@@ -16930,6 +17980,8 @@ No destructive file or registry cleanup is performed.
             [switch]$FixRDPAuth,
             [switch]$FixUserRights,
             [switch]$FixPendingUpdates,
+        [switch]$FixTxRLogs,
+        [string[]]$TransactionLogScope = @('TxR'),
             [switch]$DisableWindowsUpdate,
             [switch]$RestoreRegistryFromRegBack,
             [switch]$EnableRegBackup,
@@ -17172,6 +18224,8 @@ PARAMETERS:
     -AnalyzeRecentChanges  Correlate recent update, driver, software, registry and file changes into top suspects
   -ListInstalledUpdates  List installed Windows Updates (KB numbers) from offline CBS packages
   -DisableWindowsUpdate  Disable Windows Update services to stop boot loops
+  -FixTxRLogs            Clear TxR/config/SMI transaction logs only (KB 0x800719e4, no update rollback)
+    -TransactionLogScope <TxR|Config|SMI|All>  Which folders to clear (default: TxR)
   -FixPendingUpdates     Remove pending Windows Update transactions
   -UninstallWindowsUpdate <KB>  Mark a KB update as Absent in CBS (offline best-effort uninstall)
   -PrepareRecoveryDiagnostics  Bundle for broken VMs: boot log + serial console + full memory dump config
@@ -17235,7 +18289,7 @@ AVAILABLE DISKS:
         # Initialize logging and target (resolve VM/disk, bring disk online, detect partitions)
         # Determine if any write/repair action was requested (exclude pure read-only switches)
         $readOnlySwitches = @('SysCheck', 'CheckDiskHealth', 'ScanNetBindings', 'CheckRDPPolicies', 'CollectEventLogs', 'CollectMinidumps', 'ShowLastSession', 'GetServicesReport', 'GetAppLockerReport', 'ListInstalledUpdates', 'ListStartupPrograms', 'AnalyzeCriticalBootFiles', 'AnalyzeSyntheticDrivers', 'AnalyzeProxyState', 'GetBootPathReport', 'AnalyzeBcdConsistency', 'AnalyzeComponentStore', 'AnalyzeServicingState', 'AnalyzeRecentChanges', 'AnalyzeDomainTrustState')
-        $hasRepairAction = $PSBoundParameters.Keys | Where-Object { $readOnlySwitches -notcontains $_ -and $_ -notin @('VMName', 'DiskNumber', 'Force', 'LeaveDiskOnline', 'DriveLetter', 'RepairSource', 'CodeIntegrityPolicySourcePath', 'IncludeServices', 'IssuesOnly', 'KeepDefaultFilters', 'DriverStartType', 'RecentChangeDays', 'LoadHive', 'UnloadHive') }
+        $hasRepairAction = $PSBoundParameters.Keys | Where-Object { $readOnlySwitches -notcontains $_ -and $_ -notin @('VMName', 'DiskNumber', 'Force', 'LeaveDiskOnline', 'DriveLetter', 'RepairSource', 'CodeIntegrityPolicySourcePath', 'IncludeServices', 'IssuesOnly', 'KeepDefaultFilters', 'DriverStartType', 'RecentChangeDays', 'LoadHive', 'UnloadHive', 'TransactionLogScope') }
         if ($hasRepairAction) {
             Write-Host "  Tip: if you haven't already, a VM snapshot or disk backup before making changes is always a safe starting point." -ForegroundColor DarkGray
             Write-Host ""
@@ -17289,6 +18343,7 @@ AVAILABLE DISKS:
             if ($EnableNLA) { SetNLA -Enable $true }
             if ($EnableWinRMHTTPS) { SetWinRMHTTPSEnabled }
             if ($FixPendingUpdates) { ClearPendingUpdates }
+        if ($FixTxRLogs) { ClearTxRLogs -Scope $TransactionLogScope }
             if ($DisableWindowsUpdate) { DisableWindowsUpdate }
             if ($FixUserRights) { ResetUserRights }
             if ($RestoreRegistryFromRegBack) { RestoreRegistryFromRegBack }
