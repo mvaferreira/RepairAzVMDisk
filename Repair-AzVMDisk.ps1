@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.7.1
+        Version: 0.7.2
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -983,6 +983,328 @@ end {
                 Error       = $_.ToString()
             }
             throw
+        }
+    }
+
+    function Clear-OrphanedOfflineHiveMount {
+        # DISM mounts the offline image's hives as application hives named "{GUID}<image path>"
+        # directly under HKLM. Those mounts hold the image's registry files open *exclusively*.
+        # If DISM exits abnormally they survive with no owning process, so the files stay locked:
+        # no further offline repair can read them and the disk cannot be detached cleanly. The
+        # lock has no visible owner, which makes it very hard to diagnose from the symptom alone.
+        #
+        # Only mounts belonging to the image drive being repaired are released, so unrelated
+        # application hives on the rescue host are never touched.
+        param([Parameter(Mandatory = $true)][string]$ImageDriveLetter)
+
+        $letter = $ImageDriveLetter.Trim().TrimEnd('\').TrimEnd(':')
+        if ([string]::IsNullOrWhiteSpace($letter)) { return @() }
+        $needle = $letter + ':/'
+
+        $names = @()
+        try { $names = @([Microsoft.Win32.Registry]::LocalMachine.GetSubKeyNames()) } catch { }
+        if ($names.Count -eq 0) {
+            try {
+                $names = @((& reg.exe query HKLM 2>&1) |
+                    Where-Object { $_ -match '^HKEY_LOCAL_MACHINE\\' } |
+                    ForEach-Object { $_ -replace '^HKEY_LOCAL_MACHINE\\', '' })
+            }
+            catch { return @() }
+        }
+
+        $released = [System.Collections.Generic.List[string]]::new()
+        foreach ($name in $names) {
+            if ($name -notmatch '^\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}') { continue }
+            if ($name.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+            & reg.exe unload "HKLM\$name" 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) { $released.Add($name) | Out-Null }
+        }
+        return $released.ToArray()
+    }
+
+    function Get-DismProcessTreeSample {
+        # DISM delegates the real work to DismHost.exe children, so sampling dism.exe alone
+        # under-reports activity. Walk the whole tree.
+        param([Parameter(Mandatory = $true)][int]$RootProcessId)
+
+        $ids = New-Object 'System.Collections.Generic.HashSet[int]'
+        [void]$ids.Add($RootProcessId)
+
+        $all = @()
+        try {
+            $all = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop -Property `
+                ProcessId, ParentProcessId, ReadOperationCount, WriteOperationCount,
+                OtherOperationCount, ReadTransferCount, WriteTransferCount, UserModeTime, KernelModeTime)
+        }
+        catch {
+            return [pscustomobject]@{ Ids = @($RootProcessId); Processes = 0; IoOperations = [uint64]0; IoBytes = [uint64]0; CpuSeconds = 0.0 }
+        }
+
+        for ($pass = 0; $pass -lt 8; $pass++) {
+            $grew = $false
+            foreach ($proc in $all) {
+                $childId = [int]$proc.ProcessId
+                if ($ids.Contains([int]$proc.ParentProcessId) -and -not $ids.Contains($childId)) {
+                    [void]$ids.Add($childId); $grew = $true
+                }
+            }
+            if (-not $grew) { break }
+        }
+
+        $count = 0
+        $operations = [uint64]0
+        $bytes = [uint64]0
+        $cpu = 0.0
+        foreach ($proc in $all) {
+            if (-not $ids.Contains([int]$proc.ProcessId)) { continue }
+            $count++
+            $operations += [uint64]$proc.ReadOperationCount + [uint64]$proc.WriteOperationCount + [uint64]$proc.OtherOperationCount
+            $bytes += [uint64]$proc.ReadTransferCount + [uint64]$proc.WriteTransferCount
+            $cpu += ([double]$proc.UserModeTime + [double]$proc.KernelModeTime) / 10000000.0
+        }
+
+        return [pscustomobject]@{
+            Ids = @($ids); Processes = $count; IoOperations = $operations; IoBytes = $bytes; CpuSeconds = [math]::Round($cpu, 1)
+        }
+    }
+
+    function Stop-DismProcessTree {
+        param([Parameter(Mandatory = $true)][int]$RootProcessId)
+        $tree = Get-DismProcessTreeSample -RootProcessId $RootProcessId
+        foreach ($id in ($tree.Ids | Sort-Object -Descending)) {
+            Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Seconds 3
+    }
+
+    function Invoke-DismWithWatchdog {
+        <#
+            Runs DISM as a monitored child process rather than blocking on it indefinitely.
+
+            *Progress*, not elapsed time, decides whether DISM is alive. A component cleanup on
+            a large WinSxS legitimately runs for a long time, so a fixed timeout would kill real
+            work. Liveness is therefore measured from DISM's own /LogPath file and the bytes its
+            process tree moves - both of which advance continuously while it is working.
+
+            Measured on a healthy Server 2022 image, a full cleanup ran for 1.5 minutes with the
+            log growing and I/O bytes climbing throughout.
+
+            Measured on a damaged Server 2012 R2 image, DISM alternated between bursts of heavy
+            work and long CPU-bound phases during which the log and the I/O byte counters stayed
+            byte-for-byte identical - the two longest such phases lasted 9.0 and 8.5 minutes -
+            before resuming full-speed work. It was never actually hung. Terminating it during
+            one of those silent phases would have destroyed legitimate work.
+
+            No hang was ever actually reproduced, so nothing is terminated automatically:
+            -StallMinutes and -MaximumMinutes both default to 0, meaning DISM runs to completion
+            however long it takes. Interrupting a live component cleanup risks leaving the store
+            inconsistent, and there is no evidence a timeout would ever be correcting a real
+            fault. Both limits remain available for an operator who needs a bounded run.
+
+            What this function is really for is the other two behaviours. First, telling the
+            operator DISM is alive: a terminal that prints nothing for two hours is what makes
+            people kill DISM prematurely, which is precisely what happened while developing this.
+            Second, guaranteeing DISM's hive mounts are released even when the run is interrupted.
+
+            CPU time and I/O *operation counts* are deliberately not used as progress signals.
+            Throughout those silent phases the process tree still issued roughly 22 zero-byte
+            operations per second and pegged a full core, so either signal would report a
+            genuinely stuck DISM as healthy indefinitely. Log growth and I/O *bytes* move
+            together whenever real work is happening, and are the only signals trusted here.
+
+            Note DISM does not write to the host's default log, nor to the offline image's own
+            Windows\Logs\DISM\dism.log, once /LogPath is supplied. Watching either of those to
+            judge liveness gives a permanently frozen reading and is meaningless.
+
+            Progress is reported to the operator every 5 minutes so a slow-but-alive cleanup is
+            visibly distinguishable from a dead one while it runs.
+        #>
+        param(
+            [Parameter(Mandatory = $true)][string]$Description,
+            [Parameter(Mandatory = $true)][string[]]$ArgumentList,
+            [string]$ImageDriveLetter = '',
+            [hashtable]$Details = @{},
+            [int[]]$AcceptedExitCodes = @(0),
+            [int]$StallMinutes = 0,
+            [int]$MaximumMinutes = 0,
+            [int]$PollSeconds = 15
+        )
+
+        $scratch = 'C:\Temp'
+        if (-not (Test-Path -LiteralPath $scratch)) { New-Item -ItemType Directory -Path $scratch -Force | Out-Null }
+        $token = '{0}-{1}' -f ($Description -replace '[^\w]', ''), (Get-Date).ToString('yyyyMMdd-HHmmss-fff')
+        $dismLogPath = Join-Path $scratch "RepairAzVMDisk-$token.log"
+        $stdOutPath = Join-Path $scratch "RepairAzVMDisk-$token.out"
+        $stdErrPath = Join-Path $scratch "RepairAzVMDisk-$token.err"
+
+        $effectiveArgs = @($ArgumentList) + @("/LogPath:$dismLogPath")
+        $start = Get-Date
+        $stallDetected = $false
+        $timedOut = $false
+        $proc = $null
+
+        # A DISM that ended abnormally earlier can leave the image's hives mounted, which would
+        # make this run fail on files it cannot open. Clear any that are already orphaned.
+        if (-not [string]::IsNullOrWhiteSpace($ImageDriveLetter)) {
+            $stale = @(Clear-OrphanedOfflineHiveMount -ImageDriveLetter $ImageDriveLetter)
+            if ($stale.Count -gt 0) {
+                Write-Warning ("Released {0} offline registry hive mount(s) left over from an earlier DISM run before starting." -f $stale.Count)
+            }
+        }
+
+        try {
+            $proc = Start-Process -FilePath 'dism.exe' -ArgumentList $effectiveArgs -PassThru -WindowStyle Hidden `
+                -RedirectStandardOutput $stdOutPath -RedirectStandardError $stdErrPath -ErrorAction Stop
+        }
+        catch {
+            Write-ActionLog -Event 'ActionExecuted' -Details @{
+                Description = $Description; Start = $start.ToString('o'); End = (Get-Date).ToString('o')
+                Success = $false; Details = $Details; Error = $_.ToString()
+            }
+            throw
+        }
+
+        # Start-Process -PassThru returns a Process object whose native handle PowerShell does not
+        # keep open. Reading .ExitCode after the process ends then yields $null *and throws
+        # nothing*, so a try/catch around it cannot detect the problem - and because
+        # $null -in @(0) is false, every DISM run would be scored as a failure. Touching .Handle
+        # now makes the object cache the handle so the real exit code survives the process.
+        # Measured on the rescue host: without this line ExitCode is $null, with it the true
+        # code is returned.
+        try { $null = $proc.Handle } catch { }
+
+        $lastProgress = $start
+        $previousLogLength = -1L
+        $previousSample = $null
+        $nextReportMinutes = 5
+        $completedNormally = $false
+        $releasedMounts = @()
+
+        try {
+        while ($true) {
+            if ($proc.WaitForExit($PollSeconds * 1000)) { break }
+            $now = Get-Date
+
+            $logLength = -1L
+            try {
+                if (Test-Path -LiteralPath $dismLogPath) { $logLength = (Get-Item -LiteralPath $dismLogPath -Force).Length }
+            }
+            catch { }
+            $sample = Get-DismProcessTreeSample -RootProcessId $proc.Id
+
+            # Liveness = DISM's log grew, or DISM actually moved bytes to or from disk.
+            #
+            # I/O *operation counts* are deliberately excluded. Measured against a stuck offline
+            # cleanup: the process tree kept issuing roughly 22 zero-byte operations per second
+            # and pegged a full core, while IoBytes and the log file stayed byte-for-byte
+            # identical for the entire observation. Treating operation counts as progress would
+            # make that spin look alive indefinitely - precisely the failure this guards against.
+            $moved = $false
+            if ($logLength -gt $previousLogLength) { $moved = $true }
+            elseif ($null -eq $previousSample) { $moved = $true }
+            elseif ($sample.IoBytes -gt $previousSample.IoBytes) { $moved = $true }
+
+            $previousLogLength = $logLength
+            $previousSample = $sample
+            if ($moved) { $lastProgress = $now }
+
+            $ranMinutes = ($now - $start).TotalMinutes
+            $silentMinutes = ($now - $lastProgress).TotalMinutes
+            if ($ranMinutes -ge $nextReportMinutes) {
+                if ($silentMinutes -lt 1) {
+                    $state = 'working'
+                }
+                else {
+                    # Silent stretches of several minutes are normal for offline component
+                    # cleanup and do not mean DISM is stuck; say so rather than alarming.
+                    $state = 'quiet for {0:N0} min (normal in bursts)' -f $silentMinutes
+                }
+                Write-Host ("  DISM still running - {0:N0} min elapsed, {1} [{2} proc, {3:N0} MB I/O, {4}s CPU]" -f `
+                        $ranMinutes, $state, $sample.Processes, ($sample.IoBytes / 1MB), $sample.CpuSeconds) -ForegroundColor DarkGray
+                $nextReportMinutes += 5
+            }
+
+            if ($StallMinutes -gt 0 -and $silentMinutes -ge $StallMinutes) { $stallDetected = $true; break }
+            if ($MaximumMinutes -gt 0 -and $ranMinutes -ge $MaximumMinutes) { $timedOut = $true; break }
+        }
+
+        if ($stallDetected -or $timedOut) {
+            $reason = if ($stallDetected) { "made no measurable progress for $StallMinutes minute(s)" } else { "exceeded the $MaximumMinutes minute limit" }
+            Write-Warning "$Description $reason and is being stopped. DISM's own log: $dismLogPath"
+            Stop-DismProcessTree -RootProcessId $proc.Id
+        }
+        $completedNormally = $true
+        }
+        finally {
+            # Runs on the normal path and, critically, when the operator interrupts with Ctrl+C
+            # or an error unwinds the pipeline. Left alone, an abandoned DISM keeps servicing the
+            # image, and its hive mounts survive with no owning process holding the image's
+            # registry files open exclusively - after which the disk can be neither read nor
+            # detached, with no visible lock owner to explain why.
+            if (-not $completedNormally -and $null -ne $proc) {
+                $stillRunning = $false
+                try { $stillRunning = -not $proc.HasExited } catch { }
+                if ($stillRunning) {
+                    Write-Warning "$Description was interrupted; stopping DISM so the image is not left mid-servicing."
+                    Stop-DismProcessTree -RootProcessId $proc.Id
+                }
+            }
+            if (-not [string]::IsNullOrWhiteSpace($ImageDriveLetter)) {
+                $releasedMounts = @(Clear-OrphanedOfflineHiveMount -ImageDriveLetter $ImageDriveLetter)
+                if ($releasedMounts.Count -gt 0) {
+                    Write-Warning ("Released {0} offline registry hive mount(s) left behind by DISM. Without this the image's registry files stay locked by a mount that has no owning process." -f $releasedMounts.Count)
+                }
+            }
+        }
+
+        $exitCode = -1
+        if (-not ($stallDetected -or $timedOut)) {
+            try { $exitCode = $proc.ExitCode } catch { $exitCode = $null }
+            # Belt and braces: never let a missing exit code be scored silently either way.
+            if ($null -eq $exitCode) {
+                Write-Warning "$Description ended but Windows reported no exit code; treating it as a failure. DISM's own log: $dismLogPath"
+                $exitCode = -1
+            }
+        }
+        $end = Get-Date
+
+
+        $output = @()
+        foreach ($streamPath in @($stdOutPath, $stdErrPath)) {
+            try {
+                if (Test-Path -LiteralPath $streamPath) {
+                    $output += @(Get-Content -LiteralPath $streamPath -ErrorAction SilentlyContinue | Where-Object { $_ -ne '' })
+                }
+            }
+            catch { }
+        }
+
+        $success = $exitCode -in $AcceptedExitCodes
+        Write-ActionLog -Event 'ActionExecuted' -Details @{
+            Description       = $Description
+            Start             = $start.ToString('o')
+            End               = $end.ToString('o')
+            Success           = $success
+            Details           = $Details
+            ExitCode          = $exitCode
+            AcceptedExitCodes = $AcceptedExitCodes
+            DurationMinutes   = [math]::Round(($end - $start).TotalMinutes, 1)
+            StallDetected     = $stallDetected
+            TimedOut          = $timedOut
+            DismLogPath       = $dismLogPath
+            ReleasedHiveMounts = $releasedMounts
+            Output            = ($output | Out-String)
+        }
+
+        return [PSCustomObject]@{
+            Output             = $output
+            ExitCode           = $exitCode
+            Success            = $success
+            StallDetected      = $stallDetected
+            TimedOut           = $timedOut
+            DurationMinutes    = [math]::Round(($end - $start).TotalMinutes, 1)
+            DismLogPath        = $dismLogPath
+            ReleasedHiveMounts = $releasedMounts
         }
     }
 
@@ -6982,12 +7304,86 @@ public static class RepairAzVmDiskServicingPrivilege
         return $null
     }
 
+    function Get-ProtectedRegistryKeySddl {
+        # Captures Owner, Group and DACL so the descriptor can be replayed verbatim.
+        # The SACL is deliberately excluded: reading it needs SeSecurityPrivilege and
+        # nothing here changes auditing.
+        param([Parameter(Mandatory = $true)][string]$Path)
+
+        $subKey = ConvertTo-HklmSubKeyPath -Path $Path
+        if (-not $subKey) { return $null }
+
+        $root = [Microsoft.Win32.Registry]::LocalMachine
+        $key = $null
+        try {
+            $key = $root.OpenSubKey(
+                $subKey,
+                [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadSubTree,
+                [System.Security.AccessControl.RegistryRights]::ReadPermissions)
+            if (-not $key) { return $null }
+            $sections = [System.Security.AccessControl.AccessControlSections]::Access -bor
+            [System.Security.AccessControl.AccessControlSections]::Owner -bor
+            [System.Security.AccessControl.AccessControlSections]::Group
+            return $key.GetAccessControl($sections).GetSecurityDescriptorSddlForm('Owner,Group,Access')
+        }
+        catch {
+            return $null
+        }
+        finally {
+            if ($key) { $key.Close() }
+        }
+    }
+
+    function Restore-ProtectedRegistryKeyAccess {
+        # Replays a descriptor captured by Get-ProtectedRegistryKeySddl. A null Sddl
+        # means nothing was captured, so there is nothing to put back.
+        param(
+            [Parameter(Mandatory = $true)][string]$Path,
+            [string]$Sddl
+        )
+
+        if (-not $Sddl) { return }
+        $subKey = ConvertTo-HklmSubKeyPath -Path $Path
+        if (-not $subKey) { return }
+
+        $root = [Microsoft.Win32.Registry]::LocalMachine
+        $key = $null
+        try {
+            $rights = [System.Security.AccessControl.RegistryRights]::TakeOwnership -bor
+            [System.Security.AccessControl.RegistryRights]::ChangePermissions -bor
+            [System.Security.AccessControl.RegistryRights]::ReadPermissions
+            $key = $root.OpenSubKey(
+                $subKey,
+                [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+                $rights)
+            if (-not $key) { return }
+            $security = [System.Security.AccessControl.RegistrySecurity]::new()
+            $security.SetSecurityDescriptorSddlForm($Sddl)
+            $key.SetAccessControl($security)
+        }
+        catch {
+            Write-Warning "Could not restore the original security descriptor on $Path : $($_.Exception.Message)"
+        }
+        finally {
+            if ($key) { $key.Close() }
+            [System.GC]::Collect()
+            [System.GC]::WaitForPendingFinalizers()
+        }
+    }
+
     function Grant-ProtectedRegistryKeyAccess {
         # Takes ownership of an offline-hive key and every key below it. Deleting a key
         # requires delete rights on that key and on all of its subkeys, so the whole
-        # subtree is covered. The parent is owned first, because its children cannot be
-        # enumerated reliably until it is readable.
-        param([Parameter(Mandatory = $true)][string]$Path)
+        # subtree is covered. The key named by -Path is granted before its children,
+        # because they cannot be enumerated reliably until it is readable.
+        #
+        # -KeyOnly grants the named key alone. Use it for a parent such as 'Component
+        # Based Servicing', where recursing would rewrite the ACL of every package key
+        # in the hive - tens of thousands of them - for no benefit.
+        param(
+            [Parameter(Mandatory = $true)][string]$Path,
+            [switch]$KeyOnly
+        )
 
         Enable-ServicingRepairPrivilege
         $me = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User
@@ -7040,9 +7436,11 @@ public static class RepairAzVmDiskServicingPrivilege
 
         & $grantOne $Path
 
-        $children = @(Get-ChildItem -LiteralPath $Path -Recurse -ErrorAction SilentlyContinue |
-            ForEach-Object { $_.PSPath })
-        foreach ($child in $children) { & $grantOne $child }
+        if (-not $KeyOnly) {
+            $children = @(Get-ChildItem -LiteralPath $Path -Recurse -ErrorAction SilentlyContinue |
+                ForEach-Object { $_.PSPath })
+            foreach ($child in $children) { & $grantOne $child }
+        }
 
         # The provider opens keys of its own while enumerating; releasing them keeps the
         # later reg unload from failing.
@@ -7055,6 +7453,16 @@ public static class RepairAzVmDiskServicingPrivilege
         # delete is silent. The CBS pending keys are owned by TrustedInstaller and deny
         # delete to Administrators on a real machine, so the plain attempt is verified
         # and ownership is taken only when it is actually needed.
+        #
+        # Owning the key itself is NOT sufficient. Deleting a subkey opens the PARENT for
+        # write, so a parent such as 'Component Based Servicing' that grants SYSTEM only
+        # KEY_READ refuses the delete with a SecurityException before the child's ACL is
+        # ever consulted. Whether that bites depends on the parent's ACL, which varies by
+        # OS build and servicing history, so the parent is always granted on the retry.
+        #
+        # The parent survives the repair, unlike the child, so its original descriptor is
+        # captured first and replayed in a finally. Leaving CBS owned by the repairing
+        # account would be the same class of regression as the old TxR rename.
         param(
             [Parameter(Mandatory = $true)][string]$Path,
             [string]$Label = ''
@@ -7067,17 +7475,30 @@ public static class RepairAzVmDiskServicingPrivilege
         if (-not (Test-Path -LiteralPath $Path)) { return $true }
 
         Write-Host "  $Label is protected by its own ACL; taking ownership and retrying." -ForegroundColor DarkGray
+        $parentPath = Split-Path -Parent $Path
+        $parentSddl = $null
         try {
+            if ($parentPath) {
+                $parentSddl = Get-ProtectedRegistryKeySddl -Path $parentPath
+                Grant-ProtectedRegistryKeyAccess -Path $parentPath -KeyOnly
+            }
             Grant-ProtectedRegistryKeyAccess -Path $Path
         }
         catch {
             Write-Warning "Could not take ownership of $Label : $($_.Exception.Message)"
+            if ($parentPath) { Restore-ProtectedRegistryKeyAccess -Path $parentPath -Sddl $parentSddl }
             return $false
         }
 
-        Remove-Item-Logged -Path $Path -Recurse -Force
+        try {
+            Remove-Item-Logged -Path $Path -Recurse -Force
+        }
+        finally {
+            if ($parentPath) { Restore-ProtectedRegistryKeyAccess -Path $parentPath -Sddl $parentSddl }
+        }
+
         if (Test-Path -LiteralPath $Path) {
-            Write-Warning "$Label could not be deleted even after taking ownership of it."
+            Write-Warning "$Label could not be deleted even after taking ownership of it and its parent."
             return $false
         }
 
@@ -7343,18 +7764,18 @@ Runs DISM /StartComponentCleanup only if no pending servicing markers remain.
         $pendingUpdates | Set-Content -Path C:\Temp\PendingUpdatePackages.txt
 
         Write-Host "Running DISM /Cleanup-Image /RevertPendingActions (undo in-progress servicing)" -ForegroundColor Yellow
-        $revertResult = Invoke-NativeCommandLogged -Description 'DISM RevertPendingActions' -Details @{
+        $revertResult = Invoke-DismWithWatchdog -Description 'DISM RevertPendingActions' -ImageDriveLetter $WinDriveLetter -Details @{
             Image = $WinDriveLetter
-        } -ScriptBlock { & dism /Image:$WinDriveLetter /Cleanup-Image /RevertPendingActions /ScratchDir:C:\Temp }
+        } -ArgumentList @("/Image:$WinDriveLetter", '/Cleanup-Image', '/RevertPendingActions', '/ScratchDir:C:\Temp')
         $revertResult.Output | Out-Host
 
         $pendingUpdates | ForEach-Object {
             Write-Host "Running package uninstall: $($_)" -ForegroundColor Yellow
             $packageName = $_
-            $removePackageResult = Invoke-NativeCommandLogged -Description 'DISM remove pending package' -Details @{
+            $removePackageResult = Invoke-DismWithWatchdog -Description 'DISM remove pending package' -ImageDriveLetter $WinDriveLetter -Details @{
                 Image = $WinDriveLetter
                 PackageName = $packageName
-            } -ScriptBlock { & dism /Image:$WinDriveLetter /Remove-Package /PackageName:$packageName }
+            } -ArgumentList @("/Image:$WinDriveLetter", '/Remove-Package', "/PackageName:$packageName")
             $removePackageResult.Output | Out-Host
         }
 
@@ -7460,11 +7881,15 @@ Runs DISM /StartComponentCleanup only if no pending servicing markers remain.
         }
         else {
             Write-Host "Running DISM /Cleanup-Image /StartComponentCleanup (best-effort reclaim of superseded components)" -ForegroundColor Yellow
-            $cleanupResult = Invoke-NativeCommandLogged -Description 'DISM StartComponentCleanup' -Details @{
+            $cleanupResult = Invoke-DismWithWatchdog -Description 'DISM StartComponentCleanup' -ImageDriveLetter $WinDriveLetter -Details @{
                 Image = $WinDriveLetter
-            } -ScriptBlock { & dism /Image:$WinDriveLetter /Cleanup-Image /StartComponentCleanup /ScratchDir:C:\Temp }
+            } -ArgumentList @("/Image:$WinDriveLetter", '/Cleanup-Image', '/StartComponentCleanup', '/ScratchDir:C:\Temp')
             $cleanupResult.Output | Out-Host
-            if ($cleanupResult.ExitCode -ne 0) {
+            if ($cleanupResult.StallDetected -or $cleanupResult.TimedOut) {
+                Write-Warning "DISM /StartComponentCleanup was stopped after $($cleanupResult.DurationMinutes) minute(s) without completing. The pending-update repair itself is already finished; component cleanup is best-effort and can be retried later with -RepairComponentStore."
+                Write-Host "  DISM's own log for this attempt: $($cleanupResult.DismLogPath)" -ForegroundColor Yellow
+            }
+            elseif ($cleanupResult.ExitCode -ne 0) {
                 Write-Warning "DISM /StartComponentCleanup exited with code $($cleanupResult.ExitCode). Pending-update cleanup steps already completed; component cleanup is best-effort and can be retried later."
             }
         }
