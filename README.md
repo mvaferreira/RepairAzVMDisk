@@ -368,7 +368,8 @@ You can also target a Hyper-V VM by name instead of disk number:
 # Disable all startup programs
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -DisableStartupPrograms
 
-# Enable RegBack automatic backups
+# Enable RegBack automatic backups (affects FUTURE backups only - it cannot
+# retroactively create a hive to restore, so it will not repair the current VM)
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -EnableRegBackup
 
 # Prepare recovery diagnostics package

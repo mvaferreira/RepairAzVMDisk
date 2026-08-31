@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.8.0
+        Version: 0.8.1
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -13205,8 +13205,9 @@ complete recovery.
         $sevHiveMissing = 2   # Expected registry hive file not found on disk
         $sevHiveEmpty = 2   # Expected registry hive file is 0 bytes (corrupt)
         $sevControlSetMismatch = 1   # Current ControlSet != Default
-        $sevRegBackEmpty = 1   # RegBack\SYSTEM is 0 bytes
-        $sevRegBackMissing = 0   # RegBack\SYSTEM not found
+        # RegBack state is reported as INFO only and has no severity knob: an empty or absent
+        # RegBack is either the shipped default (build 17134+) or task-driven (earlier builds),
+        # and in neither case can it be repaired from an offline disk.
 
         # Critical Services
         $sevCriticalSvcDisabled = 2   # A critical boot/system driver is disabled
@@ -13957,36 +13958,34 @@ complete recovery.
                 }
 
                 # RegBack
-                # On Windows 10 1803 / Server 2019 (build 17134)+ the RegBack auto-backup is OFF by
-                # default and -EnableRegBackup (EnablePeriodicBackup) re-enables it. On earlier builds
-                # (Server 2012 R2 = 9600, Server 2016 = 14393) RegBack is maintained by the RegIdleBackup
-                # scheduled task and an empty RegBack is normal, so -EnableRegBackup is not the remedy there.
+                # An empty or absent RegBack is NOT a fault, and it is not repairable from an offline
+                # disk, so it is reported as context only - never as a warning with a suggested fix:
+                #   - Build 17134+ (Win10 1803 / Server 2019+): Microsoft stopped populating RegBack by
+                #     design to save disk space, so empty is the shipped default.
+                #   - Earlier builds (Server 2012 R2 = 9600, Server 2016 = 14393): RegBack is refreshed
+                #     by the '\Microsoft\Windows\Registry\RegIdleBackup' scheduled task during idle
+                #     maintenance inside the running guest.
+                # -EnableRegBackup only affects FUTURE backups - it cannot retroactively produce a hive
+                # to restore - so it is never offered as the remedy for an empty RegBack.
                 $regBackGuestBuild = 0
                 [void][int]::TryParse((Get-GuestCurrentVersion).CurrentBuildNumber, [ref]$regBackGuestBuild)
-                $regBackTaskDriven = ($regBackGuestBuild -gt 0 -and $regBackGuestBuild -lt 17134)
-                $rbSystem = Join-Path $script:WinDriveLetter 'Windows\System32\config\RegBack\SYSTEM'
-                $rbSystemItem = Get-Item -LiteralPath $rbSystem -Force -ErrorAction SilentlyContinue
-                if ($rbSystemItem) {
-                    $rbSize = $rbSystemItem.Length
-                    if ($rbSize -eq 0) {
-                        if ($regBackTaskDriven) {
-                            & $emit 'Registry' 'INFO' "RegBack\SYSTEM is 0 bytes - normal on build $regBackGuestBuild; RegBack is refreshed by the RegIdleBackup scheduled task inside the running guest, not by -EnableRegBackup"
-                        }
-                        else {
-                            & $emit 'Registry' (& $toSev $sevRegBackEmpty) 'RegBack\SYSTEM is 0 bytes - no registry backup is available' "-EnableRegBackup"
-                        }
-                    }
-                    else {
-                        & $emit 'Registry' 'OK' "RegBack\SYSTEM is $([math]::Round($rbSize/1MB, 1)) MB"
-                    }
+                $regBackWhy = if ($regBackGuestBuild -gt 0 -and $regBackGuestBuild -lt 17134) {
+                    "on build $regBackGuestBuild it is refreshed by the RegIdleBackup scheduled task inside the running guest"
+                }
+                elseif ($regBackGuestBuild -ge 17134) {
+                    "empty by design on build $regBackGuestBuild (Windows 10 1803 / Server 2019 and later no longer populate RegBack)"
                 }
                 else {
-                    if ($regBackTaskDriven) {
-                        & $emit 'Registry' 'INFO' "RegBack\SYSTEM not found - on build $regBackGuestBuild RegBack is populated by the RegIdleBackup scheduled task inside the running guest (not -EnableRegBackup)"
-                    }
-                    else {
-                        & $emit 'Registry' (& $toSev $sevRegBackMissing) 'RegBack\SYSTEM not found - registry backups not configured' "-EnableRegBackup"
-                    }
+                    'RegBack is only populated while the guest is running'
+                }
+                $rbSystem = Join-Path $script:WinDriveLetter 'Windows\System32\config\RegBack\SYSTEM'
+                $rbSystemItem = Get-Item -LiteralPath $rbSystem -Force -ErrorAction SilentlyContinue
+                if ($rbSystemItem -and $rbSystemItem.Length -gt 0) {
+                    & $emit 'Registry' 'OK' "RegBack\SYSTEM is $([math]::Round($rbSystemItem.Length/1MB, 1)) MB"
+                }
+                else {
+                    $rbState = if ($rbSystemItem) { 'is 0 bytes' } else { 'not found' }
+                    & $emit 'Registry' 'INFO' "RegBack\SYSTEM $rbState - $regBackWhy. -RestoreRegistryFromRegBack is therefore not available for this VM."
                 }
 
                 # Pending Setup CmdLine
@@ -15271,7 +15270,19 @@ complete recovery.
                         try { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]) -eq $sidNetSvc } catch { $false }
                     } | Where-Object { $_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Read }
 
-                    # SessionEnv runs as NT Service\SessionEnv - no fixed SID, match by identity string
+                    # SessionEnv runs as NT Service\SessionEnv - no fixed SID, match by identity string.
+                    # This ACE is only part of the shipped Windows default on Server 2019 and later.
+                    # Measured on real installations:
+                    #   2012 R2 (9600)  : SYSTEM:F, NETWORK SERVICE:R, Administrators:R  - no SessionEnv
+                    #   2016    (14393) : SYSTEM:F, NETWORK SERVICE:R, Administrators:R  - no SessionEnv
+                    #   2019    (17763) : SYSTEM:F, NETWORK SERVICE:R, SessionEnv:F
+                    #   2022    (20348) : SYSTEM:F, NETWORK SERVICE:R, SessionEnv:F
+                    #   2025    (26100) : SYSTEM:F, NETWORK SERVICE:R, SessionEnv:F
+                    # On 2016 and older its absence is the normal configuration, so reporting it there
+                    # would be a false positive. Only evaluate it where it is known to be standard.
+                    $rdpKeyGuestBuild = 0
+                    [void][int]::TryParse((Get-GuestCurrentVersion).CurrentBuildNumber, [ref]$rdpKeyGuestBuild)
+                    $sessionEnvExpected = ($rdpKeyGuestBuild -ge 17763)
                     $sessionEnvOk = $rules | Where-Object {
                         $_.IdentityReference.Value -match 'SessionEnv'
                     } | Where-Object { $_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl }
@@ -15285,8 +15296,8 @@ complete recovery.
                     else {
                         & $emit 'RDP' 'OK' 'RDP private key ACLs: SYSTEM and NETWORK SERVICE have required permissions'
                     }
-                    if (-not $sessionEnvOk) {
-                        & $emit 'RDP' (& $toSev $sevRdpKeySessionEnvAcl) 'RDP private key: NT Service\SessionEnv FullControl not found - may cause RDP session issues on some Windows versions' "-FixRDPPermissions"
+                    if ($sessionEnvExpected -and -not $sessionEnvOk) {
+                        & $emit 'RDP' (& $toSev $sevRdpKeySessionEnvAcl) "RDP private key: NT Service\SessionEnv FullControl not found - expected on build $rdpKeyGuestBuild (Server 2019 and later); SessionEnv manages the self-signed RDP certificate" "-FixRDPPermissions"
                     }
                 }
                 catch {
