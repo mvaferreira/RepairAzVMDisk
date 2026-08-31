@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.7.2
+        Version: 0.8.0
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -244,6 +244,8 @@ param (
     [Parameter(ParameterSetName = 'Repair')][switch]$DisableThirdPartyDrivers,
     [Parameter(ParameterSetName = 'Repair')][switch]$EnableThirdPartyDrivers,
     [Parameter(ParameterSetName = 'Repair')][switch]$GetServicesReport,
+    [Parameter(ParameterSetName = 'Repair')][switch]$GetCatalogStoreReport,
+    [Parameter(ParameterSetName = 'Repair')][string]$RepairCatalogStore,
     [Parameter(ParameterSetName = 'Repair')][string[]]$DisableDriverOrService = @(),
     [Parameter(ParameterSetName = 'Repair')][string[]]$EnableDriverOrService = @(),
     [Parameter(ParameterSetName = 'Repair')][switch]$DisableLsaProtection,
@@ -268,6 +270,7 @@ param (
     [Parameter(ParameterSetName = 'Repair')][switch]$CollectEventLogs,
     [Parameter(ParameterSetName = 'Repair')][switch]$CollectMinidumps,
     [Parameter(ParameterSetName = 'Repair')][switch]$AnalyzeCriticalBootFiles,
+    [Parameter(ParameterSetName = 'Repair')][switch]$SkipCatalogVerification,
     [Parameter(ParameterSetName = 'Repair')][string[]]$RepairSystemFile = @(),
     [Parameter(ParameterSetName = 'Repair')][switch]$AnalyzeSyntheticDrivers,
     [Parameter(ParameterSetName = 'Repair')][switch]$EnsureSyntheticDriversEnabled,
@@ -346,6 +349,7 @@ dynamicparam {
         'FixSecureBootCodeIntegrity',
         'RepairComponentStore',
         'GetServicesReport',
+        'GetCatalogStoreReport',
         'EnableDriverOrService',
         'FixDeviceFilters',
         'AnalyzeRecentChanges',
@@ -394,6 +398,10 @@ dynamicparam {
     if ($PSBoundParameters.ContainsKey('FixSecureBootCodeIntegrity')) {
         & $addParam 'CodeIntegrityPolicySourcePath' ([string]) 'Repair' ''
     }
+    # -RepairSystemFileSource: sub-option of -RepairSystemFile
+    if ($PSBoundParameters.ContainsKey('RepairSystemFile')) {
+        & $addParam 'RepairSystemFileSource' ([string]) 'Repair' ''
+    }
     # -RepairSource: sub-option of -RepairComponentStore
     if ($PSBoundParameters.ContainsKey('RepairComponentStore')) {
         & $addParam 'RepairSource' ([string]) 'Repair' ''
@@ -402,6 +410,10 @@ dynamicparam {
     if ($PSBoundParameters.ContainsKey('GetServicesReport')) {
         & $addParam 'IncludeServices' ([switch]) 'Repair' $null
         & $addParam 'IssuesOnly'      ([switch]) 'Repair' $null
+    }
+    # -IncludeHealthy: sub-option of -GetCatalogStoreReport
+    if ($PSBoundParameters.ContainsKey('GetCatalogStoreReport')) {
+        & $addParam 'IncludeHealthy' ([switch]) 'Repair' $null
     }
     # -KeepDefaultFilters: sub-option of -FixDeviceFilters
     if ($PSBoundParameters.ContainsKey('FixDeviceFilters')) {
@@ -1551,12 +1563,9 @@ $($htmlRows -join "`n")
         )
         $before = $null
         $beforeExists = $false
+        $beforeDenied = $false
         try {
-            $beforeProps = Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
-            if ($beforeProps -and ($beforeProps.PSObject.Properties.Name -contains $Name)) {
-                $beforeExists = $true
-                $before = $beforeProps.$Name
-            }
+            $before = Get-ProtectedRegistryValue -Path $Path -Name $Name -Found ([ref]$beforeExists) -Denied ([ref]$beforeDenied)
         }
         catch {
             $before = $null
@@ -1566,7 +1575,16 @@ $($htmlRows -join "`n")
         $displayBefore = Convert-ActionLogValueToText -Value $before -Missing:(-not $beforeExists)
         Write-Host "  [exec] Set-ItemProperty '$Path' -Name '$Name' -Value $displayValue ($PropertyType)  [was: $displayBefore]" -ForegroundColor DarkGray
         $details = @{ Operation = 'Set-ItemProperty'; Path = $Path; Name = $Name; HadValueBefore = $beforeExists; Before = $before; After = $Value; BeforeDisplay = $displayBefore; AfterDisplay = $displayValue }
-        Invoke-Logged -Description 'Set-ItemProperty' -Details $details -ScriptBlock { if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }; New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $PropertyType -Force | Out-Null }
+        Invoke-Logged -Description 'Set-ItemProperty' -Details $details -ScriptBlock {
+            Invoke-ProtectedRegistryWrite -Path $Path -Description "set '$Name'" -Action {
+                # -ErrorAction Stop is load-bearing: an access-denied from these cmdlets
+                # is non-terminating by default, so without it the failure never reaches
+                # the caller's catch and the ownership retry never runs - the write is
+                # simply refused and the repair reports success having changed nothing.
+                if (-not (Test-Path $Path)) { New-Item -Path $Path -Force -ErrorAction Stop | Out-Null }
+                New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $PropertyType -Force -ErrorAction Stop | Out-Null
+            }
+        }
     }
 
     # Create item wrapper (files/directories/registry keys)
@@ -1587,17 +1605,30 @@ $($htmlRows -join "`n")
         Write-Host "  [exec] New-Item $($displayParts -join ' ')" -ForegroundColor DarkGray
         $details = @{ Operation = 'New-Item'; Path = $Path; Name = $Name; ItemType = $ItemType; Value = $logValue }
         Invoke-Logged -Description 'New-Item' -Details $details -ScriptBlock {
-            if ($Name -and $ItemType -and $null -ne $Value) {
-                New-Item -Path $Path -Name $Name -ItemType $ItemType -Value $Value -Force:$Force | Out-Null
+            $create = {
+                # -ErrorAction Stop so an access-denied reaches Invoke-ProtectedRegistryWrite
+                # as a terminating error and triggers the ownership retry.
+                if ($Name -and $ItemType -and $null -ne $Value) {
+                    New-Item -Path $Path -Name $Name -ItemType $ItemType -Value $Value -Force:$Force -ErrorAction Stop | Out-Null
+                }
+                elseif ($Name -and $ItemType) {
+                    New-Item -Path $Path -Name $Name -ItemType $ItemType -Force:$Force -ErrorAction Stop | Out-Null
+                }
+                elseif ($ItemType) {
+                    New-Item -Path $Path -ItemType $ItemType -Force:$Force -ErrorAction Stop | Out-Null
+                }
+                else {
+                    New-Item -Path $Path -Force:$Force -ErrorAction Stop | Out-Null
+                }
             }
-            elseif ($Name -and $ItemType) {
-                New-Item -Path $Path -Name $Name -ItemType $ItemType -Force:$Force | Out-Null
-            }
-            elseif ($ItemType) {
-                New-Item -Path $Path -ItemType $ItemType -Force:$Force | Out-Null
+
+            # This wrapper also creates files and directories, and the ownership retry is
+            # registry-specific, so it is applied only to registry paths.
+            if ($Path -match '^HKLM:\\|HKEY_LOCAL_MACHINE\\') {
+                Invoke-ProtectedRegistryWrite -Path $Path -Description 'create key' -Action $create
             }
             else {
-                New-Item -Path $Path -Force:$Force | Out-Null
+                & $create
             }
         }
     }
@@ -1611,7 +1642,13 @@ $($htmlRows -join "`n")
         )
         Write-Host "  [exec] Remove-ItemProperty '$Path' -Name '$Name'" -ForegroundColor DarkGray
         $details = @{ Operation = 'Remove-ItemProperty'; Path = $Path; Name = $Name }
-        Invoke-Logged -Description 'Remove-ItemProperty' -Details $details -ScriptBlock { Remove-ItemProperty -Path $Path -Name $Name -Force:$Force }
+        Invoke-Logged -Description 'Remove-ItemProperty' -Details $details -ScriptBlock {
+            Invoke-ProtectedRegistryWrite -Path $Path -Description "remove '$Name'" -Action {
+                # -ErrorAction Stop so an access-denied triggers the ownership retry
+                # rather than being written to the error stream and ignored.
+                Remove-ItemProperty -Path $Path -Name $Name -Force:$Force -ErrorAction Stop
+            }
+        }
     }
 
     # Copy (file/directory) wrapper
@@ -2267,41 +2304,487 @@ exit `$exitCode
         }
     }
 
-    # Helper: Verify a binary on the offline disk carries a valid Microsoft Authenticode signature.
-    # Returns a PSCustomObject with .IsSigned, .IsMicrosoft, .Status, and .Subject.
-    # Uses Get-AuthenticodeSignature which works on offline (non-running) files.
-    # Performance note: signature verification involves reading the PE embedded catalog
-    # or catalog lookup, which takes ~10-40 ms per file. Callers should batch results
-    # or limit checks to high-value targets (boot binaries, session init, synthetic drivers).
+    # ==========================================================================
+    # Offline guest catalog verification (STATUS_INVALID_IMAGE_HASH detection)
+    # ==========================================================================
+    # Most Windows inbox binaries are catalog-signed, not embedded-signed. On an
+    # offline disk Get-AuthenticodeSignature can only consult the REPAIR HOST's
+    # catalog database, so an intact guest file normally reports NotSigned - and,
+    # critically, a CORRUPT guest file reports NotSigned as well. That is exactly
+    # why VersionInfo was never a safe substitute for trust: a damaged image keeps
+    # its Microsoft CompanyName resource while the kernel rejects it with
+    # STATUS_INVALID_IMAGE_HASH (0xC0000428) and bugchecks CRITICAL_SERVICE_FAILED
+    # (0x5A) when the driver is Boot/System start with ErrorControl=Critical.
+    #
+    # These helpers verify a file's Authenticode hash against the catalogs in the
+    # OFFLINE GUEST's own catalog store:
+    #   <WinDrive>\Windows\System32\CatRoot\{F750E6C3-38EE-11D1-85E5-00C04FC295EE}
+    # Indexing the whole store costs ~2 seconds (measured over 3,700 catalogs)
+    # because CRYPTCAT_OPEN_NO_CONTENT_HCRYPTMSG skips PKCS#7 message
+    # construction; every later lookup is then O(1).
+    $script:OfflineCatalogGuid = '{F750E6C3-38EE-11D1-85E5-00C04FC295EE}'
+    $script:OfflineCatalogNativeReady = $null
+    $script:OfflineCatalogState = 'NotBuilt'   # NotBuilt|Usable|Unusable|Unavailable|Disabled
+    $script:OfflineCatalogIndex = $null
+    $script:OfflineCatalogFiles = @()
+    $script:OfflineCatalogTrustCache = @{}
+    $script:OfflineCatalogHashCache = @{}
+    $script:OfflineCatalogStoreSummary = ''
+
+    function Initialize-OfflineCatalogNativeType {
+        if ($null -ne $script:OfflineCatalogNativeReady) { return $script:OfflineCatalogNativeReady }
+        if ('RepairAzVMDisk.CatalogNative' -as [type]) {
+            $script:OfflineCatalogNativeReady = $true
+            return $true
+        }
+        try {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace RepairAzVMDisk
+{
+    public static class CatalogNative
+    {
+        // CRYPTCAT_OPEN_EXISTING (0x4) | CRYPTCAT_OPEN_NO_CONTENT_HCRYPTMSG (0x20000000)
+        private const uint OpenFlags = 0x20000004;
+
+        [DllImport("wintrust.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern IntPtr CryptCATOpen(string pwszFileName, uint fdwOpenFlags,
+            IntPtr hProv, uint dwPublicVersion, uint dwEncodingType);
+
+        [DllImport("wintrust.dll", SetLastError = true)]
+        private static extern bool CryptCATClose(IntPtr hCatalog);
+
+        [DllImport("wintrust.dll", SetLastError = true)]
+        private static extern IntPtr CryptCATEnumerateMember(IntPtr hCatalog, IntPtr pPrevMember);
+
+        [DllImport("wintrust.dll", SetLastError = true)]
+        private static extern bool CryptCATAdminAcquireContext2(ref IntPtr phCatAdmin,
+            IntPtr pgSubsystem, [MarshalAs(UnmanagedType.LPWStr)] string pwszHashAlgorithm,
+            IntPtr pStrongHashPolicy, uint dwFlags);
+
+        [DllImport("wintrust.dll", SetLastError = true)]
+        private static extern bool CryptCATAdminReleaseContext(IntPtr hCatAdmin, uint dwFlags);
+
+        [DllImport("wintrust.dll", SetLastError = true)]
+        private static extern bool CryptCATAdminCalcHashFromFileHandle2(IntPtr hCatAdmin,
+            IntPtr hFile, ref uint pcbHash, byte[] pbHash, uint dwFlags);
+
+        [DllImport("wintrust.dll", SetLastError = true)]
+        private static extern bool CryptCATAdminCalcHashFromFileHandle(IntPtr hFile,
+            ref uint pcbHash, byte[] pbHash, uint dwFlags);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct CRYPT_ATTR_BLOB { public uint cbData; public IntPtr pbData; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct CRYPTCATMEMBER
+        {
+            public uint cbStruct;
+            public IntPtr pwszReferenceTag;
+            public IntPtr pwszFileName;
+            public Guid gSubjectType;
+            public uint fdwMemberFlags;
+            public IntPtr pIndirectData;
+            public uint dwCertVersion;
+            public uint dwReserved;
+            public IntPtr hReserved;
+            public CRYPT_ATTR_BLOB sEncodedIndirectData;
+            public CRYPT_ATTR_BLOB sEncodedMemberInfo;
+        }
+
+        private static string ToHex(byte[] bytes, int length)
+        {
+            char[] c = new char[length * 2];
+            for (int i = 0; i < length; i++)
+            {
+                int b = bytes[i] >> 4;
+                c[i * 2] = (char)(b > 9 ? b + 0x37 : b + 0x30);
+                b = bytes[i] & 0xF;
+                c[i * 2 + 1] = (char)(b > 9 ? b + 0x37 : b + 0x30);
+            }
+            return new string(c);
+        }
+
+        // Returns the Authenticode reference tags (SHA-256 first, then SHA-1) used as
+        // catalog member identifiers. These are PE-aware hashes: they deliberately
+        // exclude the checksum and the certificate table, which is what makes them
+        // comparable with catalog entries.
+        public static string[] GetFileHashTags(string path)
+        {
+            List<string> tags = new List<string>();
+            using (System.IO.FileStream fs = new System.IO.FileStream(path, System.IO.FileMode.Open,
+                       System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite))
+            {
+                IntPtr hFile = fs.SafeFileHandle.DangerousGetHandle();
+
+                IntPtr ctx = IntPtr.Zero;
+                if (CryptCATAdminAcquireContext2(ref ctx, IntPtr.Zero, "SHA256", IntPtr.Zero, 0))
+                {
+                    try
+                    {
+                        uint cb = 0;
+                        CryptCATAdminCalcHashFromFileHandle2(ctx, hFile, ref cb, null, 0);
+                        if (cb > 0 && cb <= 1024)
+                        {
+                            byte[] buf = new byte[cb];
+                            fs.Position = 0;
+                            if (CryptCATAdminCalcHashFromFileHandle2(ctx, hFile, ref cb, buf, 0))
+                                tags.Add(ToHex(buf, (int)cb));
+                        }
+                    }
+                    finally { CryptCATAdminReleaseContext(ctx, 0); }
+                }
+
+                uint cb1 = 0;
+                fs.Position = 0;
+                CryptCATAdminCalcHashFromFileHandle(hFile, ref cb1, null, 0);
+                if (cb1 > 0 && cb1 <= 1024)
+                {
+                    byte[] buf1 = new byte[cb1];
+                    fs.Position = 0;
+                    if (CryptCATAdminCalcHashFromFileHandle(hFile, ref cb1, buf1, 0))
+                        tags.Add(ToHex(buf1, (int)cb1));
+                }
+            }
+            return tags.ToArray();
+        }
+
+        // Maps every catalog member reference tag to the index of the catalog that
+        // contains it, so a hit can be traced back to a specific .cat for signer
+        // verification. stats[0]=catalogs opened, stats[1]=member entries seen.
+        //
+        // Catalogs are opened in parallel. Each thread owns the handle it opens, so no
+        // wintrust state is shared, and the work is dominated by per-catalog file I/O
+        // and parsing - a serial walk of several thousand catalogs is the single
+        // slowest step in a repair run.
+        public static Dictionary<string, int> BuildIndex(string[] catalogPaths, int[] stats)
+        {
+            ConcurrentDictionary<string, int> index =
+                new ConcurrentDictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            int opened = 0, members = 0;
+
+            ParallelOptions options = new ParallelOptions();
+            options.MaxDegreeOfParallelism = Math.Min(16, Math.Max(2, Environment.ProcessorCount * 2));
+
+            Parallel.For(0, catalogPaths.Length, options, delegate(int i)
+            {
+                IntPtr hCat = CryptCATOpen(catalogPaths[i], OpenFlags, IntPtr.Zero, 0, 0);
+                if (hCat == IntPtr.Zero || hCat == new IntPtr(-1)) return;
+                Interlocked.Increment(ref opened);
+                int localMembers = 0;
+                try
+                {
+                    IntPtr m = IntPtr.Zero;
+                    while ((m = CryptCATEnumerateMember(hCat, m)) != IntPtr.Zero)
+                    {
+                        CRYPTCATMEMBER cm = (CRYPTCATMEMBER)Marshal.PtrToStructure(m, typeof(CRYPTCATMEMBER));
+                        if (cm.pwszReferenceTag == IntPtr.Zero) continue;
+                        string tag = Marshal.PtrToStringUni(cm.pwszReferenceTag);
+                        if (string.IsNullOrEmpty(tag)) continue;
+                        localMembers++;
+                        // First writer wins. Which catalog a shared tag maps to is
+                        // arbitrary in the serial version too, and any catalog holding
+                        // the tag is equally valid for the signer check that follows.
+                        index.TryAdd(tag, i);
+                    }
+                }
+                catch { }
+                finally { CryptCATClose(hCat); }
+                Interlocked.Add(ref members, localMembers);
+            });
+
+            if (stats != null && stats.Length >= 2) { stats[0] = opened; stats[1] = members; }
+            return new Dictionary<string, int>(index, StringComparer.OrdinalIgnoreCase);
+        }
+    }
+}
+'@ -ErrorAction Stop
+            $script:OfflineCatalogNativeReady = $true
+        }
+        catch {
+            $script:OfflineCatalogNativeReady = $false
+            Write-Verbose "Offline catalog verification is unavailable on this host: $($_.Exception.Message)"
+        }
+        return $script:OfflineCatalogNativeReady
+    }
+
+    function Get-OfflineCatalogStorePath {
+        if (-not $script:WinDriveLetter) { return $null }
+        return (Join-Path $script:WinDriveLetter "Windows\System32\CatRoot\$($script:OfflineCatalogGuid)")
+    }
+
+    function Get-AuthenticodeReferenceTag {
+        param([Parameter(Mandatory)][string]$FilePath)
+
+        $item = Get-Item -LiteralPath $FilePath -Force -ErrorAction SilentlyContinue
+        if (-not $item -or $item.PSIsContainer -or $item.Length -eq 0) { return @() }
+        $cacheKey = '{0}|{1}|{2}' -f $item.FullName, $item.Length, $item.LastWriteTimeUtc.Ticks
+        if ($script:OfflineCatalogHashCache.ContainsKey($cacheKey)) {
+            return $script:OfflineCatalogHashCache[$cacheKey]
+        }
+        if (-not (Initialize-OfflineCatalogNativeType)) { return @() }
+        $tags = @()
+        try { $tags = @([RepairAzVMDisk.CatalogNative]::GetFileHashTags($item.FullName)) }
+        catch { $tags = @() }
+        $script:OfflineCatalogHashCache[$cacheKey] = $tags
+        return $tags
+    }
+
+    function Get-CatalogReferenceSampleFile {
+        # Inbox binaries that every healthy Windows installation publishes in a
+        # servicing catalog. Used for two different judgements, which is why the list
+        # lives in one place:
+        #   - is the GUEST's own store complete enough for a miss to mean corruption?
+        #   - does a DONOR store match this guest closely enough to be merged into it?
+        # Only files that actually exist and are non-empty are returned, so the ratio
+        # the callers compute is never diluted by a build that ships fewer of them.
+        $relative = @(
+            'System32\ntoskrnl.exe', 'System32\ntdll.dll', 'System32\kernel32.dll'
+            'System32\hal.dll', 'System32\smss.exe', 'System32\services.exe'
+            'System32\winlogon.exe', 'System32\advapi32.dll', 'System32\user32.dll'
+            'System32\drivers\ntfs.sys', 'System32\drivers\disk.sys', 'System32\drivers\partmgr.sys'
+            'System32\drivers\volsnap.sys', 'System32\drivers\acpi.sys', 'System32\drivers\pci.sys'
+            'System32\drivers\fltmgr.sys', 'System32\drivers\ndis.sys', 'System32\drivers\tcpip.sys'
+        )
+        foreach ($rel in $relative) {
+            $samplePath = Join-Path $script:WinDriveLetter "Windows\$rel"
+            $sampleItem = Get-Item -LiteralPath $samplePath -Force -ErrorAction SilentlyContinue
+            if ($sampleItem -and -not $sampleItem.PSIsContainer -and $sampleItem.Length -gt 0) {
+                $sampleItem.FullName
+            }
+        }
+    }
+
+    function Initialize-OfflineCatalogIndex {
+        # Builds (once) an index of every member hash in the offline guest catalog
+        # store, then samples known inbox binaries to decide whether a catalog MISS
+        # is trustworthy evidence of corruption or merely an incomplete store.
+        if ($script:OfflineCatalogState -ne 'NotBuilt') { return $script:OfflineCatalogState }
+
+        if ($script:SkipCatalogVerification) {
+            $script:OfflineCatalogState = 'Disabled'
+            $script:OfflineCatalogStoreSummary = 'guest catalog verification disabled by -SkipCatalogVerification'
+            return $script:OfflineCatalogState
+        }
+        if (-not (Initialize-OfflineCatalogNativeType)) {
+            $script:OfflineCatalogState = 'Unavailable'
+            $script:OfflineCatalogStoreSummary = 'wintrust catalog APIs unavailable on this repair host'
+            return $script:OfflineCatalogState
+        }
+
+        $storePath = Get-OfflineCatalogStorePath
+        if (-not $storePath -or -not (Test-Path -LiteralPath $storePath)) {
+            $script:OfflineCatalogState = 'Unavailable'
+            $script:OfflineCatalogStoreSummary = "guest catalog store not found ($storePath)"
+            return $script:OfflineCatalogState
+        }
+
+        $catFiles = @(Get-ChildItem -LiteralPath $storePath -Filter '*.cat' -File -ErrorAction SilentlyContinue)
+        if ($catFiles.Count -eq 0) {
+            $script:OfflineCatalogState = 'Unavailable'
+            $script:OfflineCatalogStoreSummary = "guest catalog store is empty ($storePath)"
+            return $script:OfflineCatalogState
+        }
+
+        Write-Host "  Indexing offline guest catalog store ($($catFiles.Count) catalogs)..." -ForegroundColor DarkGray
+        $script:OfflineCatalogFiles = $catFiles
+        $stats = [int[]]@(0, 0)
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            $script:OfflineCatalogIndex = [RepairAzVMDisk.CatalogNative]::BuildIndex([string[]]($catFiles.FullName), $stats)
+        }
+        catch {
+            $sw.Stop()
+            $script:OfflineCatalogIndex = $null
+            $script:OfflineCatalogState = 'Unavailable'
+            $script:OfflineCatalogStoreSummary = "guest catalog store could not be indexed: $($_.Exception.Message)"
+            return $script:OfflineCatalogState
+        }
+        $sw.Stop()
+
+        # Store-health sample. A healthy Windows installation always has these inbox
+        # binaries covered by a servicing catalog. If most of them cannot be resolved
+        # the store itself is incomplete, so an individual miss proves nothing and
+        # must not be reported as corruption.
+        $sampleFiles = @(Get-CatalogReferenceSampleFile)
+        $samplePresent = $sampleFiles.Count
+        $sampleFound = 0
+        foreach ($samplePath in $sampleFiles) {
+            foreach ($tag in (Get-AuthenticodeReferenceTag -FilePath $samplePath)) {
+                if ($script:OfflineCatalogIndex.ContainsKey($tag)) { $sampleFound++; break }
+            }
+        }
+
+        $ratio = if ($samplePresent -gt 0) { $sampleFound / $samplePresent } else { 0 }
+        if ($samplePresent -ge 6 -and $ratio -ge 0.6) {
+            $script:OfflineCatalogState = 'Usable'
+        }
+        else {
+            $script:OfflineCatalogState = 'Unusable'
+        }
+        $script:OfflineCatalogStoreSummary = ('{0} catalogs, {1:N0} hashes, reference sample {2}/{3} resolved in {4:N1}s' -f `
+                $stats[0], $script:OfflineCatalogIndex.Count, $sampleFound, $samplePresent, $sw.Elapsed.TotalSeconds)
+
+        $stateColor = if ($script:OfflineCatalogState -eq 'Usable') { 'DarkGray' } else { 'Yellow' }
+        Write-Host "  Guest catalog store: $($script:OfflineCatalogState) - $($script:OfflineCatalogStoreSummary)" -ForegroundColor $stateColor
+        if ($script:OfflineCatalogState -eq 'Unusable') {
+            Write-Host "  Catalog coverage is too incomplete to prove corruption; catalog-signed files will be reported as unverified." -ForegroundColor Yellow
+        }
+        return $script:OfflineCatalogState
+    }
+
+    function Test-OfflineCatalogMembership {
+        # Answers "is this exact file content published in a catalog that belongs to
+        # the offline guest, and is that catalog signed by Microsoft?".
+        param([Parameter(Mandatory)][string]$FilePath)
+
+        $result = [PSCustomObject]@{
+            StoreState         = Initialize-OfflineCatalogIndex
+            Found              = $false
+            CatalogPath        = ''
+            CatalogStatus      = ''
+            CatalogIsMicrosoft = $false
+            Tags               = @()
+        }
+        if ($result.StoreState -notin @('Usable', 'Unusable')) { return $result }
+
+        $result.Tags = @(Get-AuthenticodeReferenceTag -FilePath $FilePath)
+        if ($result.Tags.Count -eq 0) { return $result }
+
+        $catalogIndex = -1
+        foreach ($tag in $result.Tags) {
+            if ($script:OfflineCatalogIndex.ContainsKey($tag)) {
+                $catalogIndex = $script:OfflineCatalogIndex[$tag]
+                break
+            }
+        }
+        if ($catalogIndex -lt 0) { return $result }
+
+        $result.Found = $true
+        $result.CatalogPath = $script:OfflineCatalogFiles[$catalogIndex].FullName
+
+        # A catalog carries its own embedded PKCS#7 signature, so unlike the files it
+        # covers it CAN be validated offline. Cache per catalog: one Authenticode call
+        # typically covers hundreds of files.
+        if ($script:OfflineCatalogTrustCache.ContainsKey($catalogIndex)) {
+            $cached = $script:OfflineCatalogTrustCache[$catalogIndex]
+            $result.CatalogStatus = $cached.Status
+            $result.CatalogIsMicrosoft = $cached.IsMicrosoft
+            return $result
+        }
+
+        $catStatus = 'Error'
+        $catIsMicrosoft = $false
+        try {
+            $catSig = Get-AuthenticodeSignature -LiteralPath $result.CatalogPath -ErrorAction Stop
+            $catStatus = [string]$catSig.Status
+            if ($catSig.Status -eq 'Valid' -and $catSig.SignerCertificate -and
+                $catSig.SignerCertificate.Subject -match 'O=Microsoft Corporation') {
+                $catIsMicrosoft = $true
+            }
+        }
+        catch { $catStatus = 'Error' }
+
+        $script:OfflineCatalogTrustCache[$catalogIndex] = @{ Status = $catStatus; IsMicrosoft = $catIsMicrosoft }
+        $result.CatalogStatus = $catStatus
+        $result.CatalogIsMicrosoft = $catIsMicrosoft
+        return $result
+    }
+
+    # Helper: classify the trust state of a binary on the offline disk.
+    #
+    # Returns a PSCustomObject whose authoritative field is .TrustState:
+    #   ValidMicrosoft      cryptographically verified Microsoft image (embedded
+    #                       Authenticode signature, or hash published in a
+    #                       Microsoft-signed catalog belonging to the guest)
+    #   ValidOtherPublisher cryptographically verified, different publisher
+    #   Invalid             the image FAILED verification - hash mismatch, untrusted
+    #                       signature, or a Microsoft-branded image whose hash is not
+    #                       in the guest's (healthy) catalog store. Boot/System
+    #                       drivers in this state are what the kernel rejects with
+    #                       STATUS_INVALID_IMAGE_HASH.
+    #   CatalogUnverified   looks like a Microsoft image but trust could not be
+    #                       established from this host - advisory only
+    #   NotVerifiable       format cannot be validated by Authenticode (boot stubs)
+    #                       or no publisher evidence at all
+    #   Missing / ZeroByte / Error
+    #
+    # .IsMicrosoft is TRUE only for cryptographically validated Microsoft trust; it
+    # is never inferred from VersionInfo. Callers that only need "this does not look
+    # tampered with" should use .IsAcceptableMicrosoft, which additionally tolerates
+    # the honestly-unverifiable states without claiming trust.
+    #
+    # Legacy fields .IsSigned/.Status/.Subject are retained for existing callers.
     function Test-MicrosoftSignature {
         param(
             [Parameter(Mandatory)][string]$FilePath
         )
 
         $result = [PSCustomObject]@{
-            Path        = $FilePath
-            IsSigned    = $false
-            IsMicrosoft = $false
-            Status      = 'FileNotFound'
-            Subject     = ''
+            Path                 = $FilePath
+            IsSigned             = $false
+            IsMicrosoft          = $false
+            Status               = 'FileNotFound'
+            Subject              = ''
+            TrustState           = 'Missing'
+            AuthenticodeStatus   = ''
+            SignerSubject        = ''
+            HasSignerCertificate = $false
+            VendorHint           = ''
+            IsMicrosoftVendorHint = $false
+            IsHardFailure        = $false
+            IsAcceptableMicrosoft = $false
+            CatalogVerified      = $false
+            CatalogPath          = ''
+            CatalogStoreState    = ''
+            FileVersion          = ''
+            Size                 = 0
         }
 
-        if (-not (Test-Path -LiteralPath $FilePath)) { return $result }
-        if ((Get-Item -LiteralPath $FilePath -Force -ErrorAction SilentlyContinue).Length -eq 0) {
+        $item = Get-Item -LiteralPath $FilePath -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path -LiteralPath $FilePath) -or -not $item -or $item.PSIsContainer) { return $result }
+
+        # Trust evaluation is pure with respect to (path, size, mtime), and several
+        # report sections inspect the same binaries. Cache to keep large reports fast.
+        if ($null -eq $script:TrustResultCache) { $script:TrustResultCache = @{} }
+        $trustCacheKey = '{0}|{1}|{2}' -f $item.FullName, $item.Length, $item.LastWriteTimeUtc.Ticks
+        if ($script:TrustResultCache.ContainsKey($trustCacheKey)) { return $script:TrustResultCache[$trustCacheKey] }
+
+        $result.Size = $item.Length
+        if ($item.Length -eq 0) {
             $result.Status = 'ZeroByte'
+            $result.TrustState = 'ZeroByte'
             return $result
         }
+
+        $vi = $item.VersionInfo
+        if ($vi) {
+            $result.VendorHint = if ($vi.CompanyName) { $vi.CompanyName.Trim() } else { '' }
+            $result.FileVersion = if ($vi.FileVersion) { $vi.FileVersion.Trim() } else { '' }
+        }
+        $result.IsMicrosoftVendorHint = [bool]($result.VendorHint -match 'Microsoft')
 
         try {
             $sig = Get-AuthenticodeSignature -LiteralPath $FilePath -ErrorAction Stop
         }
         catch {
             $result.Status = 'Error'
+            $result.TrustState = 'Error'
+            $result.AuthenticodeStatus = 'Error'
             return $result
         }
 
+        $result.AuthenticodeStatus = [string]$sig.Status
         $result.Status = [string]$sig.Status
-        $result.Subject = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '' }
+        $result.SignerSubject = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '' }
+        $result.HasSignerCertificate = [bool]$sig.SignerCertificate
+        $result.Subject = $result.SignerSubject
 
         if ($sig.Status -eq 'Valid') {
             $result.IsSigned = $true
@@ -2309,34 +2792,114 @@ exit `$exitCode
             #   CN=Microsoft Windows, O=Microsoft Corporation
             #   CN=Microsoft Corporation, O=Microsoft Corporation
             #   CN=Microsoft Windows Publisher, O=Microsoft Corporation
-            #   CN=Microsoft Code Signing PCA ... (intermediate)
-            if ($result.Subject -match 'O=Microsoft Corporation') {
+            if ($result.SignerSubject -match 'O=Microsoft Corporation') {
+                $result.TrustState = 'ValidMicrosoft'
                 $result.IsMicrosoft = $true
+            }
+            else {
+                $result.TrustState = 'ValidOtherPublisher'
             }
         }
+        elseif ($sig.Status -in @('HashMismatch', 'NotTrusted', 'Incompatible')) {
+            # Hard cryptographic failure. This is the state that used to be silently
+            # converted into 'CatalogSigned' whenever the damaged image still carried a
+            # Microsoft CompanyName resource. It must never be rewritten as trusted.
+            $result.TrustState = 'Invalid'
+            $result.IsHardFailure = $true
+        }
         else {
-            # Catalog-signed files (most Windows inbox binaries) show NotSigned when
-            # checked on an offline disk because the catalog store is not available.
-            # Boot manager files (bootmgr, bootmgfw.efi) are compressed stubs that
-            # return UnknownError because they aren't standard PE executables.
-            # Fall back to checking the file's VersionInfo for Microsoft vendor strings.
-            $vi = (Get-Item -LiteralPath $FilePath -Force -ErrorAction SilentlyContinue).VersionInfo
-            if ($vi -and $vi.CompanyName -match 'Microsoft') {
-                $result.IsSigned = $true
+            # NotSigned / UnknownError / NotSupportedFileFormat.
+            # Authenticode cannot resolve catalog-signed guest files from this host, so
+            # consult the offline guest's own catalog store before drawing conclusions.
+            $catalog = Test-OfflineCatalogMembership -FilePath $FilePath
+            $result.CatalogStoreState = $catalog.StoreState
+            $result.CatalogPath = $catalog.CatalogPath
+
+            if ($catalog.Found -and $catalog.CatalogIsMicrosoft) {
+                $result.TrustState = 'ValidMicrosoft'
                 $result.IsMicrosoft = $true
+                $result.IsSigned = $true
+                $result.CatalogVerified = $true
                 $result.Status = 'CatalogSigned'
-                $result.Subject = $vi.CompanyName
+                $result.Subject = 'Microsoft (guest catalog)'
+            }
+            elseif ($catalog.Found) {
+                # Hash is published, but the catalog's own signature is not Microsoft or
+                # could not be validated here. Do not claim Microsoft trust.
+                $result.TrustState = 'CatalogUnverified'
+                $result.IsSigned = $true
+                $result.Status = 'CatalogUnverified'
+                $result.Subject = "guest catalog: $($catalog.CatalogStatus)"
+            }
+            elseif ($catalog.StoreState -eq 'Usable' -and $catalog.Tags.Count -gt 0 -and $result.IsMicrosoftVendorHint) {
+                # A Microsoft-branded image whose exact content is published in NO guest
+                # catalog, on a store proven able to resolve inbox binaries. This is the
+                # invalid-image-hash reproducer: intact metadata, rejected content.
+                $result.TrustState = 'Invalid'
+                $result.IsHardFailure = $true
+                $result.Status = 'CatalogHashNotFound'
+                $result.Subject = $result.VendorHint
             }
             elseif ($sig.Status -in @('UnknownError', 'NotSupportedFileFormat')) {
-                # File format not parseable by Authenticode (compressed boot stub, etc.)
-                # and no VersionInfo available  -  mark as inconclusive rather than suspect.
+                # Compressed boot stubs (bootmgr, bootmgfw.efi on some builds) are not
+                # standard PE images  -  inconclusive rather than suspect.
+                $result.TrustState = 'NotVerifiable'
                 $result.Status = 'NotVerifiable'
-                $result.IsSigned = $true
-                $result.IsMicrosoft = $true
+            }
+            elseif ($result.IsMicrosoftVendorHint) {
+                # Microsoft vendor metadata, but nothing on this host can confirm or deny
+                # the content. Report honestly instead of inventing trust.
+                $result.TrustState = 'CatalogUnverified'
+                $result.Status = 'CatalogUnverified'
+                $result.Subject = $result.VendorHint
+            }
+            else {
+                $result.TrustState = 'NotVerifiable'
             }
         }
 
+        $result.IsAcceptableMicrosoft = switch ($result.TrustState) {
+            'ValidMicrosoft' { $true }
+            'CatalogUnverified' { $true }
+            'NotVerifiable' {
+                # Tolerate only the genuinely unparseable formats or Microsoft-branded
+                # images; a plain unsigned third-party binary stays flagged.
+                [bool]($result.IsMicrosoftVendorHint -or
+                    $result.AuthenticodeStatus -in @('UnknownError', 'NotSupportedFileFormat'))
+            }
+            default { $false }
+        }
+
+        $script:TrustResultCache[$trustCacheKey] = $result
         return $result
+    }
+
+    function Get-TrustStateDescription {
+        param([Parameter(Mandatory)]$Signature)
+
+        switch ($Signature.TrustState) {
+            'ValidMicrosoft' {
+                if ($Signature.CatalogVerified) { 'Microsoft (verified against guest catalog)' }
+                else { 'Microsoft (valid Authenticode signature)' }
+            }
+            'ValidOtherPublisher' { "validly signed by '$($Signature.SignerSubject)' (not Microsoft)" }
+            'Invalid' {
+                if ($Signature.AuthenticodeStatus -eq 'HashMismatch') {
+                    'INVALID IMAGE HASH - the file content does not match its signature'
+                }
+                elseif ($Signature.Status -eq 'CatalogHashNotFound') {
+                    'INVALID IMAGE HASH - Microsoft-branded image whose content is in no guest catalog'
+                }
+                else {
+                    "INVALID SIGNATURE (Authenticode=$($Signature.AuthenticodeStatus))"
+                }
+            }
+            'CatalogUnverified' { "catalog trust could not be verified from this host (Authenticode=$($Signature.AuthenticodeStatus))" }
+            'NotVerifiable' { "no trustworthy publisher evidence (Authenticode=$($Signature.AuthenticodeStatus))" }
+            'ZeroByte' { '0 bytes (corrupt)' }
+            'Missing' { 'file not found' }
+            default { "trust check error (Authenticode=$($Signature.AuthenticodeStatus))" }
+        }
     }
 
     function ConvertTo-NormalizedProcessorArchitecture {
@@ -2584,8 +3147,12 @@ exit `$exitCode
             $ServiceFullPath = "$SystemRoot\Services\$ServiceName"
 
             if (Test-Path $ServiceFullPath) {
-                $CurrentValue = (Get-ItemProperty -Path $ServiceFullPath -Name Start).Start
-                Write-Host "Current $ServiceName Start -> $CurrentValue`r`nSetting to 4."
+                $found = $false
+                $denied = $false
+                $CurrentValue = Get-ProtectedRegistryValue -Path $ServiceFullPath -Name Start -Found ([ref]$found) -Denied ([ref]$denied)
+                $currentText = if ($found) { "$CurrentValue" } else { '(not set)' }
+                if ($denied) { Write-Host "  $ServiceFullPath is protected by its own ACL; took ownership to read it." -ForegroundColor DarkGray }
+                Write-Host "Current $ServiceName Start -> $currentText`r`nSetting to 4."
                 Set-ItemProperty-Logged -Path $ServiceFullPath -Name Start -Value 4 -Type DWord -Force
             }
             else {
@@ -3710,7 +4277,7 @@ finally {
         if (-not $item -or $item.Length -eq 0) { return $false }
 
         $signature = Test-MicrosoftSignature -FilePath $binaryPath
-        return [bool]$signature.IsMicrosoft
+        return [bool]$signature.IsAcceptableMicrosoft
     }
 
     function New-BootStorageServiceKey {
@@ -3735,8 +4302,8 @@ finally {
         }
 
         $signature = Test-MicrosoftSignature -FilePath $binaryPath
-        if (-not $signature.IsMicrosoft) {
-            Write-Warning "  Cannot recreate $ControlSetName\Services\$($Spec.Name): driver binary is not Microsoft-signed/verifiable ($($signature.Status))"
+        if (-not $signature.IsAcceptableMicrosoft) {
+            Write-Warning "  Cannot recreate $ControlSetName\Services\$($Spec.Name): driver binary failed trust validation - $(Get-TrustStateDescription -Signature $signature)"
             return $false
         }
 
@@ -5441,8 +6008,8 @@ The script will copy it to the guest before running bcdboot, then proceed with -
 
         if ($targetPath -match '\.(efi|exe|dll|sys)$') {
             $sig = Test-MicrosoftSignature -FilePath $targetPath
-            if (-not $sig.IsMicrosoft) {
-                Write-Warning "  $Label is not Microsoft-signed after targeted SFC (status=$($sig.Status), subject='$($sig.Subject)'): $targetPath"
+            if (-not $sig.IsAcceptableMicrosoft) {
+                Write-Warning "  $Label failed trust validation after targeted SFC - $(Get-TrustStateDescription -Signature $sig): $targetPath"
             }
         }
     }
@@ -5462,6 +6029,18 @@ The script will copy it to the guest before running bcdboot, then proceed with -
                 Label          = 'Code Integrity driver signing policy (DriverSiPolicy.p7b)'
                 ComponentRegex = 'microsoft-windows-c.*egrity-driverpolicy'
                 ComponentDirectoryFilter = '*microsoft-windows-c*egrity-driverpolicy*'
+            }
+            @{
+                # Delivered by Secure Boot servicing rather than as a WinSxS component
+                # payload, so there is deliberately no component filter here: the only
+                # real sources are an explicit known-good folder or a same-build host.
+                # It still has to be repaired before the EFI copy step runs, because
+                # that step propagates this exact file to the EFI System Partition.
+                FileName       = 'SKUSiPolicy.p7b'
+                RelativePath   = 'Windows\System32\SecureBootUpdates\SKUSiPolicy.p7b'
+                Label          = 'Secure Boot SKU policy source (SKUSiPolicy.p7b)'
+                ComponentRegex = ''
+                ComponentDirectoryFilter = ''
             }
         )
     }
@@ -5629,6 +6208,40 @@ The script will copy it to the guest before running bcdboot, then proceed with -
         return [PSCustomObject]@{ Allowed = $false; IsHostSource = $true; Reason = "host build $($buildMatch.Host) is not compatible with guest build $($buildMatch.Guest): $($buildMatch.Reason)" }
     }
 
+    function Get-CodeIntegrityCandidateSubPath {
+        param(
+            [Parameter(Mandatory = $true)][hashtable]$Spec,
+            [Parameter(Mandatory = $true)][string]$Root,
+            [switch]$HostLayout
+        )
+
+        # Payload specs no longer all live under System32\CodeIntegrity, so the places
+        # a donor file might sit are derived from the spec's own relative path instead
+        # of being hard-coded. A donor folder is accepted flat, or with any suffix of
+        # the file's normal Windows path preserved.
+        $relative = [string]$Spec.RelativePath
+        $relativeDir = [System.IO.Path]::GetDirectoryName($relative)
+        $segments = @($relativeDir -split '[\\/]' | Where-Object { $_ })
+        $root = $Root.TrimEnd('\')
+
+        if ($HostLayout) {
+            # $env:SystemRoot already is the Windows directory, so drop the leading one.
+            if ($segments.Count -gt 0 -and $segments[0] -ieq 'Windows') {
+                $segments = @($segments | Select-Object -Skip 1)
+            }
+            if ($segments.Count -eq 0) { return @(Join-Path $root $Spec.FileName) }
+            return @(Join-Path $root (Join-Path ($segments -join '\') $Spec.FileName))
+        }
+
+        $paths = [System.Collections.Generic.List[string]]::new()
+        $paths.Add((Join-Path $root $Spec.FileName))
+        for ($i = $segments.Count - 1; $i -ge 0; $i--) {
+            $suffix = ($segments[$i..($segments.Count - 1)] -join '\')
+            $paths.Add((Join-Path $root (Join-Path $suffix $Spec.FileName)))
+        }
+        return @($paths | Select-Object -Unique)
+    }
+
     function Get-CodeIntegrityPolicyCandidates {
         param(
             [Parameter(Mandatory = $true)][hashtable]$Spec,
@@ -5654,13 +6267,7 @@ The script will copy it to the guest before running bcdboot, then proceed with -
                 }
                 else {
                     $sourceRoot = $SourcePath.TrimEnd('\')
-                    $explicitPaths = @(
-                        (Join-Path $sourceRoot $Spec.FileName),
-                        (Join-Path $sourceRoot (Join-Path 'CodeIntegrity' $Spec.FileName)),
-                        (Join-Path $sourceRoot (Join-Path 'System32\CodeIntegrity' $Spec.FileName)),
-                        (Join-Path $sourceRoot (Join-Path 'Windows\System32\CodeIntegrity' $Spec.FileName))
-                    )
-                    foreach ($explicitPath in @($explicitPaths | Select-Object -Unique)) {
+                    foreach ($explicitPath in @(Get-CodeIntegrityCandidateSubPath -Spec $Spec -Root $sourceRoot)) {
                         Add-CodeIntegrityCandidate -Candidates $candidates -Spec $Spec -Path $explicitPath -Source $sourceLabel -Priority 0 -ReferenceVersion $ReferenceVersion
                     }
                 }
@@ -5669,7 +6276,7 @@ The script will copy it to the guest before running bcdboot, then proceed with -
 
         $windowsRoot = Join-Path $script:WinDriveLetter 'Windows'
         $winsxsDir = Join-Path $windowsRoot 'WinSxS'
-        if (Test-Path -LiteralPath $winsxsDir) {
+        if ((-not [string]::IsNullOrWhiteSpace($Spec.ComponentDirectoryFilter)) -and (Test-Path -LiteralPath $winsxsDir)) {
             Get-ChildItem -Path $winsxsDir -Directory -Filter $Spec.ComponentDirectoryFilter -ErrorAction SilentlyContinue |
             ForEach-Object {
                 Add-CodeIntegrityCandidate -Candidates $candidates -Spec $Spec -Path (Join-Path $_.FullName $Spec.FileName) -Source 'OfflineWinSxS' -Priority 1 -ReferenceVersion $ReferenceVersion
@@ -5679,11 +6286,12 @@ The script will copy it to the guest before running bcdboot, then proceed with -
         if ($IncludeHostFallback) {
             $buildMatch = Test-HostBuildMatchesGuest
             if ($buildMatch.Matches) {
-                $hostCodeIntegrityPath = Join-Path $env:SystemRoot (Join-Path 'System32\CodeIntegrity' $Spec.FileName)
-                Add-CodeIntegrityCandidate -Candidates $candidates -Spec $Spec -Path $hostCodeIntegrityPath -Source "HostSystem32CodeIntegrity ($($buildMatch.Host))" -Priority 2 -ReferenceVersion $ReferenceVersion
+                foreach ($hostPath in @(Get-CodeIntegrityCandidateSubPath -Spec $Spec -Root $env:SystemRoot -HostLayout)) {
+                    Add-CodeIntegrityCandidate -Candidates $candidates -Spec $Spec -Path $hostPath -Source "HostSystem32CodeIntegrity ($($buildMatch.Host))" -Priority 2 -ReferenceVersion $ReferenceVersion
+                }
 
                 $hostWinsxsDir = Join-Path $env:SystemRoot 'WinSxS'
-                if (Test-Path -LiteralPath $hostWinsxsDir) {
+                if ((-not [string]::IsNullOrWhiteSpace($Spec.ComponentDirectoryFilter)) -and (Test-Path -LiteralPath $hostWinsxsDir)) {
                     Get-ChildItem -Path $hostWinsxsDir -Directory -Filter $Spec.ComponentDirectoryFilter -ErrorAction SilentlyContinue |
                     ForEach-Object {
                         Add-CodeIntegrityCandidate -Candidates $candidates -Spec $Spec -Path (Join-Path $_.FullName $Spec.FileName) -Source "HostWinSxS ($($buildMatch.Host))" -Priority 3 -ReferenceVersion $ReferenceVersion
@@ -5755,69 +6363,39 @@ The script will copy it to the guest before running bcdboot, then proceed with -
                 Write-Warning "  Using explicit source for $($spec.FileName). Verify it came from a working VM with the same OS build/LCU."
             }
 
-            if ($targetItem) {
-                $backupPath = New-UniqueBackupPath -BasePath $targetPath -BakSuffix '.codeintegrity.bak'
-                Write-Host "  Backing up current $($spec.FileName): $targetPath -> $backupPath" -ForegroundColor DarkGray
-                Invoke-Logged -Description "Backup $($spec.FileName)" -Details @{ Source = $targetPath; BackupPath = $backupPath } -ScriptBlock {
-                    Copy-Item -LiteralPath $targetPath -Destination $backupPath -Force -ErrorAction Stop
-                }
-            }
+            # The backup is made by Install-ProtectedSystemFile below, which renames the
+            # existing file aside rather than copying it. A copy would need the same
+            # rights the replacement needs, and would leave nothing to roll back to if
+            # the overwrite then failed halfway.
 
             $targetDir = Split-Path -Parent $targetPath
             if (-not (Test-Path -LiteralPath $targetDir)) {
                 New-Item-Logged -Path $targetDir -ItemType Directory -Force
             }
 
-            $restoreProtectedAcl = $false
-            try {
-                try {
-                    Invoke-Logged -Description "Replace $($spec.FileName)" -Details @{ Source = $best.Path; Destination = $targetPath; SourceType = $best.Source; ComponentVersion = $best.ComponentVersion } -ScriptBlock {
-                        Copy-Item -LiteralPath $best.Path -Destination $targetPath -Force -ErrorAction Stop
-                    }
-                    $restoreProtectedAcl = $true
-                }
-                catch [System.UnauthorizedAccessException] {
-                    if (-not (Test-Path -LiteralPath $targetPath)) { throw }
+            # Routed through the same installer every other replacement in this script
+            # uses, so this path also gets the hard-link guard, the descriptor replay and
+            # the rollback. It previously called takeown.exe and icacls.exe, which leave
+            # a granted ACE behind and set an owner Windows never had.
+            $ciValidation = {
+                param($installedPath)
 
-                    Write-Warning "  Access denied replacing $($spec.FileName). Taking ownership and granting Administrators Full Control, then retrying once."
-                    $restoreProtectedAcl = $true
-                    $takeownResult = Invoke-NativeCommandLogged -Description "Take ownership of $($spec.FileName)" -Details @{
-                        Path = $targetPath
-                        Owner = 'BUILTIN\Administrators'
-                    } -ScriptBlock { & takeown.exe /F $targetPath /A }
-                    if ($takeownResult.ExitCode -ne 0) {
-                        throw "takeown failed for $targetPath (exit code $($takeownResult.ExitCode))."
-                    }
-
-                    $icaclsResult = Invoke-NativeCommandLogged -Description "Grant Administrators FullControl on $($spec.FileName)" -Details @{
-                        Path = $targetPath
-                        Principal = 'S-1-5-32-544'
-                        Rights = 'FullControl'
-                    } -ScriptBlock { & icacls.exe $targetPath /grant '*S-1-5-32-544:(F)' }
-                    if ($icaclsResult.ExitCode -ne 0) {
-                        throw "icacls failed to grant Administrators Full Control on $targetPath (exit code $($icaclsResult.ExitCode))."
-                    }
-
-                    Invoke-Logged -Description "Retry replace $($spec.FileName) after access grant" -Details @{ Source = $best.Path; Destination = $targetPath; SourceType = $best.Source; ComponentVersion = $best.ComponentVersion } -ScriptBlock {
-                        Copy-Item -LiteralPath $best.Path -Destination $targetPath -Force -ErrorAction Stop
-                    }
+                $installedItem = Get-Item -LiteralPath $installedPath -Force -ErrorAction Stop
+                $installedHash = Get-CodeIntegrityFileHash -Path $installedPath
+                if ($installedItem.Length -ne $best.Size -or $installedHash -ne $best.Hash) {
+                    throw "Copy verification failed for $installedPath (expected hash $($best.Hash), got $installedHash)."
                 }
             }
-            finally {
-                if ($restoreProtectedAcl -and (Test-Path -LiteralPath $targetPath)) {
-                    try {
-                        $protectedAcl = New-ProtectedSystemFileAcl
-                        Invoke-Logged -Description "Restore protected ACL on $($spec.FileName)" -Details @{
-                            Path = $targetPath
-                        } -ScriptBlock {
-                            Set-Acl -LiteralPath $targetPath -AclObject $protectedAcl -ErrorAction Stop
-                        } | Out-Null
-                        Write-Host "  [OK] Applied protected Windows system-file ACL/owner baseline." -ForegroundColor Green
-                    }
-                    catch {
-                        Write-Warning "  Could not apply protected Windows system-file ACL/owner to $($spec.FileName): $_"
-                    }
-                }
+
+            $ciInstall = Install-ProtectedSystemFile `
+                -Source $best.Path `
+                -Destination $targetPath `
+                -BackupSuffix '.codeintegrity.bak' `
+                -PostCopyValidation $ciValidation `
+                -Description $spec.FileName
+
+            if (-not $ciInstall.Installed) {
+                throw "Could not replace $($spec.FileName): $($ciInstall.Reason)"
             }
 
             $newItem = Get-Item -LiteralPath $targetPath -Force -ErrorAction Stop
@@ -5918,6 +6496,39 @@ dependencies on the Windows partition.
             throw "Missing Secure Boot recovery source file(s): $($missingSources -join ', ')"
         }
 
+        # Last line of defence before the EFI System Partition is written. Copying a
+        # damaged source over a good ESP copy turns a repairable disk into an unbootable
+        # one, so the sources are sanity-checked for their expected file signature first.
+        $sourceChecks = @(
+            @{ Path = $sourceBootManager; Magic = @(0x4D, 0x5A); Kind = 'PE image'; Label = 'boot manager (bootmgfw.efi)' }
+            @{ Path = $sourceSkuPolicy;   Magic = @(0x30, 0x82); Kind = 'DER-encoded PKCS#7'; Label = 'Secure Boot SKU policy (SKUSiPolicy.p7b)' }
+        )
+        $badSources = @()
+        foreach ($check in $sourceChecks) {
+            $header = $null
+            try {
+                $stream = [System.IO.File]::OpenRead($check.Path)
+                try {
+                    $header = New-Object byte[] 2
+                    if ($stream.Read($header, 0, 2) -lt 2) { $header = $null }
+                }
+                finally { $stream.Dispose() }
+            }
+            catch { $header = $null }
+
+            if ((-not $header) -or $header[0] -ne $check.Magic[0] -or $header[1] -ne $check.Magic[1]) {
+                $badSources += "$($check.Label) at $($check.Path) is not a valid $($check.Kind)"
+            }
+        }
+        if ($badSources.Count -gt 0) {
+            Write-Host "`n[ERROR] Secure Boot source file(s) on the offline Windows partition are damaged:" -ForegroundColor Red
+            $badSources | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
+            Write-Host "`nCopying these to the EFI System Partition would overwrite the existing copies with damaged data and could make the disk unbootable." -ForegroundColor Yellow
+            Write-Host "Supply a known-good folder from a VM with the same build and LCU using -CodeIntegrityPolicySourcePath, then rerun -FixSecureBootCodeIntegrity." -ForegroundColor Yellow
+            $script:_userFacingError = $true
+            throw "Damaged Secure Boot source file(s); EFI System Partition was left unchanged."
+        }
+
         foreach ($dir in @($microsoftBootDir, $fallbackBootDir)) {
             if (-not (Test-Path -LiteralPath $dir)) {
                 New-Item-Logged -Path $dir -ItemType Directory -Force
@@ -5931,26 +6542,19 @@ dependencies on the Windows partition.
                 [Parameter(Mandatory = $true)][string]$Label
             )
 
-            if (Test-Path -LiteralPath $Destination) {
-                $backupPath = New-UniqueBackupPath -BasePath $Destination -BakSuffix '.secureboot.bak'
-                Write-Host "  Backing up ${Label}: $Destination -> $backupPath" -ForegroundColor DarkGray
-                Invoke-Logged -Description "Backup $Label" -Details @{ Source = $Destination; BackupPath = $backupPath } -ScriptBlock {
-                    Copy-Item -LiteralPath $Destination -Destination $backupPath -Force -ErrorAction Stop
-                }
-            }
-
+            # Routed through the shared installer so this path gets the same backup,
+            # rollback, hash verification and protected-path handling as every other
+            # replacement. The destination here is normally on the FAT32 EFI System
+            # Partition, which the installer detects and handles by leaving ACLs alone.
             Write-Host "  Copying ${Label}: $Source -> $Destination" -ForegroundColor Cyan
-            Invoke-Logged -Description "Copy $Label" -Details @{ Source = $Source; Destination = $Destination } -ScriptBlock {
-                Copy-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
-            }
+            $install = Install-ProtectedSystemFile `
+                -Source $Source `
+                -Destination $Destination `
+                -BackupSuffix '.secureboot.bak' `
+                -Description $Label
 
-            if (-not (Test-Path -LiteralPath $Destination)) {
-                throw "Copy verification failed for $Destination"
-            }
-            $sourceSize = (Get-Item -LiteralPath $Source -Force).Length
-            $destSize = (Get-Item -LiteralPath $Destination -Force).Length
-            if ($sourceSize -ne $destSize) {
-                throw "Copy verification failed for $Destination (source size $sourceSize, destination size $destSize)"
+            if (-not $install.Installed) {
+                throw "Copy failed for $Destination : $($install.Reason)"
             }
         }
 
@@ -7240,22 +7844,47 @@ public static class RepairAzVmDiskServicingPrivilege
         try { $originalSddl = (Get-Acl -LiteralPath $Path).GetSecurityDescriptorSddlForm($sections) }
         catch { Write-Warning "Could not read the security descriptor of $Path : $($_.Exception.Message)" }
 
+        # An object that cannot be handed back should not be taken.
+        if (-not $originalSddl) { return $null }
+
         $me = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User
 
         # Only the owner section is set here, so the existing DACL is left intact. The
-        # DACL cannot be written until ownership is held.
-        if ($isDirectory) {
-            $ownerOnly = [System.Security.AccessControl.DirectorySecurity]::new()
-            $ownerOnly.SetOwner($me)
-            [System.IO.Directory]::SetAccessControl($Path, $ownerOnly)
+        # DACL cannot be written until ownership is held - but writing the owner back to
+        # the value it already holds is a privileged write that buys nothing, and an
+        # existing owner already carries the WRITE_DAC the grant below needs.
+        $currentOwner = ''
+        try {
+            $rawSd = [System.Security.AccessControl.RawSecurityDescriptor]::new($originalSddl)
+            if ($rawSd.Owner) { $currentOwner = $rawSd.Owner.Value }
         }
-        else {
-            $ownerOnly = [System.Security.AccessControl.FileSecurity]::new()
-            $ownerOnly.SetOwner($me)
-            [System.IO.File]::SetAccessControl($Path, $ownerOnly)
+        catch { }
+
+        if ($currentOwner -ne $me.Value) {
+            if ($isDirectory) {
+                $ownerOnly = [System.Security.AccessControl.DirectorySecurity]::new()
+                $ownerOnly.SetOwner($me)
+                [System.IO.Directory]::SetAccessControl($Path, $ownerOnly)
+            }
+            else {
+                $ownerOnly = [System.Security.AccessControl.FileSecurity]::new()
+                $ownerOnly.SetOwner($me)
+                [System.IO.File]::SetAccessControl($Path, $ownerOnly)
+            }
         }
 
-        $acl = Get-Acl -LiteralPath $Path
+        # Built from the captured SDDL rather than from Get-Acl, so that only the DACL is
+        # ever written. A descriptor that carries the SACL along demands SeSecurityPrivilege
+        # for a change that has nothing to do with auditing, and fails for that reason alone.
+        # The granted ACE deliberately does not inherit: pushing it onto children would
+        # alter descriptors that were never captured and so could never be put back.
+        $acl = if ($isDirectory) {
+            [System.Security.AccessControl.DirectorySecurity]::new()
+        }
+        else {
+            [System.Security.AccessControl.FileSecurity]::new()
+        }
+        $acl.SetSecurityDescriptorSddlForm($originalSddl, 'Access')
         $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
                 $me, 'FullControl', 'None', 'None', 'Allow'))
         if ($isDirectory) { [System.IO.Directory]::SetAccessControl($Path, $acl) }
@@ -7276,21 +7905,537 @@ public static class RepairAzVmDiskServicingPrivilege
         if (-not $Sddl) { return }
         if (-not (Test-Path -LiteralPath $Path)) { return }
 
+        Enable-ServicingRepairPrivilege
+
+        # Only the sections that actually differ are written. If ownership was never taken
+        # - because it was already ours - then replaying the owner is a privileged write
+        # with no effect, and on a restricted token it fails and takes the DACL restore
+        # down with it.
+        $sections = 'Owner,Group,Access'
+        try {
+            $capturedOwner = ([System.Security.AccessControl.RawSecurityDescriptor]::new($Sddl)).Owner
+            $currentSddl = (Get-Acl -LiteralPath $Path).GetSecurityDescriptorSddlForm('Owner,Group,Access')
+            $currentOwner = ([System.Security.AccessControl.RawSecurityDescriptor]::new($currentSddl)).Owner
+            if ($capturedOwner -and $currentOwner -and $capturedOwner.Value -eq $currentOwner.Value) {
+                $sections = 'Access'
+            }
+        }
+        catch { }
+
         try {
             if ((Get-Item -LiteralPath $Path -Force).PSIsContainer) {
                 $sd = [System.Security.AccessControl.DirectorySecurity]::new()
-                $sd.SetSecurityDescriptorSddlForm($Sddl, 'Owner,Group,Access')
+                $sd.SetSecurityDescriptorSddlForm($Sddl, $sections)
                 [System.IO.Directory]::SetAccessControl($Path, $sd)
             }
             else {
                 $sd = [System.Security.AccessControl.FileSecurity]::new()
-                $sd.SetSecurityDescriptorSddlForm($Sddl, 'Owner,Group,Access')
+                $sd.SetSecurityDescriptorSddlForm($Sddl, $sections)
                 [System.IO.File]::SetAccessControl($Path, $sd)
             }
         }
         catch {
             Write-Warning "Could not restore the original ACL on $Path : $($_.Exception.Message)"
             Write-Host "  Restore it manually with: icacls '$Path' /setowner 'NT SERVICE\TrustedInstaller'" -ForegroundColor Yellow
+        }
+    }
+
+    function Clear-ProtectedFileAttribute {
+        # ReadOnly, Hidden and System all refuse a delete or rename, and the write that
+        # clears them is itself refused on a protected file - which is why this is called
+        # again after ownership is taken rather than only before.
+        param([Parameter(Mandatory = $true)][string]$Path)
+
+        try {
+            $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+            $blocking = ([System.IO.FileAttributes]::ReadOnly -bor
+                [System.IO.FileAttributes]::Hidden -bor
+                [System.IO.FileAttributes]::System)
+            if ($item.Attributes -band $blocking) {
+                $item.Attributes = ($item.Attributes -band (-bnot $blocking))
+            }
+        }
+        catch {
+            Write-Verbose "Attributes on $Path could not be cleared: $($_.Exception.Message)"
+        }
+    }
+
+    function Test-ProtectedPathReadable {
+        # Whether this account can actually open the file for reading, which is not the
+        # same question as whether it exists. Used to tell a protected source apart from
+        # a protected destination, because the copy reports only one error for both.
+        param([Parameter(Mandatory = $true)][string]$Path)
+
+        try {
+            $stream = [System.IO.File]::Open(
+                $Path,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]'ReadWrite, Delete')
+            $stream.Dispose()
+            return $true
+        }
+        catch {
+            return $false
+        }
+    }
+
+    function Copy-ProtectedSystemFile {
+        # Writes a file into a TrustedInstaller-owned folder, taking ownership of the
+        # destination and its parent only when the plain copy is refused.
+        #
+        # On an offline guest disk, \Windows\System32\drivers\<driver>.sys is owned by
+        # NT SERVICE\TrustedInstaller. The rescue VM's SYSTEM/Administrator token is not
+        # the owner, so Copy-Item over the top fails with "Access to the path is denied"
+        # - which is how a repair reports success while having changed nothing.
+        #
+        # The copy is made in place so the destination keeps its own descriptor rather
+        # than inheriting the rescue VM's idea of the ACL. Both borrowed descriptors are
+        # replayed in a finally, so the guest boots with TrustedInstaller owning its
+        # system files again whether the copy succeeded, failed, or threw.
+        param(
+            [Parameter(Mandatory = $true)][string]$Source,
+            [Parameter(Mandatory = $true)][string]$Destination
+        )
+
+        $result = [PSCustomObject]@{
+            Copied        = $false
+            TookOwnership = $false
+            Restored      = $false
+            Reason        = ''
+        }
+
+        if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
+            $result.Reason = "The source file $Source was not present."
+            return $result
+        }
+
+        $existed = $false
+        try { $existed = Test-Path -LiteralPath $Destination -PathType Leaf -ErrorAction Stop }
+        catch {
+            Write-Verbose "Whether $Destination exists could not be checked ($($_.Exception.Message)). Treating that as protection rather than absence."
+        }
+
+        # SeRestorePrivilege on its own is usually enough to write over a file this
+        # account has no rights to, so it is enabled before the plain attempt rather
+        # than only in the fallback. That turns the common case into a single copy with
+        # nobody's ACL touched, and leaves the take-ownership path for the rest.
+        Enable-ServicingRepairPrivilege
+
+        try {
+            if ($existed) { Clear-ProtectedFileAttribute -Path $Destination }
+            Copy-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+            $result.Copied = $true
+            $result.Reason = 'Copied without changing any permission.'
+            return $result
+        }
+        catch {
+            $firstError = $_.Exception.Message
+        }
+
+        $parent = Split-Path -Path $Destination -Parent
+        Write-Host "  $Destination could not be written ($firstError)." -ForegroundColor DarkGray
+
+        $parentSddl = $null
+        $fileSddl = $null
+        $sourceSddl = $null
+        $sourceParentSddl = $null
+        try {
+            # A protected source is as likely as a protected destination, because the
+            # spare copy normally comes out of WinSxS and TrustedInstaller owns that too.
+            # The copy reports one error for both ends, so the source is tested directly
+            # rather than guessed at from the message.
+            if (-not (Test-ProtectedPathReadable -Path $Source)) {
+                Write-Host "  The source $Source cannot be read either. Taking it as well." -ForegroundColor DarkGray
+                $sourceSddl = Grant-ProtectedPathAccess -Path $Source
+                if (-not (Test-ProtectedPathReadable -Path $Source)) {
+                    # Nothing under the folder can be opened until the folder itself
+                    # allows a traverse, so the file's own ACL was never the obstacle.
+                    $sourceParentSddl = Grant-ProtectedPathAccess -Path (Split-Path -Path $Source -Parent)
+                    if (-not $sourceSddl) { $sourceSddl = Grant-ProtectedPathAccess -Path $Source }
+                }
+                $result.TookOwnership = [bool]($sourceSddl -or $sourceParentSddl)
+            }
+
+            Write-Host "  Taking ownership of $parent, retrying, and putting its ACL back either way." -ForegroundColor DarkGray
+            $parentSddl = Grant-ProtectedPathAccess -Path $parent
+            if (-not $parentSddl) {
+                $result.Reason = "The folder's security descriptor could not be read, so its ownership was left alone. Original error: $firstError"
+                return $result
+            }
+            $result.TookOwnership = $true
+
+            # Re-checked now that the folder can actually be read: the first check ran
+            # against a folder that may have been denying us, so its answer is unreliable.
+            if (Test-Path -LiteralPath $Destination) {
+                $fileSddl = Grant-ProtectedPathAccess -Path $Destination
+                Clear-ProtectedFileAttribute -Path $Destination
+            }
+
+            Copy-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+            $result.Copied = $true
+            $result.Reason = 'Copied after taking ownership of the destination and its parent folder.'
+        }
+        catch {
+            $result.Reason = "The copy was still refused after taking ownership of the destination and its parent folder: $($_.Exception.Message)"
+        }
+        finally {
+            # The destination's own descriptor is replayed onto whatever now sits at that
+            # path, so a freshly written file ends up owned by TrustedInstaller exactly as
+            # the one it replaced was. The file goes back first, while the parent rights
+            # that make it reachable are still in place.
+            if ($fileSddl) { Restore-ProtectedPathAccess -Path $Destination -Sddl $fileSddl }
+            if ($parentSddl) { Restore-ProtectedPathAccess -Path $parent -Sddl $parentSddl }
+            # The source was only borrowed to read it, so it is handed back untouched.
+            if ($sourceSddl) { Restore-ProtectedPathAccess -Path $Source -Sddl $sourceSddl }
+            if ($sourceParentSddl) { Restore-ProtectedPathAccess -Path (Split-Path -Path $Source -Parent) -Sddl $sourceParentSddl }
+            $result.Restored = [bool]($fileSddl -or $parentSddl -or $sourceSddl -or $sourceParentSddl)
+        }
+
+        return $result
+    }
+
+    function Rename-ProtectedSystemFile {
+        # Renames a file in a protected folder, taking the folder and the file only when
+        # the plain rename is refused.
+        #
+        # A rename needs rights on both and neither alone is enough: the parent supplies
+        # FILE_ADD_FILE for the new name, the file supplies the DELETE that Rename-Item
+        # asks for when it opens the source. Granting on the parent with inheritance would
+        # cover the file too, but would also rewrite every other child's descriptor.
+        param(
+            [Parameter(Mandatory = $true)][string]$Path,
+            [Parameter(Mandatory = $true)][string]$NewName
+        )
+
+        $parent = Split-Path -Path $Path -Parent
+        $target = Join-Path $parent $NewName
+        $result = [PSCustomObject]@{
+            Renamed       = $false
+            TookOwnership = $false
+            NewPath       = ''
+            Reason        = ''
+        }
+
+        try {
+            if (-not (Test-Path -LiteralPath $Path -ErrorAction Stop)) {
+                $result.Reason = 'The file was not present.'
+                return $result
+            }
+        }
+        catch {
+            Write-Verbose "Whether $Path exists could not be checked ($($_.Exception.Message)). Treating that as protection rather than absence."
+        }
+
+        # See Copy-ProtectedSystemFile: the privileges alone usually carry the rename,
+        # which leaves every descriptor on the disk exactly as the guest wrote it.
+        Enable-ServicingRepairPrivilege
+
+        try {
+            Rename-Item -LiteralPath $Path -NewName $NewName -Force -ErrorAction Stop
+            $result.Renamed = $true
+            $result.NewPath = $target
+            $result.Reason = 'Renamed without changing any permission.'
+            return $result
+        }
+        catch {
+            $firstError = $_.Exception.Message
+        }
+
+        Write-Host "  $Path could not be renamed ($firstError)." -ForegroundColor DarkGray
+        Write-Host "  Taking ownership of $parent, retrying, and putting its ACL back either way." -ForegroundColor DarkGray
+
+        $parentSddl = $null
+        $fileSddl = $null
+        try {
+            $parentSddl = Grant-ProtectedPathAccess -Path $parent
+            if (-not $parentSddl) {
+                $result.Reason = "The folder's security descriptor could not be read, so its ownership was left alone. Original error: $firstError"
+                return $result
+            }
+
+            if (-not (Test-Path -LiteralPath $Path)) {
+                $result.Reason = 'The file was not present once the folder could be read.'
+                return $result
+            }
+
+            $fileSddl = Grant-ProtectedPathAccess -Path $Path
+            Clear-ProtectedFileAttribute -Path $Path
+            $result.TookOwnership = $true
+            Rename-Item -LiteralPath $Path -NewName $NewName -Force -ErrorAction Stop
+            $result.Renamed = $true
+            $result.NewPath = $target
+            $result.Reason = 'Renamed after taking ownership of the file and its parent folder.'
+        }
+        catch {
+            $result.Reason = "The rename was still refused after taking ownership of the file and its parent folder: $($_.Exception.Message)"
+        }
+        finally {
+            # The file goes back first, under whichever name it ended up with, while the
+            # parent rights that make it reachable are still in place.
+            if ($fileSddl) {
+                Restore-ProtectedPathAccess -Path $(if ($result.Renamed) { $target } else { $Path }) -Sddl $fileSddl
+            }
+            if ($parentSddl) { Restore-ProtectedPathAccess -Path $parent -Sddl $parentSddl }
+        }
+
+        return $result
+    }
+
+    function Install-ProtectedSystemFile {
+        # The single way this script puts a file onto the offline guest disk.
+        #
+        # Every replacement has to survive the same five problems, so they are solved
+        # once here rather than separately at each call site:
+        #
+        #   1. The destination is owned by NT SERVICE\TrustedInstaller, so a plain
+        #      Copy-Item is refused and the repair "succeeds" having changed nothing.
+        #   2. The spare copy is very often a hard link to the file being replaced.
+        #      Windows keeps one instance of an inbox file and links it into place, so
+        #      copying the store copy over the live file both changes nothing and fails,
+        #      because Copy-Item opens the one file for reading and writing at once.
+        #   3. Copy-Item creates a *new* file that inherits the folder's ACEs. Unless the
+        #      original descriptor is put back, the repaired file is the only one in
+        #      System32 carrying permissions Windows never wrote.
+        #   4. A copy that lands but is wrong is worse than one that fails, so the
+        #      content is hashed and the caller's own checks are run before it is kept.
+        #   5. Anything that goes wrong has to leave the disk as it was found.
+        #
+        # takeown.exe and icacls.exe are deliberately not used. icacls /grant leaves its
+        # ACE behind, takeown sets an owner that is not the one Windows shipped, and
+        # neither can put a descriptor back the way it was.
+        param(
+            [Parameter(Mandatory = $true)][string]$Source,
+            [Parameter(Mandatory = $true)][string]$Destination,
+            [string]$BackupSuffix = '.replaced.bak',
+            [switch]$NoBackup,
+            # Run against the newly written file before it is accepted. Throwing from
+            # here rolls the replacement back, which is how a caller rejects a copy that
+            # arrived intact but is the wrong binary.
+            [scriptblock]$PostCopyValidation,
+            [string]$Description = 'system file'
+        )
+
+        $result = [PSCustomObject]@{
+            Installed  = $false
+            BackupPath = $null
+            AclSource  = ''
+            RolledBack = $false
+            Hash       = ''
+            Reason     = ''
+        }
+
+        if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
+            $result.Reason = "The source file $Source was not present."
+            return $result
+        }
+
+        $destinationItem = Get-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+        $destinationExists = $null -ne $destinationItem
+        $destinationIsDirectory = $destinationExists -and $destinationItem.PSIsContainer
+
+        # The EFI System Partition is FAT32, which has no security descriptors and no
+        # hard links at all. Asking for either there fails, and on FAT the file index
+        # is not a reliable identity, so two unrelated files can look like one. Both
+        # steps are therefore skipped rather than guessed at.
+        $supportsSecurity = $true
+        try {
+            $driveFormat = ([System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($Destination))).DriveFormat
+            $supportsSecurity = $driveFormat -in @('NTFS', 'ReFS')
+            if (-not $supportsSecurity) {
+                Write-Verbose "$Destination is on a $driveFormat volume, which stores no ACLs. Ownership and descriptor handling are skipped."
+            }
+        }
+        catch {
+            Write-Verbose "The destination's file system could not be determined: $($_.Exception.Message)"
+        }
+
+        # -- Refuse to replace a file with itself -----------------------------
+        if ($supportsSecurity -and $destinationExists -and -not $destinationIsDirectory) {
+            $sourceIdentity = Get-FileIdentity -Path $Source
+            $destinationIdentity = Get-FileIdentity -Path $Destination
+            if ($sourceIdentity -and $destinationIdentity -and $sourceIdentity.Id -eq $destinationIdentity.Id) {
+                $result.Reason = "The source and the destination are two hard links to one file (file ID $($destinationIdentity.Id), $($destinationIdentity.LinkCount) link(s)). Copying it over itself would change nothing while reporting success."
+                return $result
+            }
+        }
+
+        # -- Capture the descriptor before anything moves ---------------------
+        # Only a descriptor that still looks like one Windows wrote is worth replaying.
+        # When a file was *replaced* rather than damaged - by a bad update, a driver
+        # installer or malware - the ACL sitting on it is the attacker's, not the
+        # guest's, and putting it back on the repaired file would preserve exactly the
+        # thing being repaired. In that case the standard baseline is the safer answer.
+        $originalSddl = $null
+        if ($supportsSecurity -and $destinationExists -and -not $destinationIsDirectory) {
+            try {
+                $candidateSddl = (Get-Acl -LiteralPath $Destination).GetSecurityDescriptorSddlForm('Owner,Group,Access')
+                $ownerSid = ([System.Security.AccessControl.RawSecurityDescriptor]::new($candidateSddl)).Owner
+                $systemOwners = @(
+                    'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464', # NT SERVICE\TrustedInstaller
+                    'S-1-5-18', # NT AUTHORITY\SYSTEM
+                    'S-1-5-32-544'                                                     # BUILTIN\Administrators
+                )
+                if ($ownerSid -and $systemOwners -contains $ownerSid.Value) {
+                    $originalSddl = $candidateSddl
+                }
+                else {
+                    Write-Warning "  The existing file is owned by $($ownerSid.Value), which is not an owner Windows gives its system files. Its ACL will not be carried over to the replacement; the standard system-file baseline is applied instead."
+                }
+            }
+            catch {
+                Write-Verbose "The destination's security descriptor could not be read: $($_.Exception.Message)"
+            }
+        }
+
+        # -- Back up whatever is there now ------------------------------------
+        $backupCreated = $false
+        $backupPath = $null
+        if ($destinationExists -and -not $NoBackup) {
+            $backupPath = New-UniqueBackupPath -BasePath $Destination -BakSuffix $BackupSuffix
+            try {
+                $renameResult = Invoke-LoggedValue -Description "Back up $Description" -Details @{
+                    Path        = $Destination
+                    Destination = $backupPath
+                } -ScriptBlock {
+                    Rename-ProtectedSystemFile -Path $Destination -NewName (Split-Path $backupPath -Leaf)
+                } | Select-Object -Last 1
+                if (-not $renameResult -or -not $renameResult.Renamed) {
+                    throw $(if ($renameResult) { $renameResult.Reason } else { 'The rename helper returned no result.' })
+                }
+                if (-not (Test-Path -LiteralPath $backupPath)) { throw 'The backup path was not created.' }
+                Write-Host "  [OK] $($renameResult.Reason)" -ForegroundColor DarkGray
+                $backupCreated = $true
+                $result.BackupPath = $backupPath
+            }
+            catch {
+                $result.Reason = "The existing path could not be backed up, so the replacement was cancelled rather than run without a way back: $($_.Exception.Message)"
+                return $result
+            }
+        }
+
+        $parent = Split-Path -Path $Destination -Parent
+        if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+            New-Item-Logged -Path $parent -ItemType Directory -Force | Out-Null
+        }
+
+        try {
+            $sourceHash = (Get-FileHash -LiteralPath $Source -Algorithm SHA256 -ErrorAction Stop).Hash
+
+            $copyResult = Invoke-LoggedValue -Description "Replace $Description" -Details @{
+                Source      = $Source
+                Destination = $Destination
+            } -ScriptBlock {
+                Copy-ProtectedSystemFile -Source $Source -Destination $Destination
+            } | Select-Object -Last 1
+            if (-not $copyResult -or -not $copyResult.Copied) {
+                throw $(if ($copyResult) { $copyResult.Reason } else { 'The copy helper returned no result.' })
+            }
+            Write-Host "  [OK] $($copyResult.Reason)" -ForegroundColor DarkGray
+
+            if (-not (Test-Path -LiteralPath $Destination -PathType Leaf)) {
+                throw "The copy did not create a file at $Destination."
+            }
+
+            $destinationHash = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256 -ErrorAction Stop).Hash
+            if ($sourceHash -ne $destinationHash) {
+                throw 'SHA-256 verification failed after copying the replacement.'
+            }
+            $result.Hash = $destinationHash
+
+            if ($PostCopyValidation) {
+                & $PostCopyValidation $Destination
+            }
+
+            # -- Give the file its permissions back ----------------------------
+            if (-not $supportsSecurity) {
+                $result.AclSource = 'not applicable (volume stores no ACLs)'
+            }
+            else {
+                Enable-ServicingRepairPrivilege
+
+                if ($originalSddl) {
+                    # Preferred: hand the file back the descriptor it actually had. A
+                    # generic baseline is a guess, and a guess that is right for a driver
+                    # is wrong for files that ship with extra capability SIDs.
+                    try {
+                        $originalSd = [System.Security.AccessControl.FileSecurity]::new()
+                        $originalSd.SetSecurityDescriptorSddlForm($originalSddl, 'Owner,Group,Access')
+                        Invoke-Logged -Description "Restore original ACL on $Description" -Details @{
+                            Path = $Destination
+                            Sddl = $originalSddl
+                        } -ScriptBlock {
+                            [System.IO.File]::SetAccessControl($Destination, $originalSd)
+                        } | Out-Null
+                        $result.AclSource = 'original descriptor'
+                        Write-Host "  [OK] Restored the file's original owner, group and ACL." -ForegroundColor Green
+                    }
+                    catch {
+                        Write-Warning "  The original descriptor could not be replayed ($($_.Exception.Message)). Falling back to the standard system-file baseline."
+                    }
+                }
+
+                if (-not $result.AclSource) {
+                    try {
+                        # Set-Acl is deliberately not used: it refuses a protected (D:P)
+                        # DACL unless the caller holds SeSecurityPrivilege, even though
+                        # nothing about this write touches auditing.
+                        $protectedAcl = New-ProtectedSystemFileAcl
+                        Invoke-Logged -Description "Apply protected system-file ACL to $Description" -Details @{
+                            Path  = $Destination
+                            Owner = 'NT SERVICE\TrustedInstaller'
+                        } -ScriptBlock {
+                            [System.IO.File]::SetAccessControl($Destination, $protectedAcl)
+                        } | Out-Null
+                        $result.AclSource = 'protected system-file baseline'
+                        Write-Host "  [OK] Applied protected Windows system-file ACL/owner baseline." -ForegroundColor Green
+                    }
+                    catch {
+                        Write-Warning "  Replaced the file's content, but could not apply an owner/ACL: $($_.Exception.Message)"
+                        Write-Warning "  After recovery, verify permissions with: icacls `"$Destination`""
+                    }
+                }
+            }
+
+            $result.Installed = $true
+            $result.Reason = "Replaced $Destination."
+            return $result
+        }
+        catch {
+            $result.Reason = $_.Exception.Message
+            Write-Error "  Failed to replace or verify $Description : $($result.Reason)"
+
+            if ($backupCreated) {
+                try {
+                    if (Test-Path -LiteralPath $Destination) {
+                        Enable-ServicingRepairPrivilege
+                        $failedSddl = Grant-ProtectedPathAccess -Path $Destination
+                        if ($failedSddl) { Clear-ProtectedFileAttribute -Path $Destination }
+                        Remove-Item -LiteralPath $Destination -Recurse -Force -ErrorAction Stop
+                    }
+                    $rollback = Invoke-LoggedValue -Description "Roll back failed replacement of $Description" -Details @{
+                        Backup      = $backupPath
+                        Destination = $Destination
+                    } -ScriptBlock {
+                        Rename-ProtectedSystemFile -Path $backupPath -NewName (Split-Path $Destination -Leaf)
+                    } | Select-Object -Last 1
+                    if (-not $rollback -or -not $rollback.Renamed) {
+                        throw $(if ($rollback) { $rollback.Reason } else { 'The rename helper returned no result.' })
+                    }
+                    $result.RolledBack = $true
+                    $result.BackupPath = $null
+                    Write-Warning "  Restored the original file from $backupPath."
+                }
+                catch {
+                    Write-Warning "  Automatic rollback failed: $($_.Exception.Message)"
+                    Write-Warning "  The original file is still available at $backupPath - restore it by hand."
+                }
+            }
+            elseif (-not $destinationExists -and (Test-Path -LiteralPath $Destination)) {
+                Remove-Item-Logged -Path $Destination -Force
+            }
+
+            return $result
         }
     }
 
@@ -7302,6 +8447,88 @@ public static class RepairAzVmDiskServicingPrivilege
         if ($Path -match 'HKEY_LOCAL_MACHINE\\(.+)$') { return $Matches[1] }
         if ($Path -match '^HKLM:\\(.+)$') { return $Matches[1] }
         return $null
+    }
+
+    function Get-BackupPrivilegeRegistrySddl {
+        # Reads Owner, Group and DACL of a key the caller has no granted access to.
+        #
+        # A key whose DACL grants nothing to Administrators denies READ_CONTROL as well
+        # as write, so its descriptor cannot be read the ordinary way - and without the
+        # original descriptor there is nothing to restore afterwards, which is why the
+        # write path used to abort on such a key rather than escalate.
+        #
+        # SeBackupPrivilege lifts exactly that restriction, but only through
+        # RegOpenKeyEx with REG_OPTION_BACKUP_RESTORE. The .NET RegistryKey APIs never
+        # pass that flag, so this has to go to the Win32 entry points directly.
+        param([Parameter(Mandatory = $true)][string]$SubKey)
+
+        if (-not ('RepairAzVmDiskBackupRegistry' -as [type])) {
+            Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class RepairAzVmDiskBackupRegistry
+{
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern int RegOpenKeyExW(IntPtr hKey, string subKey, int options, int sam, out IntPtr result);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern int RegGetKeySecurity(IntPtr hKey, int securityInformation, byte[] descriptor, ref int length);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern int RegCloseKey(IntPtr hKey);
+
+    private static readonly IntPtr HKEY_LOCAL_MACHINE = new IntPtr(unchecked((int)0x80000002));
+    private const int REG_OPTION_BACKUP_RESTORE = 0x00000004;
+    private const int READ_CONTROL = 0x00020000;
+    private const int OWNER_GROUP_DACL = 0x00000001 | 0x00000002 | 0x00000004;
+    private const int ERROR_INSUFFICIENT_BUFFER = 122;
+
+    public static byte[] GetSecurityDescriptor(string subKey)
+    {
+        IntPtr handle;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, subKey, REG_OPTION_BACKUP_RESTORE, READ_CONTROL, out handle) != 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            int length = 0;
+            int rc = RegGetKeySecurity(handle, OWNER_GROUP_DACL, null, ref length);
+            if (rc != 0 && rc != ERROR_INSUFFICIENT_BUFFER)
+            {
+                return null;
+            }
+
+            byte[] buffer = new byte[length];
+            if (RegGetKeySecurity(handle, OWNER_GROUP_DACL, buffer, ref length) != 0)
+            {
+                return null;
+            }
+            return buffer;
+        }
+        finally
+        {
+            RegCloseKey(handle);
+        }
+    }
+}
+'@
+        }
+
+        Enable-ServicingRepairPrivilege
+
+        try {
+            $raw = [RepairAzVmDiskBackupRegistry]::GetSecurityDescriptor($SubKey)
+            if (-not $raw) { return $null }
+            $security = [System.Security.AccessControl.RegistrySecurity]::new()
+            $security.SetSecurityDescriptorBinaryForm($raw)
+            return $security.GetSecurityDescriptorSddlForm('Owner,Group,Access')
+        }
+        catch {
+            return $null
+        }
     }
 
     function Get-ProtectedRegistryKeySddl {
@@ -7320,18 +8547,21 @@ public static class RepairAzVmDiskServicingPrivilege
                 $subKey,
                 [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadSubTree,
                 [System.Security.AccessControl.RegistryRights]::ReadPermissions)
-            if (-not $key) { return $null }
-            $sections = [System.Security.AccessControl.AccessControlSections]::Access -bor
-            [System.Security.AccessControl.AccessControlSections]::Owner -bor
-            [System.Security.AccessControl.AccessControlSections]::Group
-            return $key.GetAccessControl($sections).GetSecurityDescriptorSddlForm('Owner,Group,Access')
+            if ($key) {
+                $sections = [System.Security.AccessControl.AccessControlSections]::Access -bor
+                [System.Security.AccessControl.AccessControlSections]::Owner -bor
+                [System.Security.AccessControl.AccessControlSections]::Group
+                return $key.GetAccessControl($sections).GetSecurityDescriptorSddlForm('Owner,Group,Access')
+            }
         }
         catch {
-            return $null
+            # Falls through to the backup-privilege read below.
         }
         finally {
             if ($key) { $key.Close() }
         }
+
+        return Get-BackupPrivilegeRegistrySddl -SubKey $subKey
     }
 
     function Restore-ProtectedRegistryKeyAccess {
@@ -7358,7 +8588,9 @@ public static class RepairAzVmDiskServicingPrivilege
                 $rights)
             if (-not $key) { return }
             $security = [System.Security.AccessControl.RegistrySecurity]::new()
-            $security.SetSecurityDescriptorSddlForm($Sddl)
+            # Sections must be named. The default is All, which pulls in the SACL and so
+            # demands SeSecurityPrivilege for a write that never touches auditing.
+            $security.SetSecurityDescriptorSddlForm($Sddl, 'Owner,Group,Access')
             $key.SetAccessControl($security)
         }
         catch {
@@ -7446,6 +8678,150 @@ public static class RepairAzVmDiskServicingPrivilege
         # later reg unload from failing.
         [System.GC]::Collect()
         [System.GC]::WaitForPendingFinalizers()
+    }
+
+    function Test-RegistryAccessDenied {
+        # An offline hive refuses a write in two different ways depending on which layer
+        # rejects it: the provider surfaces UnauthorizedAccessException, while the
+        # RegistryKey APIs raise SecurityException. Either one means "the ACL said no",
+        # and only those two are worth retrying - a missing key or a bad value type must
+        # keep failing loudly rather than being retried behind an ownership change.
+        param([Parameter(Mandatory = $true)]$ErrorRecord)
+
+        $ex = $ErrorRecord.Exception
+        while ($ex) {
+            if ($ex -is [System.UnauthorizedAccessException] -or $ex -is [System.Security.SecurityException]) { return $true }
+            $ex = $ex.InnerException
+        }
+        return $false
+    }
+
+    function Get-NearestExistingRegistryKey {
+        # Creating a value needs rights on its key; creating a key needs rights on the
+        # nearest ancestor that actually exists, because that is the key whose ACL is
+        # consulted when the first missing level is created.
+        param([Parameter(Mandatory = $true)][string]$Path)
+
+        $current = $Path
+        while ($current) {
+            if (Test-Path -LiteralPath $current) { return $current }
+            $parent = Split-Path -Parent $current
+            if ($parent -eq $current) { break }
+            $current = $parent
+        }
+        return $null
+    }
+
+    function Get-ProtectedRegistryValue {
+        # The read counterpart of Invoke-ProtectedRegistryWrite. A key locked to
+        # SYSTEM:Read denies Administrators even READ_CONTROL, so reporting the current
+        # value of a guarded key needs the same ownership dance the write does.
+        #
+        # -DefaultValue is returned when the value genuinely does not exist, which is a
+        # different outcome from "exists but could not be read" and must not be confused
+        # with it: mislabelling a locked value as absent is how a repair ends up logging
+        # 'was: (not set)' about a value it never managed to see.
+        param(
+            [Parameter(Mandatory = $true)][string]$Path,
+            [Parameter(Mandatory = $true)][string]$Name,
+            $DefaultValue = $null,
+            [ref]$Found,
+            [ref]$Denied
+        )
+
+        if ($Found) { $Found.Value = $false }
+        if ($Denied) { $Denied.Value = $false }
+
+        $read = {
+            $props = Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop
+            if ($props -and ($props.PSObject.Properties.Name -contains $Name)) {
+                if ($Found) { $Found.Value = $true }
+                return $props.$Name
+            }
+            return $DefaultValue
+        }
+
+        try { return & $read }
+        catch {
+            if (-not (Test-RegistryAccessDenied -ErrorRecord $_)) { return $DefaultValue }
+        }
+
+        if ($Denied) { $Denied.Value = $true }
+
+        $guardPath = Get-NearestExistingRegistryKey -Path $Path
+        if (-not $guardPath) { return $DefaultValue }
+        $originalSddl = Get-ProtectedRegistryKeySddl -Path $guardPath
+        if (-not $originalSddl) { return $DefaultValue }
+
+        try { Grant-ProtectedRegistryKeyAccess -Path $guardPath -KeyOnly }
+        catch {
+            Restore-ProtectedRegistryKeyAccess -Path $guardPath -Sddl $originalSddl
+            return $DefaultValue
+        }
+
+        try { return & $read }
+        catch { return $DefaultValue }
+        finally { Restore-ProtectedRegistryKeyAccess -Path $guardPath -Sddl $originalSddl }
+    }
+
+    function Invoke-ProtectedRegistryWrite {
+        # The registry counterpart of Install-ProtectedSystemFile, and it exists for the
+        # same reason: keys in an offline hive can be owned by TrustedInstaller and deny
+        # write to Administrators, so a repair reports success having changed nothing.
+        #
+        # The plain write is attempted first and the ACL is only touched when the write
+        # is actually refused. That matters here far more than it does for files: this
+        # runs behind every registry write in the script, and unconditionally rewriting
+        # a descriptor per value would be both slow and a change the guest never asked
+        # for. The overwhelming majority of writes take the fast path and cost nothing.
+        #
+        # Only the guarded key itself is granted, never its subtree. A value write needs
+        # KEY_SET_VALUE on one key; recursing would rewrite the ACL of every key beneath
+        # it - which under a hive root is tens of thousands of keys - for no benefit.
+        param(
+            [Parameter(Mandatory = $true)][string]$Path,
+            [Parameter(Mandatory = $true)][scriptblock]$Action,
+            [string]$Description = 'registry write'
+        )
+
+        try {
+            & $Action
+            return
+        }
+        catch {
+            $firstError = $_
+            if (-not (Test-RegistryAccessDenied -ErrorRecord $firstError)) { throw }
+        }
+
+        $guardPath = Get-NearestExistingRegistryKey -Path $Path
+        if (-not $guardPath) { throw $firstError }
+
+        # Captured before anything changes so the descriptor can be replayed verbatim.
+        # A null means the path is not in HKLM and these APIs cannot address it, in
+        # which case the original access-denied error is the honest outcome.
+        $originalSddl = Get-ProtectedRegistryKeySddl -Path $guardPath
+        if (-not $originalSddl) { throw $firstError }
+
+        Write-Host "  $guardPath is protected by its own ACL; taking ownership to $Description." -ForegroundColor DarkGray
+
+        try {
+            Grant-ProtectedRegistryKeyAccess -Path $guardPath -KeyOnly
+        }
+        catch {
+            Write-Warning "Could not take ownership of $guardPath : $($_.Exception.Message)"
+            Restore-ProtectedRegistryKeyAccess -Path $guardPath -Sddl $originalSddl
+            throw $firstError
+        }
+
+        try {
+            & $Action
+            Write-Host "  [OK] Completed after taking ownership; original owner, group and ACL restored." -ForegroundColor Green
+        }
+        finally {
+            # Runs even when the retry fails, so a failed repair never leaves the key
+            # owned by the repairing account.
+            Restore-ProtectedRegistryKeyAccess -Path $guardPath -Sddl $originalSddl
+        }
     }
 
     function Remove-ProtectedRegistryKey {
@@ -7604,18 +8980,20 @@ public static class RepairAzVmDiskServicingPrivilege
                 }
             } | Out-Null
 
-            foreach ($file in $files) {
-                try {
-                    Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $backupPath $file.Name) -Force -ErrorAction Stop
-                }
-                catch {
-                    $failures.Add("backup of $($file.Name) failed: $($_.Exception.Message)") | Out-Null
-                }
-            }
-            Write-ActionLog -Event 'ClearTransactionLogsBackup' -Details @{
+            Invoke-Logged -Description 'Back up transaction log files' -Details @{
                 Scope = $scopePlan.Scope; Path = $scopePlan.Path; Backup = $backupPath
                 Files = @($files | ForEach-Object { $_.Name })
-            }
+            } -ScriptBlock {
+                foreach ($file in $files) {
+                    try {
+                        Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $backupPath $file.Name) -Force -ErrorAction Stop
+                    }
+                    catch {
+                        # A List, so the additions survive the scriptblock's child scope.
+                        $failures.Add("backup of $($file.Name) failed: $($_.Exception.Message)") | Out-Null
+                    }
+                }
+            } | Out-Null
 
             if ($failures.Count -gt 0) {
                 Write-Error "Backup incomplete for $($scopePlan.Label); nothing was deleted. $($failures -join '; ')"
@@ -9446,6 +10824,446 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
         }
     }
 
+    function Get-PeCertificateTableSize {
+        # Returns the byte size of the PE certificate table (data directory entry 4,
+        # IMAGE_DIRECTORY_ENTRY_SECURITY). Zero means the image carries NO embedded
+        # Authenticode signature, so its only possible route to trust is a catalog.
+        # Most Windows inbox drivers are in that category - filecrypt.sys and
+        # npsvctrig.sys both report 0 - which is why a damaged catalog store makes
+        # byte-for-byte correct Microsoft drivers fail verification.
+        # Returns -1 when the file cannot be parsed as a PE image.
+        param([Parameter(Mandatory)][string]$FilePath)
+
+        $fs = $null
+        try {
+            $fs = [System.IO.File]::Open($FilePath, [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            $br = New-Object System.IO.BinaryReader($fs)
+
+            if ($fs.Length -lt 0x40) { return -1 }
+            $fs.Position = 0x3C
+            $peOffset = $br.ReadInt32()
+            if ($peOffset -le 0 -or ($peOffset + 0x18) -ge $fs.Length) { return -1 }
+
+            $fs.Position = $peOffset
+            if ($br.ReadUInt32() -ne 0x00004550) { return -1 }      # 'PE\0\0'
+
+            $fs.Position = $peOffset + 0x18                          # optional header
+            $magic = $br.ReadUInt16()
+            $ddOffset = switch ($magic) {
+                0x10B { $peOffset + 0x18 + 96 }                      # PE32
+                0x20B { $peOffset + 0x18 + 112 }                     # PE32+
+                default { -1 }
+            }
+            if ($ddOffset -lt 0) { return -1 }
+
+            $secOffset = $ddOffset + (4 * 8)                         # entry 4, 8 bytes each
+            if (($secOffset + 8) -gt $fs.Length) { return -1 }
+            $fs.Position = $secOffset
+            $null = $br.ReadUInt32()                                 # RVA (unused)
+            return [int]$br.ReadUInt32()                             # Size
+        }
+        catch { return -1 }
+        finally { if ($fs) { $fs.Dispose() } }
+    }
+
+    function GetCatalogStoreReport {
+        # Reports the health of the offline guest's Authenticode catalog store, then
+        # names every Boot/System-start driver whose ability to load depends on it.
+        #
+        # Why this exists: boot-time Code Integrity parses the raw .cat files under
+        #   \Windows\System32\CatRoot\{F750E6C3-38EE-11D1-85E5-00C04FC295EE}
+        # It does NOT use CatRoot2, which is a CryptSvc database that only exists once
+        # the OS is running - so the common "delete CatRoot2" advice cannot fix a boot
+        # failure. A driver with an empty PE certificate table has no embedded
+        # signature to fall back on, so if its catalog is missing or damaged the load
+        # fails with STATUS_INVALID_IMAGE_HASH (0xC0000428) even though the binary is
+        # byte-for-byte correct. When that driver also carries ErrorControl=3
+        # (Critical) the failure aborts boot -> bugcheck 0x5A CRITICAL_SERVICE_FAILED.
+        #
+        # The tell-tale signature of a store-level fault is MULTIPLE unrelated inbox
+        # drivers failing the same way: replacing binaries one at a time just moves the
+        # bugcheck to the next driver in load order.
+        param([switch]$IncludeHealthy)
+
+        Write-Host "`nBuilding offline catalog store report..." -ForegroundColor Cyan
+
+        $storePath = Get-OfflineCatalogStorePath
+        Write-Host "`n=== Catalog store ===" -ForegroundColor Cyan
+        Write-Host "  Path: $storePath" -ForegroundColor Gray
+
+        if (-not $storePath -or -not (Test-Path -LiteralPath $storePath)) {
+            Write-Host "  [CRITICAL] Catalog store directory does not exist." -ForegroundColor Red
+            Write-Host "  Every catalog-signed driver will fail Code Integrity at boot." -ForegroundColor Red
+            return
+        }
+
+        $cats = @(Get-ChildItem -LiteralPath $storePath -Filter '*.cat' -File -ErrorAction SilentlyContinue)
+        $totalBytes = ($cats | Measure-Object -Property Length -Sum).Sum
+        $zeroLen = @($cats | Where-Object { $_.Length -eq 0 })
+        $truncated = @($cats | Where-Object { $_.Length -gt 0 -and $_.Length -lt 512 })
+
+        Write-Host ("  Catalogs      : {0:N0}" -f $cats.Count) -ForegroundColor Gray
+        Write-Host ("  Total size    : {0:N1} MB" -f ($totalBytes / 1MB)) -ForegroundColor Gray
+
+        $zeroColor = if ($zeroLen.Count -gt 0) { 'Red' } else { 'Gray' }
+        Write-Host ("  Zero-length   : {0:N0}" -f $zeroLen.Count) -ForegroundColor $zeroColor
+        $truncColor = if ($truncated.Count -gt 0) { 'Yellow' } else { 'Gray' }
+        Write-Host ("  Suspiciously small (<512B): {0:N0}" -f $truncated.Count) -ForegroundColor $truncColor
+
+        # A healthy Server 2016/2019/2022 store holds thousands of catalogs. A store
+        # with only a handful has been wiped or partially restored.
+        if ($cats.Count -eq 0) {
+            Write-Host "  [CRITICAL] Catalog store is EMPTY." -ForegroundColor Red
+        }
+        elseif ($cats.Count -lt 200) {
+            Write-Host "  [CRITICAL] Catalog count is far below a healthy install (expect thousands)." -ForegroundColor Red
+        }
+        foreach ($z in ($zeroLen | Select-Object -First 10)) {
+            Write-Host "    zero-length: $($z.Name)" -ForegroundColor Red
+        }
+
+        # Force the index + reference sample to run so we get the store verdict.
+        $state = Initialize-OfflineCatalogIndex
+        Write-Host "`n=== Store verdict ===" -ForegroundColor Cyan
+        Write-Host "  State  : $state" -ForegroundColor $(if ($state -eq 'Usable') { 'Green' } else { 'Red' })
+        if ($script:OfflineCatalogStoreSummary) {
+            Write-Host "  Detail : $($script:OfflineCatalogStoreSummary)" -ForegroundColor Gray
+        }
+
+        if ($state -eq 'Unusable') {
+            Write-Host "  The store exists but cannot resolve well-known inbox binaries." -ForegroundColor Red
+            Write-Host "  That is the fingerprint of a DAMAGED CATALOG STORE, not damaged drivers." -ForegroundColor Red
+        }
+        elseif ($state -eq 'Disabled') {
+            Write-Host "  Catalog verification was disabled with -SkipCatalogVerification." -ForegroundColor Yellow
+            return
+        }
+        elseif ($state -ne 'Usable') {
+            Write-Host "  Store could not be indexed on this repair host; results below are advisory." -ForegroundColor Yellow
+        }
+
+        # ---- which Boot/System drivers actually depend on this store? -------------
+        Write-Host "`n=== Boot/System drivers that depend on the catalog store ===" -ForegroundColor Cyan
+
+        $rows = [System.Collections.Generic.List[PSCustomObject]]::new()
+        Invoke-WithHive 'SYSTEM' {
+            & {
+                $SystemRoot = Get-SystemRootPath
+                Get-ChildItem "$SystemRoot\Services" -ErrorAction SilentlyContinue | ForEach-Object {
+                    $props = Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue
+                    if (-not $props) { return }
+                    if ($null -eq $props.Start -or $null -eq $props.Type) { return }
+                    if ([int]$props.Start -notin @(0, 1)) { return }
+                    if ([int]$props.Type -notin @(1, 2, 4, 8)) { return }
+                    if (-not $props.ImagePath) { return }
+
+                    $imgPath = Resolve-GuestImagePath $props.ImagePath
+                    $exists = Test-Path -LiteralPath $imgPath
+                    $certSize = if ($exists) { Get-PeCertificateTableSize -FilePath $imgPath } else { -1 }
+                    $inStore = $false
+                    if ($exists) {
+                        $member = Test-OfflineCatalogMembership -FilePath $imgPath
+                        $inStore = [bool]$member.Found
+                    }
+
+                    $rows.Add([PSCustomObject]@{
+                            Name         = $_.PSChildName
+                            StartVal     = [int]$props.Start
+                            ErrorControl = if ($null -ne $props.ErrorControl) { [int]$props.ErrorControl } else { 0 }
+                            Image        = Split-Path $imgPath -Leaf
+                            Exists       = $exists
+                            CertSize     = $certSize
+                            InStore      = $inStore
+                        })
+                }
+            }
+        }
+
+        # Catalog-dependent = present, parseable PE, and no embedded signature.
+        $catalogDependent = @($rows | Where-Object { $_.Exists -and $_.CertSize -eq 0 })
+        $unresolved = @($catalogDependent | Where-Object { -not $_.InStore })
+        $bootFatal = @($unresolved | Where-Object { $_.ErrorControl -ge 2 })
+
+        Write-Host ("  Boot/System drivers examined : {0}" -f $rows.Count) -ForegroundColor Gray
+        Write-Host ("  Catalog-dependent (no embedded signature) : {0}" -f $catalogDependent.Count) -ForegroundColor Gray
+        $unresColor = if ($unresolved.Count -gt 0) { 'Red' } else { 'Green' }
+        Write-Host ("  Not resolvable in this store : {0}" -f $unresolved.Count) -ForegroundColor $unresColor
+        Write-Host ("  ...of which ErrorControl>=2 (would abort boot) : {0}" -f $bootFatal.Count) -ForegroundColor $unresColor
+
+        $show = if ($IncludeHealthy) { $rows } else { $unresolved }
+        if ($show.Count -gt 0) {
+            Write-Host ""
+            Write-Host ("  {0,-28} {1,-7} {2,-6} {3,-9} {4,-8} {5}" -f `
+                    'Driver', 'Start', 'ErCtl', 'Embedded', 'InStore', 'Image') -ForegroundColor DarkGray
+            foreach ($r in ($show | Sort-Object StartVal, Name)) {
+                $startLabel = if ($r.StartVal -eq 0) { 'Boot' } else { 'System' }
+                $errLabel = switch ($r.ErrorControl) {
+                    3 { 'CRIT' } 2 { 'SEV' } 1 { 'NORM' } default { 'IGN' }
+                }
+                $embedded = if ($r.CertSize -gt 0) { "$($r.CertSize)B" } elseif ($r.CertSize -eq 0) { 'none' } else { 'n/a' }
+                $inStore = if ($r.InStore) { 'yes' } else { 'NO' }
+                $color = if (-not $r.InStore -and $r.CertSize -eq 0) {
+                    if ($r.ErrorControl -ge 2) { 'Red' } else { 'Yellow' }
+                }
+                else { 'Gray' }
+                Write-Host ("  {0,-28} {1,-7} {2,-6} {3,-9} {4,-8} {5}" -f `
+                        $r.Name, $startLabel, $errLabel, $embedded, $inStore, $r.Image) -ForegroundColor $color
+            }
+        }
+
+        # ---- interpretation -------------------------------------------------------
+        Write-Host "`n=== Interpretation ===" -ForegroundColor Cyan
+        if ($state -eq 'Usable' -and $unresolved.Count -eq 0) {
+            Write-Host "  Catalog store is healthy and every catalog-dependent boot driver resolves." -ForegroundColor Green
+            Write-Host "  A 0xC0000428 boot failure is NOT explained by the catalog store." -ForegroundColor Green
+        }
+        elseif ($unresolved.Count -ge 3 -or $state -eq 'Unusable') {
+            Write-Host "  MULTIPLE unrelated Microsoft inbox drivers cannot be verified against this" -ForegroundColor Red
+            Write-Host "  store. That is a STORE-level fault. Replacing individual .sys files will" -ForegroundColor Red
+            Write-Host "  not help - the bugcheck simply moves to the next driver in load order." -ForegroundColor Red
+            Write-Host ""
+            Write-Host "  Repair options, most surgical first:" -ForegroundColor Yellow
+            Write-Host "    1. Restore the catalog store from a same-build donor (see -RepairCatalogStore)." -ForegroundColor Yellow
+            Write-Host "    2. DISM /Image:<mount> /Cleanup-Image /RestoreHealth /Source:<matching WIM>" -ForegroundColor Yellow
+            Write-Host "    3. sfc /scannow /offbootdir=<win> /offwindir=<win>\Windows" -ForegroundColor Yellow
+            Write-Host "    4. Reinstall the owning LCU offline (DISM /Add-Package)." -ForegroundColor Yellow
+            Write-Host "  Do NOT bother deleting CatRoot2 - it is not consulted during boot." -ForegroundColor DarkGray
+        }
+        else {
+            Write-Host "  A small number of drivers did not resolve. That can be legitimate (an" -ForegroundColor Yellow
+            Write-Host "  out-of-band or third-party driver may be covered by its own catalog)." -ForegroundColor Yellow
+            Write-Host "  Treat as store-level corruption only if the failures are inbox components." -ForegroundColor Yellow
+        }
+    }
+
+    function RepairCatalogStore {
+        # Merges a same-build donor's Authenticode catalogs into the offline guest's
+        # store to fix a 0xC0000428 boot failure caused by store-level damage rather
+        # than by any individual driver.
+        #
+        # This is safe in a way that replacing drivers is not. Catalogs are additive
+        # and each one carries its own Microsoft signature, so adding one can only
+        # widen the set of hashes boot code integrity can resolve. Nothing already
+        # present is invalidated, and an existing catalog is never overwritten.
+        param(
+            [Parameter(Mandatory = $true)][string]$DonorPath,
+            [switch]$Force
+        )
+
+        Write-Host "`nRepairing offline catalog store..." -ForegroundColor Cyan
+
+        if (-not (Initialize-OfflineCatalogNativeType)) {
+            Write-Error "The wintrust catalog APIs are unavailable on this repair host; cannot merge a donor store."
+            return
+        }
+
+        $storePath = Get-OfflineCatalogStorePath
+        if (-not $storePath) {
+            Write-Error "Could not resolve the guest catalog store path (no Windows volume detected)."
+            return
+        }
+
+        # Accept any sensible way of naming the donor: the GUID folder itself, a
+        # CatRoot folder, a System32 folder, a \Windows folder, or a mounted volume.
+        $donorCandidates = @(
+            $DonorPath
+            (Join-Path $DonorPath $script:OfflineCatalogGuid)
+            (Join-Path $DonorPath "CatRoot\$($script:OfflineCatalogGuid)")
+            (Join-Path $DonorPath "System32\CatRoot\$($script:OfflineCatalogGuid)")
+            (Join-Path $DonorPath "Windows\System32\CatRoot\$($script:OfflineCatalogGuid)")
+        )
+        $donorStore = $null
+        $donorFiles = @()
+        foreach ($candidate in $donorCandidates) {
+            if (-not (Test-Path -LiteralPath $candidate -PathType Container)) { continue }
+            $found = @(Get-ChildItem -LiteralPath $candidate -Filter '*.cat' -File -ErrorAction SilentlyContinue)
+            if ($found.Count -gt 0) { $donorStore = $candidate; $donorFiles = $found; break }
+        }
+        if (-not $donorStore) {
+            Write-Error "No catalogs (*.cat) found at or under '$DonorPath'. Point -RepairCatalogStore at a same-build donor's CatRoot, its {GUID} subfolder, or the donor's mounted Windows volume."
+            return
+        }
+
+        Write-Host "  Donor store : $donorStore" -ForegroundColor Gray
+        Write-Host "  Guest store : $storePath" -ForegroundColor Gray
+        Write-Host ("  Donor catalogs: {0:N0}" -f $donorFiles.Count) -ForegroundColor Gray
+
+        # ---- record the guest's condition before touching anything -----------------
+        $beforeState = Initialize-OfflineCatalogIndex
+        $beforeSummary = $script:OfflineCatalogStoreSummary
+        if ($beforeState -eq 'Disabled') {
+            Write-Error "-SkipCatalogVerification is in effect, so the store cannot be assessed or repaired. Re-run without it."
+            return
+        }
+
+        # ---- prove the donor actually matches this guest ---------------------------
+        # A donor from the wrong build indexes perfectly well but resolves none of the
+        # guest's own binaries, and merging it would add thousands of useless files
+        # while leaving the machine just as unbootable.
+        Write-Host "  Indexing donor store..." -ForegroundColor DarkGray
+        $donorStats = [int[]]@(0, 0)
+        try {
+            $donorIndex = [RepairAzVMDisk.CatalogNative]::BuildIndex([string[]]($donorFiles.FullName), $donorStats)
+        }
+        catch {
+            Write-Error "Donor catalog store could not be indexed: $($_.Exception.Message)"
+            return
+        }
+
+        $sampleFiles = @(Get-CatalogReferenceSampleFile)
+        $donorResolved = 0
+        foreach ($samplePath in $sampleFiles) {
+            foreach ($tag in (Get-AuthenticodeReferenceTag -FilePath $samplePath)) {
+                if ($donorIndex.ContainsKey($tag)) { $donorResolved++; break }
+            }
+        }
+        $donorRatio = if ($sampleFiles.Count -gt 0) { $donorResolved / $sampleFiles.Count } else { 0 }
+        Write-Host ("  Donor resolves {0}/{1} of this guest's reference binaries ({2:P0}), {3:N0} hashes." -f `
+                $donorResolved, $sampleFiles.Count, $donorRatio, $donorIndex.Count) -ForegroundColor Gray
+
+        if ($sampleFiles.Count -ge 6 -and $donorRatio -lt 0.6) {
+            Write-Host ""
+            Write-Host "  This donor does not match the guest's build." -ForegroundColor Red
+            Write-Host "  Its catalogs do not publish the hashes of this guest's own inbox binaries," -ForegroundColor Red
+            Write-Host "  so merging it would add files without making the guest bootable." -ForegroundColor Red
+            Write-Host "  Use a donor at the same OS build AND patch level (UBR) as the guest." -ForegroundColor Yellow
+            if (-not $Force) {
+                Write-Error "Refusing to merge a mismatched donor catalog store. Re-run with -Force to override."
+                return
+            }
+            Write-Host "  -Force specified; merging anyway." -ForegroundColor Yellow
+        }
+
+        # ---- work out what is actually missing -------------------------------------
+        # Same name + same content is already present. Same name + different content
+        # is kept side by side under a suffixed name rather than overwritten, because
+        # discarding a catalog can only ever reduce coverage.
+        $existing = @{}
+        foreach ($f in @(Get-ChildItem -LiteralPath $storePath -Filter '*.cat' -File -ErrorAction SilentlyContinue)) {
+            $existing[$f.Name] = $f
+        }
+
+        $toCopy = [System.Collections.Generic.List[object]]::new()
+        foreach ($d in $donorFiles) {
+            $target = Join-Path $storePath $d.Name
+            if ($existing.ContainsKey($d.Name)) {
+                $sameSize = ($existing[$d.Name].Length -eq $d.Length)
+                if ($sameSize -and
+                    (Get-FileHash -LiteralPath $existing[$d.Name].FullName -Algorithm SHA256).Hash -eq
+                    (Get-FileHash -LiteralPath $d.FullName -Algorithm SHA256).Hash) {
+                    continue
+                }
+                $target = Join-Path $storePath ("{0}.donor{1}" -f [IO.Path]::GetFileNameWithoutExtension($d.Name), [IO.Path]::GetExtension($d.Name))
+                if (Test-Path -LiteralPath $target) { continue }
+            }
+            $toCopy.Add([PSCustomObject]@{ Source = $d.FullName; Target = $target })
+        }
+
+        if ($toCopy.Count -eq 0) {
+            Write-Host "  The guest store already contains every catalog this donor has; nothing to merge." -ForegroundColor Yellow
+            Write-Host "  The damage is therefore not missing catalogs. Use DISM /RestoreHealth with a matching source." -ForegroundColor Yellow
+            return
+        }
+
+        Write-Host ("  Catalogs to add: {0:N0}" -f $toCopy.Count) -ForegroundColor Gray
+
+        # ---- copy ------------------------------------------------------------------
+        # The store directory is taken once rather than per file. At a few thousand
+        # catalogs, per-file ownership changes dominate the runtime.
+        $originalSddl = ''
+        $addedPaths = [System.Collections.Generic.List[string]]::new()
+        $failures = [System.Collections.Generic.List[string]]::new()
+        try {
+            $originalSddl = Grant-ProtectedPathAccess -Path $storePath
+            # Logged as one action rather than per catalog. A merge routinely adds a few
+            # thousand files, and an action log with a line for each would bury every
+            # other decision the run made; the file list lives in Details, which is what
+            # a revert needs anyway - deleting exactly the catalogs this run added.
+            #
+            # The tallies are collections, not integers, because the scriptblock runs in
+            # a child scope: '$n++' there would increment a copy and leave the outer
+            # counter at zero, which would then trip the "nothing was written" guard.
+            Invoke-Logged -Description 'Merge donor catalogs into the guest catalog store' -Details @{
+                Operation  = 'RepairCatalogStore'
+                StorePath  = $storePath
+                Candidates = $toCopy.Count
+                AddedPaths = $addedPaths
+            } -ScriptBlock {
+                foreach ($item in $toCopy) {
+                    try {
+                        Copy-Item -LiteralPath $item.Source -Destination $item.Target -Force -ErrorAction Stop
+                        $addedPaths.Add($item.Target)
+                    }
+                    catch {
+                        $failures.Add("$(Split-Path $item.Target -Leaf): $($_.Exception.Message)")
+                        if ($failures.Count -le 5) {
+                            Write-Host "    Failed to add $(Split-Path $item.Target -Leaf): $($_.Exception.Message)" -ForegroundColor DarkYellow
+                        }
+                    }
+                }
+            } | Out-Null
+        }
+        finally {
+            if ($originalSddl) { Restore-ProtectedPathAccess -Path $storePath -Sddl $originalSddl }
+        }
+
+        $copied = $addedPaths.Count
+        $failed = $failures.Count
+        $copyColor = if ($failed -gt 0) { 'Yellow' } else { 'Green' }
+        Write-Host ("  Added {0:N0} catalogs ({1:N0} failed)." -f $copied, $failed) -ForegroundColor $copyColor
+        if ($copied -eq 0) {
+            Write-Error "No catalogs could be written to the guest store; it has not been changed."
+            return
+        }
+
+        # ---- re-assess -------------------------------------------------------------
+        # Every cached verdict was formed against the old store and is now stale.
+        $script:OfflineCatalogState = 'NotBuilt'
+        $script:OfflineCatalogIndex = $null
+        $script:OfflineCatalogFiles = @()
+        $script:OfflineCatalogTrustCache = @{}
+        $script:TrustResultCache = @{}
+
+        $afterState = Initialize-OfflineCatalogIndex
+        $afterSummary = $script:OfflineCatalogStoreSummary
+
+        Write-Host "`n=== Result ===" -ForegroundColor Cyan
+        Write-Host ("  Before : {0} - {1}" -f $beforeState, $beforeSummary) -ForegroundColor Gray
+        $afterColor = if ($afterState -eq 'Usable') { 'Green' } else { 'Yellow' }
+        Write-Host ("  After  : {0} - {1}" -f $afterState, $afterSummary) -ForegroundColor $afterColor
+
+        Write-ActionLog -Event 'ActionExecuted' -Details @{
+            Description   = 'RepairCatalogStore'
+            DonorStore    = $donorStore
+            GuestStore    = $storePath
+            CatalogsAdded = $copied
+            CatalogsFailed = $failed
+            StateBefore   = $beforeState
+            StateAfter    = $afterState
+            SummaryAfter  = $afterSummary
+            Success       = ($afterState -eq 'Usable')
+        }
+
+        Write-Host ""
+        if ($afterState -eq 'Usable' -and $beforeState -ne 'Usable') {
+            Write-Host "  The catalog store now resolves this guest's own inbox binaries." -ForegroundColor Green
+            Write-Host "  Re-run -GetCatalogStoreReport to confirm no boot driver is left unresolvable," -ForegroundColor Green
+            Write-Host "  then boot the VM." -ForegroundColor Green
+        }
+        elseif ($afterState -eq 'Usable') {
+            Write-Host "  The store was already usable and is now more complete." -ForegroundColor Green
+            Write-Host "  Re-run -GetCatalogStoreReport to check the per-driver picture." -ForegroundColor Green
+        }
+        else {
+            Write-Host "  The store still cannot resolve this guest's inbox binaries." -ForegroundColor Yellow
+            Write-Host "  The donor was accepted but is not the right build, or the damage is not" -ForegroundColor Yellow
+            Write-Host "  confined to CatRoot. Fall back to DISM /Cleanup-Image /RestoreHealth with a" -ForegroundColor Yellow
+            Write-Host "  matching WIM, or reinstall the owning LCU offline." -ForegroundColor Yellow
+        }
+        Write-Host "  Nothing that was already in the store was overwritten or removed." -ForegroundColor DarkGray
+    }
+
     function GetServicesReport {
         param(
             [switch]$IncludeServices,
@@ -9494,6 +11312,8 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                     $imgPath = $null
                     $present = $null    # $null = no ImagePath registered
                     $vendor = 'N/A'
+                    $trustState = ''
+                    $trustBad = $false
 
                     if ($imgRaw) {
                         $imgPath = Resolve-GuestImagePath $imgRaw
@@ -9502,6 +11322,14 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                             $present = $true
                             $vi = (Get-Item $imgPath -ErrorAction SilentlyContinue).VersionInfo
                             $vendor = if ($vi -and $vi.CompanyName) { $vi.CompanyName.Trim() } else { '(no version info)' }
+                            # Cryptographic trust for kernel drivers only - a Microsoft
+                            # CompanyName on a tampered image must not hide the failure.
+                            if ([int]$typeVal -in @(1, 2, 4, 8)) {
+                                $svcSig = Test-MicrosoftSignature -FilePath $imgPath
+                                $trustState = $svcSig.TrustState
+                                $trustBad = [bool]$svcSig.IsHardFailure
+                                if ($trustBad) { $vendor = "!TRUST FAIL! $vendor" }
+                            }
                         }
                         else {
                             $present = $false
@@ -9517,6 +11345,8 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                             Type          = $typeLabel
                             Group         = if ($props.Group) { $props.Group } else { '' }
                             Vendor        = $vendor
+                            TrustState    = $trustState
+                            TrustBad      = $trustBad
                             BinaryPresent = $present
                             ImagePath     = if ($imgRaw) { $imgRaw } else { '' }
                             ErrorControl  = if ($null -ne $props.ErrorControl) { [int]$props.ErrorControl } else { $null }
@@ -9532,12 +11362,16 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                 # Filter to issue rows only when -IssuesOnly is given.
                 # An issue row is one that warrants attention:
                 #   - Missing binary (any vendor)
+                #   - Failed cryptographic trust (any vendor, including Microsoft-branded)
                 #   - Non-Microsoft vendor with a binary present
                 #   - ErrorControl >= 2 (Severe/Critical) AND non-Microsoft vendor
                 #     (Microsoft inbox drivers legitimately carry CRIT/Sev ErrorControl - that is normal)
                 if ($IssuesOnly) {
                     $rows = [System.Collections.Generic.List[PSCustomObject]]($rows | Where-Object {
-                            $isMsVendor = $_.Vendor -match 'Microsoft'
+                            # A tampered driver keeps its Microsoft CompanyName, so trust
+                            # failure must be evaluated before the vendor suppression.
+                            $isMsVendor = (-not $_.TrustBad) -and $_.Vendor -match 'Microsoft'
+                            $_.TrustBad -or
                             $_.BinaryPresent -eq $false -or
                             ($_.BinaryPresent -eq $true -and -not $isMsVendor) -or
                             ($null -ne $_.ErrorControl -and $_.ErrorControl -ge 2 -and -not $isMsVendor)
@@ -9570,17 +11404,17 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                         Write-Host ("  {0,-30} {1,-28} {2,-6} {3,-6} {4}" -f ('-' * 30), ('-' * 28), '------', '------', ('-' * 40)) -ForegroundColor DarkGray
                     }
 
-                    # Colour logic: missing binary = Red, non-Microsoft = Yellow, Microsoft = Green, N/A = Gray
-                    $isMicrosoft = $r.Vendor -match 'Microsoft'
+                    # Colour logic: trust failure or missing binary = Red, non-Microsoft = Yellow, Microsoft = Green, N/A = Gray
+                    $isMicrosoft = (-not $r.TrustBad) -and $r.Vendor -match 'Microsoft'
                     $isMissing = $r.BinaryPresent -eq $false
                     $noPath = $null -eq $r.BinaryPresent
 
-                    $rowColor = if ($isMissing) { 'Red' }
+                    $rowColor = if ($isMissing -or $r.TrustBad) { 'Red' }
                     elseif ($noPath) { 'DarkGray' }
                     elseif ($isMicrosoft) { 'Green' }
                     else { 'Yellow' }
 
-                    $presTag = if ($isMissing) { 'MISS' } elseif ($noPath) { ' -- ' } else { ' OK ' }
+                    $presTag = if ($isMissing) { 'MISS' } elseif ($noPath) { ' -- ' } elseif ($r.TrustBad) { 'BAD!' } else { ' OK ' }
                     $vendorShort = if ($r.Vendor.Length -gt 28) { $r.Vendor.Substring(0, 25) + '...' } else { $r.Vendor }
 
                     # ErrorControl: 0=Ignore, 1=Normal, 2=Severe (LKGC fallback), 3=Critical (boot failure)
@@ -9601,10 +11435,21 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                 $isKernelDriver = @(1, 2, 4, 8)
                 $sevCritDrivers = @($rows | Where-Object { $_.TypeVal -in $isKernelDriver -and $null -ne $_.ErrorControl -and $_.ErrorControl -ge 2 }).Count
                 $missingBootSys = @($rows | Where-Object { $_.BinaryPresent -eq $false -and $_.StartVal -in @(0, 1) -and $_.TypeVal -in $isKernelDriver }).Count
+                $trustFailed = @($rows | Where-Object { $_.TrustBad })
+                $trustFailedBootSys = @($trustFailed | Where-Object { $_.StartVal -in @(0, 1) })
 
                 Write-Host "`n  ===========================================================" -ForegroundColor Cyan
                 Write-Host ("  Total {0}: {1}  |  Boot/System: {2}  |  Missing binary: {3}  |  Non-Microsoft: {4}  |  Severe/Critical EC (drivers): {5}" `
                         -f $reportLabel, $total, $boot_sys, $missing, $nonMS, $sevCritDrivers) -ForegroundColor Cyan
+                if ($trustFailed.Count -gt 0) {
+                    Write-Host "  [!] $($trustFailed.Count) driver(s) FAILED image trust validation: $(($trustFailed.Name | Select-Object -First 8) -join ', ')" -ForegroundColor Red
+                    Write-Host "      The binary is present but its content does not match any valid signature or guest catalog entry (tampered, corrupted or truncated)." -ForegroundColor Red
+                    if ($trustFailedBootSys.Count -gt 0) {
+                        Write-Host "      $($trustFailedBootSys.Count) of these are Boot/System start - Code Integrity will reject them with STATUS_INVALID_IMAGE_HASH (0xC0000428) -> 0x5A CRITICAL_SERVICE_FAILED." -ForegroundColor Red
+                    }
+                    Write-Host "      Run -RepairSystemFile <driver.sys> to restore a clean copy from WinSxS/DriverStore." -ForegroundColor Red
+                    Write-Host "      If the component store holds the same damaged bytes (a hard link to the file), add -RepairSystemFileSource <file-or-folder>." -ForegroundColor Red
+                }
                 if ($missingBootSys -gt 0) {
                     Write-Host "  [!] $missingBootSys missing-binary Boot/System kernel driver(s) detected - may cause BSOD (e.g. INACCESSIBLE_BOOT_DEVICE)." -ForegroundColor Red
                     Write-Host "      Run -RepairBrokenSystemFile <driver.sys> to restore from WinSxS, or -DisableThirdPartyDrivers if the driver is non-Microsoft." -ForegroundColor Red
@@ -11182,7 +13027,10 @@ complete recovery.
 
                     # Step 1: Remove class instance key - de-registers the component from Windows
                     Write-Host "    [1/3] Removing class instance key..." -ForegroundColor Yellow
-                    Remove-Item-Logged -Path $c.ClassKeyPath -Recurse -Force
+                    # Network class keys under Control\Class are frequently owned by
+                    # TrustedInstaller, and Remove-Item-Logged swallows an access-denied
+                    # delete, so the repair would report success having removed nothing.
+                    [void](Remove-ProtectedRegistryKey -Path $c.ClassKeyPath -Label "class instance key $($c.ComponentId)")
 
                     # Step 2: Disable the service to prevent any load attempt at boot
                     $svcPath = "HKLM:\BROKENSYSTEM\$csName\Services\$($c.ServiceName)"
@@ -11917,8 +13765,9 @@ complete recovery.
             }
             else {
                 $efiMgfwSig = Test-MicrosoftSignature -FilePath $efiBootmgfw
-                if (-not $efiMgfwSig.IsMicrosoft) {
-                    & $emit 'Security' (& $toSev $sevBinarySignatureBad) "bootmgfw.efi is NOT Microsoft-signed (status=$($efiMgfwSig.Status), subject='$($efiMgfwSig.Subject)') - possible tampering" $bcdFix
+                if (-not $efiMgfwSig.IsAcceptableMicrosoft) {
+                    $mgfwSev = if ($efiMgfwSig.IsHardFailure) { 'CRIT' } else { & $toSev $sevBinarySignatureBad }
+                    & $emit 'Security' $mgfwSev "bootmgfw.efi failed trust validation - $(Get-TrustStateDescription -Signature $efiMgfwSig)" $bcdFix
                 }
                 else {
                     & $emit 'BCD' 'OK' 'bootmgfw.efi present on EFI System Partition'
@@ -11932,8 +13781,9 @@ complete recovery.
             }
             else {
                 $efiX64Sig = Test-MicrosoftSignature -FilePath $efiBootx64
-                if (-not $efiX64Sig.IsMicrosoft) {
-                    & $emit 'Security' (& $toSev $sevBinarySignatureBad) "bootx64.efi is NOT Microsoft-signed (status=$($efiX64Sig.Status), subject='$($efiX64Sig.Subject)') - possible tampering" $bcdFix
+                if (-not $efiX64Sig.IsAcceptableMicrosoft) {
+                    $x64Sev = if ($efiX64Sig.IsHardFailure) { 'CRIT' } else { & $toSev $sevBinarySignatureBad }
+                    & $emit 'Security' $x64Sev "bootx64.efi failed trust validation - $(Get-TrustStateDescription -Signature $efiX64Sig)" $bcdFix
                 }
             }
         }
@@ -12025,8 +13875,9 @@ complete recovery.
                 # Binary exists and is non-zero  -  verify Microsoft signature
                 if (-not ([bool]$bf.SkipSignature)) {
                     $sigCheck = Test-MicrosoftSignature -FilePath $bf.Path
-                    if (-not $sigCheck.IsMicrosoft) {
-                        & $emit 'Security' (& $toSev $sevBinarySignatureBad) "$($bf.Name) is NOT Microsoft-signed (status=$($sigCheck.Status), subject='$($sigCheck.Subject)') - possible tampering or corruption" $bf.Fix
+                    if (-not $sigCheck.IsAcceptableMicrosoft) {
+                        $bfSev = if ($sigCheck.IsHardFailure) { 'CRIT' } else { & $toSev $sevBinarySignatureBad }
+                        & $emit 'Security' $bfSev "$($bf.Name) failed trust validation - $(Get-TrustStateDescription -Signature $sigCheck)" $bf.Fix
                         $sigIssues++
                     }
                 }
@@ -12067,8 +13918,9 @@ complete recovery.
             }
             else {
                 $sigCheck = Test-MicrosoftSignature -FilePath $sb.Path
-                if (-not $sigCheck.IsMicrosoft) {
-                    & $emit 'Security' (& $toSev $sevBinarySignatureBad) "$($sb.Name) is NOT Microsoft-signed (status=$($sigCheck.Status), subject='$($sigCheck.Subject)') - possible tampering" "-RepairSystemFile $($sb.Name)"
+                if (-not $sigCheck.IsAcceptableMicrosoft) {
+                    $sbSev = if ($sigCheck.IsHardFailure) { 'CRIT' } else { & $toSev $sevBinarySignatureBad }
+                    & $emit 'Security' $sbSev "$($sb.Name) failed trust validation - $(Get-TrustStateDescription -Signature $sigCheck)" "-RepairSystemFile $($sb.Name)"
                     $sessSigIssues++
                 }
             }
@@ -12209,10 +14061,10 @@ complete recovery.
                     else {
                         # Binary exists, non-zero, start value correct  -  verify signature
                         $sdSig = Test-MicrosoftSignature -FilePath $sdBin.Path
-                        if (-not $sdSig.IsMicrosoft) {
-                            $sigSeverity = if ($sdSig.Status -eq 'Valid') { $sevThirdPartyBootSystemDriver } else { $sdSeverity }
-                            $sigReason = if ($sdSig.Status -eq 'Valid') { 'validly signed by a non-Microsoft publisher' } else { 'possible tampering' }
-                            & $emit 'Security' (& $toSev $sigSeverity) "$sdBinName is NOT Microsoft-signed (status=$($sdSig.Status), subject='$($sdSig.Subject)') - $sigReason" "-RepairSystemFile $sdBinName"
+                        if (-not $sdSig.IsAcceptableMicrosoft) {
+                            $sigSeverity = if ($sdSig.TrustState -eq 'ValidOtherPublisher') { $sevThirdPartyBootSystemDriver } else { $sdSeverity }
+                            $sigSev = if ($sdSig.IsHardFailure) { 'CRIT' } else { & $toSev $sigSeverity }
+                            & $emit 'Security' $sigSev "$sdBinName failed trust validation - $(Get-TrustStateDescription -Signature $sdSig)" "-RepairSystemFile $sdBinName"
                             $synBad++
                         }
                     }
@@ -12260,8 +14112,8 @@ complete recovery.
                         }
                         elseif ($icBinExists) {
                             $icSig = Test-MicrosoftSignature -FilePath $icBinPath
-                            if (-not $icSig.IsMicrosoft) {
-                                & $emit 'Security' (& $toSev $sevBinarySignatureBad) "$($ic.Name) binary is NOT Microsoft-signed (status=$($icSig.Status), subject='$($icSig.Subject)') - possible tampering" "-RepairSystemFile $(Split-Path $icBinPath -Leaf)"
+                            if (-not $icSig.IsAcceptableMicrosoft) {
+                                & $emit 'Security' (& $toSev $sevBinarySignatureBad) "$($ic.Name) binary failed trust validation - $(Get-TrustStateDescription -Signature $icSig)" "-RepairSystemFile $(Split-Path $icBinPath -Leaf)"
                                 $intBad++
                             }
                         }
@@ -12499,17 +14351,19 @@ complete recovery.
                     & $emit 'Networking' 'OK' "SAN policy: OnlineAll ($sanPolicy)"
                 }
 
-                # -- Boot/System drivers with missing binaries -------------------------
-                # We only flag drivers that are registered to load at boot/system start
-                # but whose binary is ABSENT on the offline disk - these WILL cause a
-                # BSOD or hang on next boot. Inbox hardware drivers (LSI, Intel RST,
-                # Broadcom HBA, etc.) ship with Windows but carry vendor company names;
-                # they are NOT flagged here because they are safe and present on disk.
+                # -- Boot/System driver binary + trust health ---------------------------
+                # We flag drivers registered to load at boot/system start whose binary is
+                # ABSENT, zero-byte, or fails image trust validation - all three WILL stop
+                # the boot. Inbox hardware drivers (LSI, Intel RST, Broadcom HBA, etc.)
+                # ship with Windows but carry vendor company names; validly signed ones
+                # are reported separately because they are safe and present on disk.
                 # Use -DisableThirdPartyDrivers to intentionally suppress all non-MS
                 # drivers when troubleshooting a clean-boot scenario.
                 $missingDrivers = [System.Collections.Generic.List[string]]::new()
                 $thirdPartyBootSystemDrivers = [System.Collections.Generic.List[string]]::new()
-                $badSignatureDrivers = [System.Collections.Generic.List[string]]::new()
+                $badSignatureDrivers = [System.Collections.Generic.List[PSCustomObject]]::new()
+                $unverifiedDrivers = [System.Collections.Generic.List[string]]::new()
+                $trustedDriverCount = 0
                 $knownSafeBootSystemDriverNames = [string[]]@()
                 foreach ($safeDriverSpec in (Get-DeviceClassFilterSpec | Where-Object { $_.Name -in @('HDC', 'SCSIAdapter') })) {
                     foreach ($safeDriverName in @($safeDriverSpec.SafeFilters | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
@@ -12521,32 +14375,90 @@ complete recovery.
                 Get-ChildItem $svcRoot -ErrorAction SilentlyContinue | ForEach-Object {
                     $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
                     # Only kernel/filesystem drivers (Type 1/2) at Boot(0) or System(1) start
-                    if ($p.Type -notin @(1, 2) -or $p.Start -notin @(0, 1) -or -not $p.ImagePath) { return }
+                    if ($p.Type -notin @(1, 2) -or $p.Start -notin @(0, 1)) { return }
                     $svcName = $_.PSChildName
-                    $imgR = Resolve-GuestImagePath $p.ImagePath
-                    # Flag if binary is missing or 0 bytes (corrupt/truncated)
-                    if (-not (Test-Path $imgR)) { $missingDrivers.Add("$svcName ($($p.ImagePath))") }
-                    elseif ((Get-Item -LiteralPath $imgR -ErrorAction SilentlyContinue).Length -eq 0) { $missingDrivers.Add("$svcName ($($p.ImagePath)) [0 bytes]") }
+                    # Windows default: when ImagePath is absent the driver file is
+                    # System32\drivers\<ServiceName>.sys, so those still get checked.
+                    $imgDisplay = if ($p.ImagePath) { $p.ImagePath } else { "system32\drivers\$svcName.sys (default path)" }
+                    $imgR = if ($p.ImagePath) {
+                        Resolve-GuestImagePath $p.ImagePath
+                    }
                     else {
-                        # Verify Microsoft signature on present boot/system drivers
+                        Join-Path $script:WinDriveLetter "Windows\System32\drivers\$svcName.sys"
+                    }
+                    # Flag if binary is missing or 0 bytes (corrupt/truncated)
+                    if (-not (Test-Path $imgR)) { $missingDrivers.Add("$svcName ($imgDisplay)") }
+                    elseif ((Get-Item -LiteralPath $imgR -ErrorAction SilentlyContinue).Length -eq 0) { $missingDrivers.Add("$svcName ($imgDisplay) [0 bytes]") }
+                    else {
+                        # Validate image trust on present boot/system drivers
                         $drvSig = Test-MicrosoftSignature -FilePath $imgR
-                        if (-not $drvSig.IsMicrosoft) {
-                            $driverSummary = "$svcName ($($p.ImagePath)) [status=$($drvSig.Status)]"
-                            $isKnownSafeBootSystemDriver = ($drvSig.Status -eq 'Valid' -and $knownSafeBootSystemDriverNames -icontains $svcName -and ([IO.Path]::GetFileName($imgR) -ieq "$svcName.sys"))
-                            if ($isKnownSafeBootSystemDriver) { return }
-                            elseif ($drvSig.Status -eq 'Valid') { $thirdPartyBootSystemDrivers.Add($driverSummary) }
-                            else { $badSignatureDrivers.Add($driverSummary) }
+                        $isKnownSafeBootSystemDriver = ($drvSig.TrustState -eq 'ValidOtherPublisher' -and
+                            $knownSafeBootSystemDriverNames -icontains $svcName -and
+                            ([IO.Path]::GetFileName($imgR) -ieq "$svcName.sys"))
+                        $driverSummary = "$svcName ($imgDisplay) [$($drvSig.Status)]"
+
+                        if ($drvSig.IsHardFailure) {
+                            $badSignatureDrivers.Add([PSCustomObject]@{
+                                    Name         = $svcName
+                                    ImagePath    = $imgDisplay
+                                    ResolvedPath = $imgR
+                                    FileName     = [IO.Path]::GetFileName($imgR)
+                                    Start        = [int]$p.Start
+                                    Type         = [int]$p.Type
+                                    ErrorControl = if ($null -ne $p.ErrorControl) { [int]$p.ErrorControl } else { 1 }
+                                    Group        = if ($p.Group) { [string]$p.Group } else { '' }
+                                    Signature    = $drvSig
+                                })
                         }
+                        elseif ($isKnownSafeBootSystemDriver) { return }
+                        elseif ($drvSig.TrustState -eq 'ValidOtherPublisher') { $thirdPartyBootSystemDrivers.Add($driverSummary) }
+                        elseif ($drvSig.TrustState -eq 'ValidMicrosoft') { $trustedDriverCount++ }
+                        elseif ($drvSig.IsAcceptableMicrosoft) { $unverifiedDrivers.Add($driverSummary) }
+                        else { $unverifiedDrivers.Add($driverSummary) }
                     }
                 }
                 if ($missingDrivers.Count -gt 0) {
                     & $emit 'Drivers' (& $toSev $sevMissingDriverBinaries) "$($missingDrivers.Count) Boot/System driver(s) registered but binary MISSING or 0-byte - will BSOD on boot: $($missingDrivers -join ', ')" "-RepairSystemFile <name.sys> or -DisableThirdPartyDrivers"
                 }
                 else {
-                    & $emit 'Drivers' 'OK' 'All Boot/System drivers have binaries present on disk'
+                    # Presence and trust are different results; say which one this is.
+                    $trustSummary = "trust: $trustedDriverCount verified, $($badSignatureDrivers.Count) invalid, $($unverifiedDrivers.Count) unverified, $($thirdPartyBootSystemDrivers.Count) third-party"
+                    if ($badSignatureDrivers.Count -gt 0) {
+                        # Every path resolved, but at least one of those files will be
+                        # refused at load. Reporting that as OK reads as an all-clear,
+                        # which is the opposite of what the next line goes on to say.
+                        & $emit 'Drivers' 'WARN' "All Boot/System driver paths are present and non-zero, but $($badSignatureDrivers.Count) failed image trust validation ($trustSummary)" '-RepairSystemFile <name.sys>'
+                    }
+                    else {
+                        & $emit 'Drivers' 'OK' "All Boot/System driver paths are present and non-zero ($trustSummary)"
+                    }
                 }
                 if ($badSignatureDrivers.Count -gt 0) {
-                    & $emit 'Security' (& $toSev $sevBinarySignatureBad) "$($badSignatureDrivers.Count) Boot/System driver(s) have invalid or unverifiable non-Microsoft signatures (possible tampering): $($badSignatureDrivers -join ', ')" "-GetServicesReport -IssuesOnly"
+                    # Connect the trust failure to real boot risk. A Boot/System driver with
+                    # ErrorControl=3 that the kernel refuses to load is boot-fatal and is the
+                    # exact shape of CRITICAL_SERVICE_FAILED (0x5A) / STATUS_INVALID_IMAGE_HASH.
+                    foreach ($bad in ($badSignatureDrivers | Sort-Object @{E = { $_.ErrorControl }; Descending = $true }, Name)) {
+                        $startName = if ($bad.Start -eq 0) { 'Boot' } else { 'System' }
+                        $typeName = if ($bad.Type -eq 2) { 'file-system driver' } else { 'kernel driver' }
+                        $ecName = switch ($bad.ErrorControl) { 0 { 'Ignore' } 1 { 'Normal' } 2 { 'Severe' } 3 { 'Critical' } default { "$($bad.ErrorControl)" } }
+                        $trustText = Get-TrustStateDescription -Signature $bad.Signature
+                        $impact = if ($bad.ErrorControl -ge 3) {
+                            'Windows will stop with CRITICAL_SERVICE_FAILED (0x5A, STATUS_INVALID_IMAGE_HASH 0xC0000428) during driver initialization; Safe Mode does not avoid it'
+                        }
+                        elseif ($bad.ErrorControl -eq 2) {
+                            'Windows will fail this driver and fall back to Last Known Good; boot may still fail'
+                        }
+                        else {
+                            'the driver will not load; dependent storage/network/security functionality will be unavailable'
+                        }
+                        $severity = if ($bad.ErrorControl -ge 3) { 'CRIT' } else { & $toSev $sevBinarySignatureBad }
+                        & $emit 'Security' $severity ("$($bad.Name) is a $startName-start $typeName with ErrorControl=$ecName; $($bad.FileName) $trustText - $impact") "-RepairSystemFile $($bad.FileName)"
+                    }
+                }
+                if ($unverifiedDrivers.Count -gt 0) {
+                    # Honest reporting: Microsoft-branded images this host cannot prove or
+                    # disprove. Grouped into one advisory so it never floods the report.
+                    & $emit 'Security' 'INFO' "$($unverifiedDrivers.Count) Boot/System driver(s) are Microsoft-branded but could not be cryptographically verified from this host ($($script:OfflineCatalogStoreSummary)): $($unverifiedDrivers -join ', ')" ''
                 }
                 if ($thirdPartyBootSystemDrivers.Count -gt 0) {
                     & $emit 'Security' (& $toSev $sevThirdPartyBootSystemDriver) "$($thirdPartyBootSystemDrivers.Count) Boot/System driver(s) are validly signed by non-Microsoft publishers: $($thirdPartyBootSystemDrivers -join ', ')" "-GetServicesReport -IssuesOnly"
@@ -12868,7 +14780,7 @@ complete recovery.
                         $tpName = ($entry -split '\s+', 2)[0]
                         $tpPath = Join-Path $sys32Path "$tpName.exe"
                         $tpSig = Test-MicrosoftSignature -FilePath $tpPath
-                        if (-not $tpSig.IsMicrosoft) { $unsignedBoot += $entry }
+                        if (-not $tpSig.IsAcceptableMicrosoft) { $unsignedBoot += $entry }
                     }
                     if ($danglingBoot.Count -gt 0) {
                         & $emit 'Boot' (& $toSev $sevBootExecDangling) "BootExecute has $($danglingBoot.Count) entry/entries with missing binaries (will hang boot at black screen): $($danglingBoot -join '; ')" "-FixSessionManager"
@@ -12896,7 +14808,7 @@ complete recovery.
                             }
                             else {
                                 $seSig = Test-MicrosoftSignature -FilePath $nativePath
-                                if (-not $seSig.IsMicrosoft) { $unsignedSetup += $entry }
+                                if (-not $seSig.IsAcceptableMicrosoft) { $unsignedSetup += $entry }
                             }
                         }
                         if ($danglingSetup.Count -gt 0) {
@@ -14936,9 +16848,17 @@ Default and LastKnownGood control sets are not modified.
             $size = if ($exists) { (Get-Item -LiteralPath $c.Path -Force -ErrorAction SilentlyContinue).Length } else { 0 }
             # Signature check for existing non-zero binaries (skip BCD store  -  it's not a PE)
             $sigStatus = ''
+            $sigIsHardFailure = $false
             if ($exists -and $size -gt 0 -and $c.Name -ne 'BCD store' -and -not ([bool]$c.SkipSignature)) {
                 $sig = Test-MicrosoftSignature -FilePath $c.Path
-                $sigStatus = if ($sig.IsMicrosoft) { 'Microsoft' } elseif ($sig.IsSigned) { "Signed: $($sig.Subject)" } else { $sig.Status }
+                $sigIsHardFailure = [bool]$sig.IsHardFailure
+                $sigStatus = switch ($sig.TrustState) {
+                    'ValidMicrosoft' { 'Microsoft' }
+                    'ValidOtherPublisher' { "Signed: $($sig.SignerSubject)" }
+                    'Invalid' { "INVALID ($($sig.Status))" }
+                    'CatalogUnverified' { 'Unverified (MS metadata)' }
+                    default { $sig.Status }
+                }
             }
             [PSCustomObject]@{
                 Category  = $c.Category
@@ -14946,6 +16866,7 @@ Default and LastKnownGood control sets are not modified.
                 Exists    = $exists
                 Size      = if ($exists) { "{0:N0}" -f $size } else { '' }
                 Signature = $sigStatus
+                HardFail  = $sigIsHardFailure
                 Path      = $c.Path
                 Optional  = [bool]$c.Optional
             }
@@ -14954,15 +16875,22 @@ Default and LastKnownGood control sets are not modified.
         $rows | Format-Table Category, Artifact, Exists, Size, Signature, Path -AutoSize
         $missing = @($rows | Where-Object { -not $_.Exists -and -not $_.Optional })
         $zeroLen = @($rows | Where-Object { $_.Exists -and $_.Size -eq '0' })
-        $notMsSigned = @($rows | Where-Object { $_.Signature -and $_.Signature -ne 'Microsoft' -and $_.Artifact -ne 'BCD store' })
+        $invalidTrust = @($rows | Where-Object { $_.HardFail })
+        $notMsSigned = @($rows | Where-Object { $_.Signature -and $_.Signature -ne 'Microsoft' -and -not $_.HardFail -and $_.Artifact -ne 'BCD store' })
         if ($missing.Count -gt 0) {
             Write-Warning "Missing critical artifact(s): $($missing.Artifact -join ', ')."
         }
         if ($zeroLen.Count -gt 0) {
             Write-Warning "Zero-byte (corrupt) critical artifact(s): $($zeroLen.Artifact -join ', ') - file exists but is empty."
         }
+        if ($invalidTrust.Count -gt 0) {
+            Write-Warning "FAILED image trust validation: $($invalidTrust.Artifact -join ', ') - the file content does not match its signature or is published in no guest catalog. Windows Code Integrity will refuse to load these."
+            Write-Host "  These produce STATUS_INVALID_IMAGE_HASH (0xC0000428) at load, which surfaces as 0x5A CRITICAL_SERVICE_FAILED." -ForegroundColor Red
+            Write-Host "  Fix: -RepairSystemFile $(($invalidTrust.Artifact | Select-Object -First 4) -join ', ')" -ForegroundColor Red
+            Write-Host "  If the component store holds the same damaged bytes (a hard link to the file), add -RepairSystemFileSource <file-or-folder>." -ForegroundColor Red
+        }
         if ($notMsSigned.Count -gt 0) {
-            Write-Warning "Non-Microsoft-signed binary/ies: $($notMsSigned.Artifact -join ', ') - possible tampering or third-party replacement."
+            Write-Warning "Not verified as Microsoft: $($notMsSigned.Artifact -join ', ') - third-party publisher or trust not provable from this host."
         }
 
         if ($script:VMGen -eq 2) {
@@ -15030,7 +16958,7 @@ Default and LastKnownGood control sets are not modified.
             }
         }
 
-        if ($missing.Count -eq 0 -and $zeroLen.Count -eq 0 -and $notMsSigned.Count -eq 0) {
+        if ($missing.Count -eq 0 -and $zeroLen.Count -eq 0 -and $invalidTrust.Count -eq 0 -and $notMsSigned.Count -eq 0) {
             Write-Host "All checked critical boot/system files are present, non-empty, and Microsoft-signed." -ForegroundColor Green
         }
     }
@@ -15041,6 +16969,11 @@ Default and LastKnownGood control sets are not modified.
 
         $trustedInstallerSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
         $acl.SetOwner($trustedInstallerSid)
+        # Windows ships its system files with TrustedInstaller as the primary group as
+        # well as the owner. Leaving the group unset stamps the rescue VM's own primary
+        # group onto the guest's file, which makes the repaired file the odd one out in
+        # any ACL comparison against its neighbours even though its DACL is identical.
+        $acl.SetGroup($trustedInstallerSid)
 
         $accessType = [System.Security.AccessControl.AccessControlType]::Allow
         $inheritanceFlags = [System.Security.AccessControl.InheritanceFlags]::None
@@ -15071,10 +17004,310 @@ Default and LastKnownGood control sets are not modified.
         return $acl
     }
 
+    # Builds a single-pass index of replacement sources for one or more file names.
+    #
+    # The previous implementation ran `Get-ChildItem -Recurse` over WinSxS *and*
+    # DriverStore once per requested file name. WinSxS holds tens of thousands of
+    # component directories, so each pass walked the whole tree again and the cost
+    # grew linearly with the number of files being repaired. This walks both roots
+    # exactly once for the whole batch using the BCL enumerator (no FileInfo/PSObject
+    # allocation per traversed entry) and caches the result for the session.
+    function Get-FileIdentity {
+        # Returns the volume serial and file index that together identify one MFT
+        # record, plus how many directory entries point at it.
+        #
+        # This is how a hard link is spotted. Most Windows inbox files are stored once
+        # and linked into both \Windows\WinSxS\<component>\ and their live location, so
+        # the "component store copy" is frequently the very same data. When the live
+        # file is damaged in place, restoring from that link would change nothing while
+        # reporting success.
+        param([Parameter(Mandatory = $true)][string]$Path)
+
+        if (-not ([System.Management.Automation.PSTypeName]'RepairAzVMDisk.FileIdentity').Type) {
+            try {
+                Add-Type -Namespace RepairAzVMDisk -Name FileIdentity -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential)]
+public struct BY_HANDLE_FILE_INFORMATION {
+    public uint FileAttributes;
+    // FILETIME is two DWORDs and only 4-byte aligned. Declaring these as long would
+    // make the CLR insert 4 bytes of padding after FileAttributes, shifting every
+    // field that follows and yielding a zero volume serial and a nonsense link count.
+    public uint CreationTimeLow;
+    public uint CreationTimeHigh;
+    public uint LastAccessTimeLow;
+    public uint LastAccessTimeHigh;
+    public uint LastWriteTimeLow;
+    public uint LastWriteTimeHigh;
+    public uint VolumeSerialNumber;
+    public uint FileSizeHigh;
+    public uint FileSizeLow;
+    public uint NumberOfLinks;
+    public uint FileIndexHigh;
+    public uint FileIndexLow;
+}
+[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+public static extern IntPtr CreateFileW(string path, uint access, uint share, IntPtr sec, uint disposition, uint flags, IntPtr template);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool GetFileInformationByHandle(IntPtr handle, out BY_HANDLE_FILE_INFORMATION info);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool CloseHandle(IntPtr handle);
+'@ -ErrorAction Stop
+            }
+            catch {
+                Write-Verbose "Hard-link detection is unavailable: $($_.Exception.Message)"
+                return $null
+            }
+        }
+
+        $handle = [IntPtr]::Zero
+        try {
+            # Zero desired access asks only for metadata, so this succeeds on a
+            # TrustedInstaller-owned file that we are not yet permitted to read.
+            # Sharing everything, including DELETE, avoids disturbing other openers.
+            $handle = [RepairAzVMDisk.FileIdentity]::CreateFileW(
+                $Path, 0, 7, [IntPtr]::Zero, 3, 0x02000000, [IntPtr]::Zero)
+            if ($handle -eq [IntPtr]::Zero -or $handle -eq [IntPtr](-1)) { return $null }
+
+            $info = New-Object RepairAzVMDisk.FileIdentity+BY_HANDLE_FILE_INFORMATION
+            if (-not [RepairAzVMDisk.FileIdentity]::GetFileInformationByHandle($handle, [ref]$info)) { return $null }
+
+            $index = ([uint64]$info.FileIndexHigh -shl 32) -bor [uint64]$info.FileIndexLow
+            return [PSCustomObject]@{
+                VolumeSerialNumber = $info.VolumeSerialNumber
+                FileIndex          = $index
+                LinkCount          = [int]$info.NumberOfLinks
+                Id                 = ('{0:X8}:{1:X16}' -f $info.VolumeSerialNumber, $index)
+            }
+        }
+        catch {
+            return $null
+        }
+        finally {
+            if ($handle -ne [IntPtr]::Zero -and $handle -ne [IntPtr](-1)) {
+                [void][RepairAzVMDisk.FileIdentity]::CloseHandle($handle)
+            }
+        }
+    }
+
+    function Initialize-FastFileSearchType {
+        if ($null -ne $script:FastFileSearchReady) { return $script:FastFileSearchReady }
+        if ('RepairAzVMDisk.FastFileSearch' -as [type]) {
+            $script:FastFileSearchReady = $true
+            return $true
+        }
+        try {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Threading.Tasks;
+
+namespace RepairAzVMDisk
+{
+    public static class FastFileSearch
+    {
+        // Finds every file under root whose name matches one of the wanted names.
+        //
+        // WinSxS holds tens of thousands of component directories, and walking them
+        // one at a time from PowerShell costs minutes: the per-directory overhead of
+        // the interpreter dwarfs the actual I/O. The same walk in .NET, with the
+        // top-level component folders spread across threads, is bound by the disk
+        // instead of by the loop.
+        //
+        // Each directory is enumerated inside its own try/catch so that one unreadable
+        // folder cannot abort the traversal - which is what SearchOption.AllDirectories
+        // would do, silently returning a partial result as if it were complete.
+        public static string[] Find(string root, string[] wantedNames, int[] stats)
+        {
+            HashSet<string> wanted = new HashSet<string>(wantedNames, StringComparer.OrdinalIgnoreCase);
+            ConcurrentBag<string> hits = new ConcurrentBag<string>();
+            int dirCount = 0;
+
+            List<string> topLevel = new List<string>();
+            topLevel.Add(root);
+            try
+            {
+                foreach (string d in Directory.EnumerateDirectories(root)) topLevel.Add(d);
+            }
+            catch { }
+
+            ParallelOptions options = new ParallelOptions();
+            options.MaxDegreeOfParallelism = Math.Min(16, Math.Max(2, Environment.ProcessorCount * 2));
+
+            Parallel.ForEach(topLevel, options, delegate(string start)
+            {
+                Stack<string> pending = new Stack<string>();
+                pending.Push(start);
+                int localDirs = 0;
+                bool isRoot = string.Equals(start, root, StringComparison.OrdinalIgnoreCase);
+
+                while (pending.Count > 0)
+                {
+                    string dir = pending.Pop();
+                    localDirs++;
+
+                    // The root itself is handled for its own files only; its
+                    // subdirectories are the parallel work items and must not be
+                    // walked twice.
+                    if (!(isRoot && localDirs == 1))
+                    {
+                        try
+                        {
+                            foreach (string sub in Directory.EnumerateDirectories(dir)) pending.Push(sub);
+                        }
+                        catch { }
+                    }
+
+                    try
+                    {
+                        foreach (string file in Directory.EnumerateFiles(dir))
+                        {
+                            if (wanted.Contains(Path.GetFileName(file))) hits.Add(file);
+                        }
+                    }
+                    catch { }
+                }
+                System.Threading.Interlocked.Add(ref dirCount, localDirs);
+            });
+
+            if (stats != null && stats.Length >= 1) { stats[0] = dirCount; }
+            List<string> result = new List<string>(hits);
+            result.Sort(StringComparer.OrdinalIgnoreCase);
+            return result.ToArray();
+        }
+    }
+}
+'@ -ErrorAction Stop
+            $script:FastFileSearchReady = $true
+        }
+        catch {
+            $script:FastFileSearchReady = $false
+            Write-Verbose "Native file search is unavailable; falling back to the managed walk: $($_.Exception.Message)"
+        }
+        return $script:FastFileSearchReady
+    }
+
+    function Get-SystemFileRepairSourceIndex {
+        param(
+            [Parameter(Mandatory = $true)][string[]]$FileNames,
+            [Parameter(Mandatory = $true)][string]$WinRoot,
+            [string]$SourcePath = ''
+        )
+
+        $wanted = @{}
+        foreach ($name in $FileNames) {
+            if ([string]::IsNullOrWhiteSpace($name)) { continue }
+            $wanted[$name.Trim().ToLowerInvariant()] = $true
+        }
+        if ($wanted.Count -eq 0) { return @{} }
+
+        if ($null -eq $script:RepairSourceIndexCache) { $script:RepairSourceIndexCache = @{} }
+        $cacheKey = '{0}|{1}|{2}' -f $WinRoot.ToLowerInvariant(), $SourcePath.ToLowerInvariant(), (($wanted.Keys | Sort-Object) -join ';')
+        if ($script:RepairSourceIndexCache.ContainsKey($cacheKey)) {
+            return $script:RepairSourceIndexCache[$cacheKey]
+        }
+
+        $index = @{}
+        foreach ($key in $wanted.Keys) { $index[$key] = [System.Collections.Generic.List[PSCustomObject]]::new() }
+
+        $roots = @(
+            [PSCustomObject]@{ Path = (Join-Path $WinRoot 'WinSxS'); Source = 'WinSxS' }
+            [PSCustomObject]@{ Path = (Join-Path $WinRoot 'System32\DriverStore\FileRepository'); Source = 'DriverStore' }
+        )
+        if (-not [string]::IsNullOrWhiteSpace($SourcePath) -and (Test-Path -LiteralPath $SourcePath)) {
+            # Searched first so an operator-supplied known-good copy outranks the
+            # component store, which on a damaged guest may hold the same bad bytes.
+            $roots = @([PSCustomObject]@{ Path = $SourcePath; Source = 'SuppliedSource' }) + $roots
+        }
+
+        foreach ($root in $roots) {
+            if (-not (Test-Path -LiteralPath $root.Path)) { continue }
+            # A supplied source may name the file itself rather than a folder holding it.
+            if (Test-Path -LiteralPath $root.Path -PathType Leaf) {
+                $leaf = [System.IO.Path]::GetFileName($root.Path).ToLowerInvariant()
+                if ($wanted.ContainsKey($leaf)) {
+                    $index[$leaf].Add([PSCustomObject]@{ Path = $root.Path; Source = $root.Source })
+                    Write-Host "  Using supplied source file: $($root.Path)" -ForegroundColor DarkGray
+                }
+                else {
+                    Write-Warning "  The supplied source file is named '$leaf', which is not one of the files being repaired. It was ignored."
+                }
+                continue
+            }
+            Write-Host "  Indexing $($root.Source)..." -ForegroundColor DarkGray
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $dirCount = 0
+            $hitCount = 0
+
+            if (Initialize-FastFileSearchType) {
+                $searchStats = [int[]]@(0)
+                $found = @()
+                try {
+                    $found = @([RepairAzVMDisk.FastFileSearch]::Find($root.Path, [string[]]@($wanted.Keys), $searchStats))
+                }
+                catch {
+                    Write-Verbose "Native search failed on $($root.Path): $($_.Exception.Message)"
+                    $found = $null
+                }
+                if ($null -ne $found) {
+                    $dirCount = $searchStats[0]
+                    foreach ($file in $found) {
+                        $leaf = [System.IO.Path]::GetFileName($file).ToLowerInvariant()
+                        if ($index.ContainsKey($leaf)) {
+                            $index[$leaf].Add([PSCustomObject]@{ Path = $file; Source = $root.Source })
+                            $hitCount++
+                        }
+                    }
+                    $sw.Stop()
+                    Write-Host ("    {0}: {1:N0} directories scanned, {2} candidate file(s), {3:N1}s" -f $root.Source, $dirCount, $hitCount, $sw.Elapsed.TotalSeconds) -ForegroundColor DarkGray
+                    continue
+                }
+            }
+
+            $pending = [System.Collections.Generic.Stack[string]]::new()
+            $pending.Push($root.Path)
+            while ($pending.Count -gt 0) {
+                $dir = $pending.Pop()
+                $dirCount++
+                # Enumerate per directory so a single ACL-denied or transient failure
+                # cannot abort the whole traversal (AllDirectories would throw out).
+                try {
+                    foreach ($sub in [System.IO.Directory]::EnumerateDirectories($dir)) { $pending.Push($sub) }
+                }
+                catch { }
+                try {
+                    foreach ($file in [System.IO.Directory]::EnumerateFiles($dir)) {
+                        $leaf = [System.IO.Path]::GetFileName($file).ToLowerInvariant()
+                        if ($wanted.ContainsKey($leaf)) {
+                            $index[$leaf].Add([PSCustomObject]@{ Path = $file; Source = $root.Source })
+                            $hitCount++
+                        }
+                    }
+                }
+                catch { }
+            }
+            $sw.Stop()
+            Write-Host ("    {0}: {1:N0} directories scanned, {2} candidate file(s), {3:N1}s" -f $root.Source, $dirCount, $hitCount, $sw.Elapsed.TotalSeconds) -ForegroundColor DarkGray
+        }
+
+        # \Windows\WinSxS\Backup is deliberately NOT searched. It looks like the ideal
+        # spare - genuinely separate files rather than the hard links the component
+        # directories hold - but its contents are reverse delta patches, not binaries.
+        # Their names are mangled to <component-identity>_<filename>_<hash>, and each
+        # file begins with the "DCS" Delta Compression Storage signature and is roughly
+        # 40% of the size of the binary it relates to. Handing one to a caller as a
+        # replacement would install a compressed blob in place of a driver.
+
+        $script:RepairSourceIndexCache[$cacheKey] = $index
+        return $index
+    }
+
     function RepairBrokenSystemFile {
         param(
             [Parameter(Mandatory = $true)]
-            [string[]]$FileNames
+            [string[]]$FileNames,
+            [string]$SourcePath = ''
         )
         # Replaces a missing, 0-byte, or wrong-architecture Windows system binary
         # from the offline disk's WinSxS component store or DriverStore.
@@ -15090,6 +17323,13 @@ Default and LastKnownGood control sets are not modified.
         # Reference: https://learn.microsoft.com/en-us/troubleshoot/azure/virtual-machines/windows/virtual-machines-windows-repair-replace-system-binary-file
 
         $portableExecutableExtensions = @('.sys', '.dll', '.exe', '.efi')
+        if (-not [string]::IsNullOrWhiteSpace($SourcePath)) {
+            if (-not (Test-Path -LiteralPath $SourcePath)) {
+                Write-Error "The -RepairSystemFileSource path does not exist: $SourcePath"
+                return
+            }
+            Write-Host "Repair source supplied: $SourcePath" -ForegroundColor DarkGray
+        }
         $guestArchitecture = Get-OfflineGuestProcessorArchitecture
         if ($guestArchitecture -eq 'Unknown') {
             $guestArchitecture = 'AMD64'
@@ -15144,7 +17384,18 @@ Default and LastKnownGood control sets are not modified.
                 }
             }
 
-            $isBroken = (-not $targetExists) -or $targetIsDirectory -or ($targetSize -eq 0) -or $targetArchitectureMismatch
+            $targetTrustFailed = $false
+            $targetTrust = $null
+            if ($targetExists -and -not $targetIsDirectory -and $targetSize -gt 0 -and
+                $portableExecutableExtensions -contains $ext) {
+                $targetTrust = Test-MicrosoftSignature -FilePath $targetPath
+                $targetTrustFailed = [bool]$targetTrust.IsHardFailure
+            }
+
+            $isBroken = (-not $targetExists) -or $targetIsDirectory -or ($targetSize -eq 0) -or $targetArchitectureMismatch -or $targetTrustFailed
+            if ($targetTrustFailed) {
+                Write-Host "  Image trust: $(Get-TrustStateDescription -Signature $targetTrust)" -ForegroundColor Red
+            }
             if ($targetExists -and ($targetIsDirectory -or $targetSize -gt 0)) {
                 $currentSizeText = if ($targetIsDirectory) { 'directory' } else { "$targetSize bytes" }
                 $currentArchitecture = if ($targetPeInfo -and $targetPeInfo.IsPortableExecutable) {
@@ -15185,6 +17436,9 @@ apply a protected Windows system-file ACL/owner baseline.
             elseif ($targetArchitectureMismatch) {
                 "$($targetPeInfo.Architecture) PE architecture mismatches $guestArchitecture guest"
             }
+            elseif ($targetTrustFailed) {
+                'FAILED IMAGE TRUST VALIDATION (STATUS_INVALID_IMAGE_HASH candidate)'
+            }
             elseif ($isBroken) {
                 'corrupt'
             }
@@ -15194,67 +17448,79 @@ apply a protected Windows system-file ACL/owner baseline.
             Write-Host "  Target: $targetPath [$stateDesc]" -ForegroundColor Yellow
 
             # -- 2. Search WinSxS and DriverStore for replacement candidates ------
+            # Sources are indexed once for the whole batch (see
+            # Get-SystemFileRepairSourceIndex) instead of re-walking WinSxS per file.
             $candidates = [System.Collections.Generic.List[PSCustomObject]]::new()
-
-            # Search WinSxS
-            # Skip \f\ and \r\ subdirectories - these contain forward/reverse
-            # delta patches (not usable PE binaries).
-            # Also skip tiny files (<1KB) with no version info - these are delta
-            # compression stubs that replaced the original binary in superseded
-            # component folders.
-            $winsxsDir = Join-Path $winRoot 'WinSxS'
-            if (Test-Path $winsxsDir) {
-                Write-Host "  Searching WinSxS..." -ForegroundColor DarkGray
-                Get-ChildItem -Path $winsxsDir -Filter $fileName -Recurse -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Length -gt 0 -and $_.DirectoryName -notmatch '\\(f|r)$' } |
-                ForEach-Object {
-                    $ver = $_.VersionInfo
-                    $peInfo = Get-PortableExecutableInfo -FilePath $_.FullName
-                    # Filter out delta stubs: no version info + under 1KB = not a real PE binary
-                    if (-not ($_.Length -lt 1024 -and -not $ver.FileVersion)) {
-                        $candidates.Add([PSCustomObject]@{
-                            Path       = $_.FullName
-                            Size       = $_.Length
-                            Version    = $ver.FileVersion
-                            ProductVer = $ver.ProductVersion
-                            Company    = $ver.CompanyName
-                            LastWrite  = $_.LastWriteTime
-                            Source     = 'WinSxS'
-                            IsPortableExecutable = $peInfo.IsPortableExecutable
-                            Architecture = $peInfo.Architecture
-                            Machine      = $peInfo.Machine
-                        })
-                    }
-                }
+            $sourceIndex = Get-SystemFileRepairSourceIndex -FileNames $FileNames -WinRoot $winRoot -SourcePath $SourcePath
+            $indexedSources = @()
+            if ($sourceIndex.ContainsKey($fileName.ToLowerInvariant())) {
+                $indexedSources = @($sourceIndex[$fileName.ToLowerInvariant()])
             }
 
-            # Search DriverStore
-            $driverStoreDir = Join-Path $winRoot 'System32\DriverStore\FileRepository'
-            if (Test-Path $driverStoreDir) {
-                Write-Host "  Searching DriverStore..." -ForegroundColor DarkGray
-                Get-ChildItem -Path $driverStoreDir -Filter $fileName -Recurse -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Length -gt 0 } |
-                ForEach-Object {
-                    $ver = $_.VersionInfo
-                    $peInfo = Get-PortableExecutableInfo -FilePath $_.FullName
-                    $candidates.Add([PSCustomObject]@{
-                            Path       = $_.FullName
-                            Size       = $_.Length
-                            Version    = $ver.FileVersion
-                            ProductVer = $ver.ProductVersion
-                            Company    = $ver.CompanyName
-                            LastWrite  = $_.LastWriteTime
-                            Source     = 'DriverStore'
-                            IsPortableExecutable = $peInfo.IsPortableExecutable
-                            Architecture = $peInfo.Architecture
-                            Machine      = $peInfo.Machine
-                        })
+            foreach ($src in $indexedSources) {
+                $srcItem = Get-Item -LiteralPath $src.Path -Force -ErrorAction SilentlyContinue
+                if (-not $srcItem -or $srcItem.Length -eq 0) { continue }
+                # Skip \f\ and \r\ subdirectories - these contain forward/reverse
+                # delta patches (not usable PE binaries).
+                if ($src.Source -eq 'WinSxS' -and $srcItem.DirectoryName -match '\\(f|r)$') { continue }
+                $ver = $srcItem.VersionInfo
+                # Filter out delta stubs: no version info + under 1KB = not a real PE binary
+                if ($src.Source -eq 'WinSxS' -and $srcItem.Length -lt 1024 -and -not $ver.FileVersion) { continue }
+                $peInfo = Get-PortableExecutableInfo -FilePath $srcItem.FullName
+                $candidates.Add([PSCustomObject]@{
+                        Path       = $srcItem.FullName
+                        Size       = $srcItem.Length
+                        Version    = $ver.FileVersion
+                        ProductVer = $ver.ProductVersion
+                        Company    = $ver.CompanyName
+                        LastWrite  = $srcItem.LastWriteTime
+                        Source     = $src.Source
+                        IsPortableExecutable = $peInfo.IsPortableExecutable
+                        Architecture = $peInfo.Architecture
+                        Machine      = $peInfo.Machine
+                    })
+            }
+
+            # -- 2a. Discard candidates that are the target itself ----------------
+            # Windows stores component files once and hard-links them into place, so
+            # \WinSxS\<component>\<file> and the live path are usually two names for one
+            # MFT record. When the live file was damaged in place, that "store copy" holds
+            # the same damaged bytes; copying it back would repair nothing while reporting
+            # success, and Copy-Item would in fact fail because it opens the one file for
+            # reading and for writing at the same time.
+            $hardLinkedCandidates = @()
+            $targetIdentity = if ($targetExists -and -not $targetIsDirectory) { Get-FileIdentity -Path $targetPath } else { $null }
+            if ($targetIdentity -and $candidates.Count -gt 0) {
+                $distinctCandidates = [System.Collections.Generic.List[PSCustomObject]]::new()
+                foreach ($cand in $candidates) {
+                    $candIdentity = Get-FileIdentity -Path $cand.Path
+                    if ($candIdentity -and $candIdentity.Id -eq $targetIdentity.Id) {
+                        $hardLinkedCandidates += $cand
+                    }
+                    else {
+                        $distinctCandidates.Add($cand)
+                    }
+                }
+                if ($hardLinkedCandidates.Count -gt 0) {
+                    Write-Warning "  Excluded $($hardLinkedCandidates.Count) candidate(s) that are hard links to the target itself, not separate copies:"
+                    foreach ($hl in $hardLinkedCandidates) { Write-Warning "    $($hl.Path)" }
+                    Write-Warning "  Target file ID $($targetIdentity.Id) has $($targetIdentity.LinkCount) hard link(s) on this volume."
+                    $candidates = $distinctCandidates
                 }
             }
 
             if ($candidates.Count -eq 0) {
-                Write-Warning "  No replacement candidates found for '$fileName' in WinSxS or DriverStore."
-                Write-Warning "  The file may need to be copied from another VM with the same OS version."
+                if ($hardLinkedCandidates.Count -gt 0) {
+                    Write-Error "  No independent replacement source exists on this disk for '$fileName'."
+                    Write-Warning "  Every copy found is a hard link to the damaged file, which is what Windows does for inbox files: the component store holds one instance and links it into place. A file damaged where it lies is therefore damaged in the store too."
+                    Write-Warning "  \Windows\WinSxS\Backup is not an alternative: it holds reverse delta patches (DCS), not usable binaries."
+                    Write-Warning "  Supply a known-good copy instead, taken from a machine running the same OS build and patch level, or extracted from matching installation media:"
+                    Write-Warning "    -RepairSystemFile $fileName -RepairSystemFileSource <file-or-folder>"
+                }
+                else {
+                    Write-Warning "  No replacement candidates found for '$fileName' in WinSxS or DriverStore."
+                    Write-Warning "  The file may need to be copied from another VM with the same OS version, then supplied with -RepairSystemFileSource <file-or-folder>."
+                }
                 continue
             }
 
@@ -15315,9 +17581,43 @@ apply a protected Windows system-file ACL/owner baseline.
             # Files without version info are likely delta stubs or placeholders.
             $driverBaseName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
             $infMatchPattern = '\\' + [regex]::Escape($driverBaseName) + '\.inf_'
+
+            # Reject sources that themselves fail image trust, and prefer sources whose
+            # content is cryptographically provable. Restoring a corrupt WinSxS copy would
+            # simply reproduce the STATUS_INVALID_IMAGE_HASH failure being repaired.
+            $trustRanked = @()
+            if ($portableExecutableExtensions -contains $ext) {
+                foreach ($cand in $eligibleCandidates) {
+                    $candSig = Test-MicrosoftSignature -FilePath $cand.Path
+                    $candRank = switch ($candSig.TrustState) {
+                        'ValidMicrosoft' { 0 }
+                        'CatalogUnverified' { 1 }
+                        'NotVerifiable' { 2 }
+                        'ValidOtherPublisher' { 3 }
+                        default { 9 }
+                    }
+                    Add-Member -InputObject $cand -NotePropertyName 'TrustState' -NotePropertyValue $candSig.TrustState -Force
+                    Add-Member -InputObject $cand -NotePropertyName 'TrustBad' -NotePropertyValue ([bool]$candSig.IsHardFailure) -Force
+                    Add-Member -InputObject $cand -NotePropertyName 'TrustRank' -NotePropertyValue ([int]$candRank) -Force
+                }
+                $trustRejected = @($eligibleCandidates | Where-Object { $_.TrustBad })
+                if ($trustRejected.Count -gt 0) {
+                    Write-Warning "  Discarded $($trustRejected.Count) replacement candidate(s) that failed image trust validation:"
+                    foreach ($rej in $trustRejected) { Write-Warning "    $($rej.Path) [$($rej.TrustState)]" }
+                }
+                $trustRanked = @($eligibleCandidates | Where-Object { -not $_.TrustBad })
+                if ($trustRanked.Count -eq 0) {
+                    Write-Error "  Every replacement candidate for '$fileName' failed image trust validation. Refusing to install a known-bad binary."
+                    Write-Warning "  The component store itself may be damaged. Copy the file from another VM with the same OS build, or run DISM /RestoreHealth online."
+                    continue
+                }
+                $eligibleCandidates = $trustRanked
+            }
+
             $best = $eligibleCandidates |
                 Sort-Object @{Expression = {
                                 if ($ext -eq '.sys' -and $_.Source -eq 'DriverStore' -and $_.Path -match $infMatchPattern) { 0 } else { 1 } } },
+                            @{Expression = { if ($null -ne $_.TrustRank) { $_.TrustRank } else { 0 } } },
                             @{Expression = { if ($_.Version -and $_.Company) { 0 } else { 1 } } },
                             @{Expression = 'Size'; Descending = $true },
                             @{Expression = 'LastWrite'; Descending = $true } |
@@ -15337,140 +17637,95 @@ apply a protected Windows system-file ACL/owner baseline.
                 Write-Warning "  Proceeding anyway - verify the replacement is correct."
             }
 
-            # -- 4. Backup the broken file (if it exists) ------------------------
-            $bakPath = $null
-            $backupCreated = $false
-            if ($targetExists) {
-                $backupSuffix = if ($targetSize -eq 0 -and -not $targetIsDirectory) { '.broken.bak' } else { '.replaced.bak' }
-                $bakPath = New-UniqueBackupPath -BasePath $targetPath -BakSuffix $backupSuffix
-                Write-Host "  Backing up existing path: $targetPath -> $bakPath" -ForegroundColor DarkGray
-                try {
-                    Invoke-Logged -Description 'Back up broken system file' -Details @{
-                        Path = $targetPath
-                        Destination = $bakPath
-                    } -ScriptBlock {
-                        Rename-Item -LiteralPath $targetPath -NewName (Split-Path $bakPath -Leaf) -Force -ErrorAction Stop
-                    } | Out-Null
-                    if (-not (Test-Path -LiteralPath $bakPath)) {
-                        throw "Backup path was not created."
-                    }
-                    $backupCreated = $true
-                }
-                catch {
-                    Write-Warning "  Could not back up the existing path: $_"
-                    Write-Error "  Replacement was cancelled because automatic rollback would not be available."
-                    continue
-                }
-            }
+            # -- 4/5. Install the replacement -------------------------------------
+            # Everything that makes writing to an offline guest disk hard - the
+            # TrustedInstaller ownership, the backup, the hard-link guard, the hash
+            # check, replaying the file's original descriptor and rolling back a bad
+            # copy - lives in Install-ProtectedSystemFile, so every caller in this
+            # script behaves identically. Only the checks specific to a Windows system
+            # binary are supplied here, as a validation block that rejects the copy by
+            # throwing.
+            $backupSuffix = if ($targetExists -and $targetSize -eq 0 -and -not $targetIsDirectory) { '.broken.bak' } else { '.replaced.bak' }
 
-            # Ensure target directory exists
-            if (-not (Test-Path $targetDir)) {
-                New-Item-Logged -Path $targetDir -ItemType Directory -Force | Out-Null
-            }
+            $validateReplacement = {
+                param($installedPath)
 
-            # -- 5. Copy the replacement -----------------------------------------
-            try {
-                $sourceHash = (Get-FileHash -LiteralPath $best.Path -Algorithm SHA256 -ErrorAction Stop).Hash
-                Invoke-Logged -Description 'Replace broken system file' -Details @{
-                    Source = $best.Path
-                    Destination = $targetPath
-                } -ScriptBlock {
-                    Copy-Item -LiteralPath $best.Path -Destination $targetPath -Force -ErrorAction Stop
-                } | Out-Null
-                if (-not (Test-Path -LiteralPath $targetPath -PathType Leaf)) {
-                    throw "Replacement copy did not create a file at $targetPath."
-                }
+                if ($portableExecutableExtensions -notcontains $ext) { return }
 
-                $destinationHash = (Get-FileHash -LiteralPath $targetPath -Algorithm SHA256 -ErrorAction Stop).Hash
-                if ($sourceHash -ne $destinationHash) {
-                    throw "SHA-256 verification failed after copying the replacement."
-                }
-
-                $replacementPeInfo = $null
-                if ($portableExecutableExtensions -contains $ext) {
-                    $replacementPeInfo = Get-PortableExecutableInfo -FilePath $targetPath
-                    if ($replacementPeInfo.IsPortableExecutable -and $replacementPeInfo.Architecture -ne 'Unknown') {
-                        if ($guestArchitecture -ne 'Unknown' -and
-                            -not (Test-PortableExecutableArchitectureCompatible `
+                $replacementPeInfo = Get-PortableExecutableInfo -FilePath $installedPath
+                if ($replacementPeInfo.IsPortableExecutable -and $replacementPeInfo.Architecture -ne 'Unknown') {
+                    if ($guestArchitecture -ne 'Unknown' -and
+                        -not (Test-PortableExecutableArchitectureCompatible `
                                 -ExpectedArchitecture $guestArchitecture `
                                 -ActualArchitecture $replacementPeInfo.Architecture)) {
-                            throw "Replacement PE architecture $($replacementPeInfo.Architecture) ($($replacementPeInfo.Machine)) does not match guest architecture $guestArchitecture."
-                        }
-                        Write-Host "  [OK] Replacement PE architecture: $($replacementPeInfo.Architecture) ($($replacementPeInfo.Machine))." -ForegroundColor Green
+                        throw "Replacement PE architecture $($replacementPeInfo.Architecture) ($($replacementPeInfo.Machine)) does not match guest architecture $guestArchitecture."
                     }
-                    else {
-                        Write-Warning "  The copied file's PE architecture could not be verified: $($replacementPeInfo.Error)"
-                    }
+                    Write-Host "  [OK] Replacement PE architecture: $($replacementPeInfo.Architecture) ($($replacementPeInfo.Machine))." -ForegroundColor Green
+                }
+                else {
+                    Write-Warning "  The copied file's PE architecture could not be verified: $($replacementPeInfo.Error)"
                 }
 
-                try {
-                    $protectedAcl = New-ProtectedSystemFileAcl
-                    Invoke-Logged -Description 'Apply protected system-file ACL' -Details @{
-                        Path = $targetPath
-                        Owner = 'NT SERVICE\TrustedInstaller'
-                    } -ScriptBlock {
-                        Set-Acl -LiteralPath $targetPath -AclObject $protectedAcl -ErrorAction Stop
-                    } | Out-Null
-                    Write-Host "  [OK] Applied protected Windows system-file ACL/owner baseline." -ForegroundColor Green
-                    Write-ActionLog -Event 'SystemFileAclRestored' -Details @{
-                        FileName   = $fileName
-                        TargetPath = $targetPath
-                        SourcePath = $best.Path
-                        AclSource  = 'protected system-file baseline'
-                        Owner      = 'NT SERVICE\TrustedInstaller'
-                    }
+                # Re-verify trust at the destination. This is the check that proves the
+                # repair actually cleared STATUS_INVALID_IMAGE_HASH rather than moving it.
+                $postSig = Test-MicrosoftSignature -FilePath $installedPath
+                if ($postSig.IsHardFailure) {
+                    throw "Replacement still fails image trust validation at the destination - $(Get-TrustStateDescription -Signature $postSig)."
                 }
-                catch {
-                    Write-Warning "  Replaced file content, but could not apply protected system-file ACL/owner: $_"
-                    Write-Warning "  After recovery, verify permissions with: icacls `"$targetPath`""
-                    Write-ActionLog -Event 'SystemFileAclRestoreFailed' -Details @{
-                        FileName   = $fileName
-                        TargetPath = $targetPath
-                        SourcePath = $best.Path
-                        Error      = $_.ToString()
-                    }
-                }
-                $newSize = (Get-Item -LiteralPath $targetPath).Length
-                Write-Host "  [OK] Replaced: $targetPath ($("{0:N0}" -f $newSize) bytes)" -ForegroundColor Green
-
-                Write-ActionLog -Event 'SystemFileReplaced' -Details @{
-                    FileName      = $fileName
-                    TargetPath    = $targetPath
-                    SourcePath    = $best.Path
-                    Source        = $best.Source
-                    Version       = $best.Version
-                    Size          = $best.Size
-                    Company       = $best.Company
-                    GuestArchitecture = $guestArchitecture
-                    CandidateArchitecture = $best.Architecture
-                    CandidateMachine = $best.Machine
-                    PreviousState = $stateDesc
+                switch ($postSig.TrustState) {
+                    'ValidMicrosoft' { Write-Host "  [OK] Image trust verified: $(Get-TrustStateDescription -Signature $postSig)." -ForegroundColor Green }
+                    'CatalogUnverified' { Write-Host "  [i] Image trust could not be proven offline (no usable guest catalog store); PE and hash checks passed." -ForegroundColor DarkGray }
+                    default { Write-Host "  [i] Image trust after replacement: $(Get-TrustStateDescription -Signature $postSig)." -ForegroundColor DarkGray }
                 }
             }
-            catch {
-                $replacementError = $_
-                Write-Error "  Failed to replace or verify the system file: $replacementError"
 
-                if ($backupCreated) {
-                    try {
-                        if (Test-Path -LiteralPath $targetPath) {
-                            Remove-Item -LiteralPath $targetPath -Recurse -Force -ErrorAction Stop
-                        }
-                        Invoke-Logged -Description 'Roll back failed system file replacement' -Details @{
-                            Backup = $bakPath
-                            Destination = $targetPath
-                        } -ScriptBlock {
-                            Move-Item -LiteralPath $bakPath -Destination $targetPath -Force -ErrorAction Stop
-                        } | Out-Null
-                        Write-Warning "  Restored the original path from $bakPath."
-                    }
-                    catch {
-                        Write-Warning "  Automatic rollback failed: $($_.Exception.Message)"
-                    }
+            $install = Install-ProtectedSystemFile `
+                -Source $best.Path `
+                -Destination $targetPath `
+                -BackupSuffix $backupSuffix `
+                -PostCopyValidation $validateReplacement `
+                -Description "system file '$fileName'"
+
+            if (-not $install.Installed) {
+                Write-Error "  '$fileName' was not replaced: $($install.Reason)"
+                Write-ActionLog -Event 'SystemFileReplacementFailed' -Details @{
+                    FileName   = $fileName
+                    TargetPath = $targetPath
+                    SourcePath = $best.Path
+                    RolledBack = $install.RolledBack
+                    Reason     = $install.Reason
                 }
-                elseif (-not $targetExists -and (Test-Path -LiteralPath $targetPath)) {
-                    Remove-Item-Logged -Path $targetPath -Force
-                }
+                continue
+            }
+
+            Write-ActionLog -Event 'SystemFileAclRestored' -Details @{
+                FileName   = $fileName
+                TargetPath = $targetPath
+                SourcePath = $best.Path
+                AclSource  = $install.AclSource
+            }
+
+            $newSize = (Get-Item -LiteralPath $targetPath).Length
+            Write-Host "  [OK] Replaced: $targetPath ($("{0:N0}" -f $newSize) bytes)" -ForegroundColor Green
+            if ($install.BackupPath) {
+                Write-Host "  Backup: $($install.BackupPath)" -ForegroundColor DarkGray
+            }
+
+            Write-ActionLog -Event 'SystemFileReplaced' -Details @{
+                FileName              = $fileName
+                TargetPath            = $targetPath
+                SourcePath            = $best.Path
+                Source                = $best.Source
+                Version               = $best.Version
+                Size                  = $best.Size
+                Company               = $best.Company
+                Sha256                = $install.Hash
+                BackupPath            = $install.BackupPath
+                AclSource             = $install.AclSource
+                GuestArchitecture     = $guestArchitecture
+                CandidateArchitecture = $best.Architecture
+                CandidateMachine      = $best.Machine
+                PreviousState         = $stateDesc
             }
         }
     }
@@ -15793,6 +18048,7 @@ Use this when stale proxy/PAC settings prevent WinRM/RDP reachability after migr
                 SizeStr   = ''
                 SigStatus = ''
                 IsMicrosoft = $false
+                TrustState = ''
                 Health    = 'FAIL'
                 Detail    = ''
             }
@@ -15815,14 +18071,25 @@ Use this when stale proxy/PAC settings prevent WinRM/RDP reachability after migr
                 $sig = Test-MicrosoftSignature -FilePath $Path
                 $obj.SigStatus = $sig.Status
                 $obj.IsMicrosoft = $sig.IsMicrosoft
-                if (-not $sig.IsMicrosoft -and -not $sig.IsSigned) {
-                    $obj.Health = 'WARN'
-                    $obj.Detail = "Not signed ($($sig.Status))  -  $Path ($($obj.SizeStr) bytes)"
+                $obj.TrustState = $sig.TrustState
+                if ($sig.IsHardFailure) {
+                    $obj.Health = 'FAIL'
+                    $obj.Detail = "IMAGE TRUST FAILURE  -  $(Get-TrustStateDescription -Signature $sig)  -  $Path ($($obj.SizeStr) bytes)"
                     return $obj
                 }
-                elseif (-not $sig.IsMicrosoft -and $sig.IsSigned) {
+                elseif ($sig.TrustState -eq 'ValidOtherPublisher') {
                     $obj.Health = 'WARN'
-                    $obj.Detail = "Signed by '$($sig.Subject)' (not Microsoft)  -  $Path ($($obj.SizeStr) bytes)"
+                    $obj.Detail = "Signed by '$($sig.SignerSubject)' (not Microsoft)  -  $Path ($($obj.SizeStr) bytes)"
+                    return $obj
+                }
+                elseif (-not $sig.IsAcceptableMicrosoft) {
+                    $obj.Health = 'WARN'
+                    $obj.Detail = "$(Get-TrustStateDescription -Signature $sig)  -  $Path ($($obj.SizeStr) bytes)"
+                    return $obj
+                }
+                elseif ($sig.TrustState -eq 'CatalogUnverified') {
+                    $obj.Health = 'OK'
+                    $obj.Detail = "$Path ($($obj.SizeStr) bytes, trust unverified offline)"
                     return $obj
                 }
             }
@@ -16226,14 +18493,25 @@ Use this when stale proxy/PAC settings prevent WinRM/RDP reachability after migr
                     if ($isAzureCritical) { $detail += ' (Azure/Hyper-V critical  -  will BSOD)' }
                 }
                 else {
-                    # Spot-check signature for non-Microsoft drivers
-                    $vi = (Get-Item -LiteralPath $imgResolved -Force -ErrorAction SilentlyContinue).VersionInfo
-                    $vendor = if ($vi -and $vi.CompanyName) { $vi.CompanyName.Trim() } else { '' }
-                    if ($vendor -and $vendor -notmatch 'Microsoft') {
-                        $detail = "3rd-party ($vendor)"
+                    # Cryptographic trust check (catalog-aware, offline-safe)
+                    $drvSig = Test-MicrosoftSignature -FilePath $imgResolved
+                    if ($drvSig.IsHardFailure) {
+                        $health = 'FAIL'
+                        $detail = "IMAGE TRUST FAILURE  -  $(Get-TrustStateDescription -Signature $drvSig)  -  ErrorControl=$($drv.ErrorCtlName)"
+                        if ($drv.ErrorControl -ge 3 -or $isAzureCritical) { $detail += ' (0x5A CRITICAL_SERVICE_FAILED  -  will BSOD)' }
+                    }
+                    elseif ($drvSig.TrustState -eq 'ValidOtherPublisher') {
+                        $detail = "3rd-party (signed: $($drvSig.SignerSubject))"
+                    }
+                    elseif (-not $drvSig.IsAcceptableMicrosoft) {
+                        $health = 'WARN'
+                        $detail = "$(Get-TrustStateDescription -Signature $drvSig)"
+                    }
+                    elseif ($drvSig.TrustState -eq 'CatalogUnverified') {
+                        $detail = "$('{0:N0}' -f $fileSize) bytes (trust unverified)"
                     }
                     else {
-                        $detail = if ($imgResolved) { "$('{0:N0}' -f $fileSize) bytes" } else { '' }
+                        $detail = "$('{0:N0}' -f $fileSize) bytes"
                     }
                 }
 
@@ -16408,10 +18686,21 @@ Use this when stale proxy/PAC settings prevent WinRM/RDP reachability after migr
                     if ($isAzureCritical) { $detail += ' (Azure/Hyper-V critical  -  will BSOD)' }
                 }
                 else {
-                    $vi = (Get-Item -LiteralPath $imgResolved -Force -ErrorAction SilentlyContinue).VersionInfo
-                    $vendor = if ($vi -and $vi.CompanyName) { $vi.CompanyName.Trim() } else { '' }
-                    if ($vendor -and $vendor -notmatch 'Microsoft') {
-                        $detail = "3rd-party ($vendor)"
+                    $drvSig = Test-MicrosoftSignature -FilePath $imgResolved
+                    if ($drvSig.IsHardFailure) {
+                        $health = 'FAIL'
+                        $detail = "IMAGE TRUST FAILURE  -  $(Get-TrustStateDescription -Signature $drvSig)  -  ErrorControl=$($drv.ErrorCtlName)"
+                        if ($drv.ErrorControl -ge 3 -or $isAzureCritical) { $detail += ' (0x5A CRITICAL_SERVICE_FAILED  -  will BSOD)' }
+                    }
+                    elseif ($drvSig.TrustState -eq 'ValidOtherPublisher') {
+                        $detail = "3rd-party (signed: $($drvSig.SignerSubject))"
+                    }
+                    elseif (-not $drvSig.IsAcceptableMicrosoft) {
+                        $health = 'WARN'
+                        $detail = "$(Get-TrustStateDescription -Signature $drvSig)"
+                    }
+                    elseif ($drvSig.TrustState -eq 'CatalogUnverified') {
+                        $detail = "$('{0:N0}' -f $fileSize) bytes (trust unverified)"
                     }
                     else {
                         $detail = "$('{0:N0}' -f $fileSize) bytes"
@@ -17578,8 +19867,9 @@ public static class RepairAzVmDiskRegistryLastWrite {
             $evidence = "LastWriteTime=$($fileItem.LastWriteTime); Size=$($fileItem.Length)"
             if ($fileSpec.Signed) {
                 $signature = Test-MicrosoftSignature -FilePath $fileSpec.Path
-                $evidence += "; Signature=$($signature.Status); Subject=$($signature.Subject)"
-                if (-not $signature.IsMicrosoft) { $severity = 'WARN'; $priority = 18 }
+                $evidence += "; Trust=$($signature.TrustState); Signature=$($signature.Status); Subject=$($signature.SignerSubject)"
+                if ($signature.IsHardFailure) { $severity = 'CRITICAL'; $priority = 10 }
+                elseif (-not $signature.IsAcceptableMicrosoft) { $severity = 'WARN'; $priority = 18 }
             }
             Add-RecentChangeFinding -Findings $Findings -Severity $severity -Priority $priority -Category $fileSpec.Category -Timestamp $fileItem.LastWriteTime -Source 'Critical file timestamp' -Item $fileSpec.Name -ChangeType 'RecentCriticalFileTimestamp' -Evidence $evidence -Confidence 'Medium' -LikelyImpact 'A recently modified critical file should be correlated with servicing or driver installation evidence.' -SuggestedNextStep 'Use file health and servicing analysis before replacing files.' -SuggestedRepairSwitch '-AnalyzeCriticalBootFiles' -Path $fileSpec.Path
         }
@@ -17588,9 +19878,9 @@ public static class RepairAzVmDiskRegistryLastWrite {
         if (Test-Path -LiteralPath $driversRoot) {
             foreach ($driverFile in (Get-ChildItem -LiteralPath $driversRoot -Filter '*.sys' -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $Cutoff } | Sort-Object LastWriteTime -Descending | Select-Object -First 40)) {
                 $signature = Test-MicrosoftSignature -FilePath $driverFile.FullName
-                $severity = if ($signature.IsMicrosoft) { 'INFO' } else { 'WARN' }
-                $priority = if ($severity -eq 'WARN') { 34 } else { 84 }
-                Add-RecentChangeFinding -Findings $Findings -Severity $severity -Priority $priority -Category 'DriverFiles' -Timestamp $driverFile.LastWriteTime -Source 'System32\drivers' -Item $driverFile.Name -ChangeType 'RecentDriverFile' -Evidence "Size=$($driverFile.Length); Company=$($driverFile.VersionInfo.CompanyName); Signature=$($signature.Status)" -Confidence 'Medium' -LikelyImpact 'A recently modified driver file may correspond to an update or third-party driver install.' -SuggestedNextStep 'Correlate with Services and setupapi evidence before disabling anything.' -SuggestedRepairSwitch '-GetServicesReport -IssuesOnly' -Path $driverFile.FullName
+                $severity = if ($signature.IsHardFailure) { 'CRITICAL' } elseif ($signature.IsAcceptableMicrosoft) { 'INFO' } else { 'WARN' }
+                $priority = if ($severity -eq 'CRITICAL') { 10 } elseif ($severity -eq 'WARN') { 34 } else { 84 }
+                Add-RecentChangeFinding -Findings $Findings -Severity $severity -Priority $priority -Category 'DriverFiles' -Timestamp $driverFile.LastWriteTime -Source 'System32\drivers' -Item $driverFile.Name -ChangeType 'RecentDriverFile' -Evidence "Size=$($driverFile.Length); Company=$($driverFile.VersionInfo.CompanyName); Trust=$($signature.TrustState); Signature=$($signature.Status)" -Confidence 'Medium' -LikelyImpact 'A recently modified driver file may correspond to an update or third-party driver install.' -SuggestedNextStep 'Correlate with Services and setupapi evidence before disabling anything.' -SuggestedRepairSwitch '-GetServicesReport -IssuesOnly' -Path $driverFile.FullName
             }
         }
 
@@ -18380,6 +20670,7 @@ No destructive file or registry cleanup is performed.
             [switch]$RecreateBootPartition,
             [switch]$RepairComponentStore,
             [string]$RepairSource = '',
+            [string]$RepairSystemFileSource = '',
             [switch]$AnalyzeComponentStore,
             [switch]$TryLGKC,
             [switch]$TryOtherBootConfig,        
@@ -18413,6 +20704,9 @@ No destructive file or registry cleanup is performed.
             [switch]$DisableThirdPartyDrivers,
             [switch]$EnableThirdPartyDrivers,
             [switch]$GetServicesReport,
+            [switch]$GetCatalogStoreReport,
+            [string]$RepairCatalogStore,
+            [switch]$IncludeHealthy,
             [switch]$IncludeServices,
             [switch]$IssuesOnly,
             [string[]]$DisableDriverOrService = @(),
@@ -18469,6 +20763,7 @@ No destructive file or registry cleanup is performed.
             [switch]$DisableFirewall,
             [switch]$FixFirewallDebugLoopbackApps,
             [switch]$LeaveDiskOnline,
+            [switch]$SkipCatalogVerification,
             [ValidateSet('SYSTEM', 'SOFTWARE', 'COMPONENTS', 'SAM', 'SECURITY')][string[]]$LoadHive = @(),
             [ValidateSet('SYSTEM', 'SOFTWARE', 'COMPONENTS', 'SAM', 'SECURITY')][string[]]$UnloadHive = @(),
             [string]$DriveLetter = ''
@@ -18480,6 +20775,7 @@ No destructive file or registry cleanup is performed.
         $script:LocalOsDiskNumber = (Get-Partition -DriveLetter 'C' -ErrorAction SilentlyContinue).DiskNumber
         $script:RepairForceConfirm = [bool]$Force
         $script:BootsectPath = $BootsectPath
+        $script:SkipCatalogVerification = [bool]$SkipCatalogVerification
 
         foreach ($pair in $mutuallyExclusiveParameterPairs) {
             if ($PSBoundParameters.ContainsKey($pair.Left) -and
@@ -18545,6 +20841,7 @@ PARAMETERS:
   -FixBoot               Rebuild BCD from scratch
         -FixSecureBootCodeIntegrity  Refresh Gen2 EFI boot manager + SKUSiPolicy.p7b and repair CodeIntegrity Driver.stl/DriverSiPolicy.p7b for winload.efi / 0xc0430001
             -CodeIntegrityPolicySourcePath <path> Optional known-good CodeIntegrity folder/file source; otherwise uses offline WinSxS, then same-build rescue host fallback
+            -RepairSystemFileSource <path> Optional known-good file or folder to repair from, for when every copy on the disk is a hard link to the damaged file
   -FixBootSector         Inspect and repair the MBR bootstrap + NTFS volume boot record (Gen1/BIOS only).
                          Fixes what -FixBoot cannot: "Operating system not found", "Missing operating
                          system", "A disk read error occurred" and a stale BPB HiddenSectors after a
@@ -18590,6 +20887,21 @@ PARAMETERS:
     -IncludeServices             (sub-option) also include Win32 services, not just kernel drivers
     -IssuesOnly                  (sub-option) show only rows that need attention: missing binary,
                                    non-Microsoft vendor, or ErrorControl Severe/Critical (>=2)
+  -GetCatalogStoreReport       Report the health of the guest's Authenticode catalog store
+                                 (\Windows\System32\CatRoot) and name every Boot/System driver whose
+                                 load depends on it. Use when boot fails with STATUS_INVALID_IMAGE_HASH
+                                 (0xC0000428) or bugcheck 0x5A on a Microsoft driver whose binary is
+                                 known good - multiple unrelated inbox drivers failing means the
+                                 catalog store is at fault, not the drivers.
+    -IncludeHealthy              (sub-option) list every catalog-dependent driver, not just failures
+  -RepairCatalogStore <path>   Merge a same-build donor's catalogs into the guest's damaged store.
+                                 <path> may be the donor's CatRoot, its {GUID} subfolder, or the
+                                 donor's mounted Windows volume. The donor is rejected unless its
+                                 catalogs actually publish this guest's own inbox binaries, so a
+                                 wrong-build donor cannot be merged by accident (override with -Force).
+                                 Purely additive: existing catalogs are never overwritten or removed,
+                                 because each catalog is independently Microsoft-signed and adding one
+                                 can only widen the hashes boot code integrity can resolve.
     -FixDeviceFilters      Scan and remove unsafe UpperFilters/LowerFilters from device classes and boot-critical device instances
     -KeepDefaultFilters    (sub-option) strict mode: only inbox safe-list entries kept; removes Microsoft-signed
                              non-defaults like InDskFlt that are not standard on Azure VMs
@@ -18713,8 +21025,8 @@ AVAILABLE DISKS:
 
         # Initialize logging and target (resolve VM/disk, bring disk online, detect partitions)
         # Determine if any write/repair action was requested (exclude pure read-only switches)
-        $readOnlySwitches = @('SysCheck', 'CheckDiskHealth', 'ScanNetBindings', 'CheckRDPPolicies', 'CollectEventLogs', 'CollectMinidumps', 'ShowLastSession', 'GetServicesReport', 'GetAppLockerReport', 'ListInstalledUpdates', 'ListStartupPrograms', 'AnalyzeCriticalBootFiles', 'AnalyzeSyntheticDrivers', 'AnalyzeProxyState', 'GetBootPathReport', 'AnalyzeBcdConsistency', 'AnalyzeComponentStore', 'AnalyzeServicingState', 'AnalyzeRecentChanges', 'AnalyzeDomainTrustState')
-        $hasRepairAction = $PSBoundParameters.Keys | Where-Object { $readOnlySwitches -notcontains $_ -and $_ -notin @('VMName', 'DiskNumber', 'Force', 'LeaveDiskOnline', 'DriveLetter', 'RepairSource', 'CodeIntegrityPolicySourcePath', 'IncludeServices', 'IssuesOnly', 'KeepDefaultFilters', 'DriverStartType', 'RecentChangeDays', 'LoadHive', 'UnloadHive', 'TransactionLogScope') }
+        $readOnlySwitches = @('SysCheck', 'CheckDiskHealth', 'ScanNetBindings', 'CheckRDPPolicies', 'CollectEventLogs', 'CollectMinidumps', 'ShowLastSession', 'GetServicesReport', 'GetCatalogStoreReport', 'GetAppLockerReport', 'ListInstalledUpdates', 'ListStartupPrograms', 'AnalyzeCriticalBootFiles', 'AnalyzeSyntheticDrivers', 'AnalyzeProxyState', 'GetBootPathReport', 'AnalyzeBcdConsistency', 'AnalyzeComponentStore', 'AnalyzeServicingState', 'AnalyzeRecentChanges', 'AnalyzeDomainTrustState')
+        $hasRepairAction = $PSBoundParameters.Keys | Where-Object { $readOnlySwitches -notcontains $_ -and $_ -notin @('VMName', 'DiskNumber', 'Force', 'LeaveDiskOnline', 'DriveLetter', 'RepairSource', 'CodeIntegrityPolicySourcePath', 'RepairSystemFileSource', 'IncludeServices', 'IssuesOnly', 'KeepDefaultFilters', 'DriverStartType', 'RecentChangeDays', 'LoadHive', 'UnloadHive', 'TransactionLogScope') }
         if ($hasRepairAction) {
             Write-Host "  Tip: if you haven't already, a VM snapshot or disk backup before making changes is always a safe starting point." -ForegroundColor DarkGray
             Write-Host ""
@@ -18776,6 +21088,8 @@ AVAILABLE DISKS:
             if ($DisableThirdPartyDrivers) { DisableThirdPartyDrivers }
             if ($EnableThirdPartyDrivers) { EnableThirdPartyDrivers }
             if ($GetServicesReport) { GetServicesReport -IncludeServices:$IncludeServices -IssuesOnly:$IssuesOnly }
+            if ($GetCatalogStoreReport) { GetCatalogStoreReport -IncludeHealthy:$IncludeHealthy }
+            if ($RepairCatalogStore) { RepairCatalogStore -DonorPath $RepairCatalogStore -Force:$Force }
             foreach ($d in $DisableDriverOrService) { if (-not [string]::IsNullOrWhiteSpace($d)) { Disable-ServiceOrDriver -ServiceName $d.Trim() } }
             if ($EnableDriverOrService.Count -gt 0) {
                 if (-not $PSBoundParameters.ContainsKey('DriverStartType')) {
@@ -18806,7 +21120,7 @@ AVAILABLE DISKS:
             if ($CheckDiskHealth) { CheckDiskHealth }
             if ($CollectEventLogs) { CollectEventLogs }
             if ($AnalyzeCriticalBootFiles) { AnalyzeCriticalBootFiles }
-            if ($RepairSystemFile.Count -gt 0) { RepairBrokenSystemFile -FileNames $RepairSystemFile }
+            if ($RepairSystemFile.Count -gt 0) { RepairBrokenSystemFile -FileNames $RepairSystemFile -SourcePath $RepairSystemFileSource }
             if ($AnalyzeSyntheticDrivers) { AnalyzeSyntheticDrivers }
             if ($EnsureSyntheticDriversEnabled) { EnsureSyntheticDriversEnabled }
             if ($ResetInterfacesToDHCP) { ResetInterfacesToDHCP }
@@ -18891,6 +21205,7 @@ AVAILABLE DISKS:
     $CodeIntegrityPolicySourcePath = if ($PSBoundParameters.ContainsKey('CodeIntegrityPolicySourcePath')) { $PSBoundParameters['CodeIntegrityPolicySourcePath'] } else { '' }
     $DriveLetter = if ($PSBoundParameters.ContainsKey('DriveLetter')) { $PSBoundParameters['DriveLetter'] }      else { '' }
     $RepairSource = if ($PSBoundParameters.ContainsKey('RepairSource')) { $PSBoundParameters['RepairSource'] }     else { '' }
+    $RepairSystemFileSource = if ($PSBoundParameters.ContainsKey('RepairSystemFileSource')) { $PSBoundParameters['RepairSystemFileSource'] } else { '' }
     $IncludeServices = [bool]$PSBoundParameters.ContainsKey('IncludeServices')
     $IssuesOnly = [bool]$PSBoundParameters.ContainsKey('IssuesOnly')
     $KeepDefaultFilters = [bool]$PSBoundParameters.ContainsKey('KeepDefaultFilters')

@@ -154,6 +154,19 @@ You can also target a Hyper-V VM by name instead of disk number:
 # Repair a system file using architecture-validated WinSxS/DriverStore candidates
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -RepairSystemFile "ntoskrnl.exe","ci.dll"
 
+# Supply your own known-good binaries instead of searching the guest
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -RepairSystemFile "filecrypt.sys" -RepairSystemFileSource C:\Temp\KnownGood
+
+# Report on the guest's catalog store — use this before replacing any driver that
+# fails with 0xc0000428. If the store cannot resolve well-known inbox binaries, the
+# named driver is a symptom and replacing it will not help.
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -GetCatalogStoreReport
+
+# Repair a damaged catalog store by merging catalogs from a healthy donor of the
+# SAME build and UBR. Catalogs are added, never replaced, so machine-specific
+# catalogs in the guest survive.
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -RepairCatalogStore D:\Windows\System32\CatRoot
+
 # Fix registry corruption
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixRegistryCorruption
 
@@ -470,7 +483,8 @@ first.
 | **0xC000021A** | STATUS_SYSTEM_PROCESS_TERMINATED | winlogon/csrss/lsass crash after bad update or file/registry mismatch | `-FixWinlogon` → `-RestoreRegistryFromRegBack` → `-FixPendingUpdates` → `-RunSFC` → `-RepairComponentStore` | [0xC000021A][c21a] |
 | **0x000000EF** | CRITICAL_PROCESS_DIED | Critical system process missing/corrupt | `-RepairSystemFile <proc>.exe` → `-FixWinlogon` → `-RunSFC` → `-RepairComponentStore` | [Critical service failed][csf] |
 | **0x00000067** | CONFIG_INITIALIZATION_FAILED | Stale IMC hive entries in BCD | `-FixBoot` | [Boot errors][be] |
-| **0xC0000428** | "Windows cannot verify the digital signature" / Invalid Image Hash | Unsigned/corrupt boot driver, or HVCI/Secure Boot block | `-FixSecureBootCodeIntegrity` → `-DisableMemoryIntegrity` → `-RepairSystemFile <driver>` → `-EnableTestSigning` (temporary) | [Invalid image hash][cih], [Disabling Secure Boot][sb] |
+| **0xC0000428** | "Windows cannot verify the digital signature" / Invalid Image Hash | Unsigned/corrupt boot driver — **or a damaged catalog store**, which looks identical | `-GetCatalogStoreReport` **first** → if the store is `Unusable`, `-RepairCatalogStore <donor CatRoot>`; if the store is healthy, `-RepairSystemFile <driver>` → `-FixSecureBootCodeIntegrity` → `-DisableMemoryIntegrity` | [Invalid image hash][cih], [Disabling Secure Boot][sb] |
+| **0x0000005A** | CRITICAL_SERVICE_FAILED (commonly with 0xC0000428) | A boot/system-start driver failed signature verification | Same as 0xC0000428. If disabling the named driver just moves the bugcheck to a different driver, the store is at fault, not the binaries | [Critical service failed][csf], [Invalid image hash][cih] |
 | **0xc0430001** | winload.efi Code Integrity error (Gen2) | Stale EFI boot manager / Code-Integrity policy payloads | `-FixSecureBootCodeIntegrity` (optionally `-CodeIntegrityPolicySourcePath`) | [Invalid image hash][cih] |
 | Directory Service init failure (DC) | "directory service initialization failure" | AD DS database (ntds.dit) / boot dependency | `-SysCheck` → `-RestoreRegistryFromRegBack` (DC database repair is out of scope) | [DS init failure][dsi] |
 
