@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.8.1
+        Version: 0.8.2
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -398,9 +398,10 @@ dynamicparam {
     if ($PSBoundParameters.ContainsKey('FixSecureBootCodeIntegrity')) {
         & $addParam 'CodeIntegrityPolicySourcePath' ([string]) 'Repair' ''
     }
-    # -RepairSystemFileSource: sub-option of -RepairSystemFile
+    # -RepairSystemFileSource, -SkipOfflineSfc: sub-options of -RepairSystemFile
     if ($PSBoundParameters.ContainsKey('RepairSystemFile')) {
         & $addParam 'RepairSystemFileSource' ([string]) 'Repair' ''
+        & $addParam 'SkipOfflineSfc' ([switch]) 'Repair' $null
     }
     # -RepairSource: sub-option of -RepairComponentStore
     if ($PSBoundParameters.ContainsKey('RepairComponentStore')) {
@@ -1646,7 +1647,14 @@ $($htmlRows -join "`n")
             Invoke-ProtectedRegistryWrite -Path $Path -Description "remove '$Name'" -Action {
                 # -ErrorAction Stop so an access-denied triggers the ownership retry
                 # rather than being written to the error stream and ignored.
-                Remove-ItemProperty -Path $Path -Name $Name -Force:$Force -ErrorAction Stop
+                try {
+                    Remove-ItemProperty -Path $Path -Name $Name -Force:$Force -ErrorAction Stop
+                }
+                catch [System.Management.Automation.PSArgumentException] {
+                    # The value is already absent, which is the requested end state. Only this
+                    # specific error is treated as success; access-denied still throws so the
+                    # ownership retry above keeps working.
+                }
             }
         }
     }
@@ -2750,6 +2758,11 @@ namespace RepairAzVMDisk
         $item = Get-Item -LiteralPath $FilePath -Force -ErrorAction SilentlyContinue
         if (-not (Test-Path -LiteralPath $FilePath) -or -not $item -or $item.PSIsContainer) { return $result }
 
+        # Extensions that must always resolve to a parseable PE image. Anything here
+        # that is not a PE is damaged; extensionless boot stubs are deliberately absent.
+        $peImageExtensions = @('.sys', '.dll', '.exe', '.efi', '.mui', '.ocx', '.cpl', '.drv')
+        $fileExtension = [System.IO.Path]::GetExtension($FilePath).ToLowerInvariant()
+
         # Trust evaluation is pure with respect to (path, size, mtime), and several
         # report sections inspect the same binaries. Cache to keep large reports fast.
         if ($null -eq $script:TrustResultCache) { $script:TrustResultCache = @{} }
@@ -2840,9 +2853,22 @@ namespace RepairAzVMDisk
                 $result.Status = 'CatalogHashNotFound'
                 $result.Subject = $result.VendorHint
             }
+            elseif ($peImageExtensions -contains $fileExtension -and
+                -not (Get-PortableExecutableInfo -FilePath $FilePath).IsPortableExecutable) {
+                # A .sys/.dll/.exe/.efi whose content is in no guest catalog and which
+                # cannot even be parsed as a PE image. Overwritten headers destroy the
+                # version resource too, so the Microsoft vendor hint above is gone and
+                # the file would otherwise fall into the compressed-stub tolerance and
+                # be reported as acceptable. It is corruption, not a format quirk.
+                $result.TrustState = 'Invalid'
+                $result.IsHardFailure = $true
+                $result.Status = 'NotPortableExecutable'
+                $result.Subject = $result.VendorHint
+            }
             elseif ($sig.Status -in @('UnknownError', 'NotSupportedFileFormat')) {
-                # Compressed boot stubs (bootmgr, bootmgfw.efi on some builds) are not
-                # standard PE images  -  inconclusive rather than suspect.
+                # Compressed boot stubs (bootmgr, and bootmgfw.efi on some builds) are
+                # not standard PE images  -  inconclusive rather than suspect. They carry
+                # no PE extension, so the corruption branch above does not catch them.
                 $result.TrustState = 'NotVerifiable'
                 $result.Status = 'NotVerifiable'
             }
@@ -2889,6 +2915,9 @@ namespace RepairAzVMDisk
                 }
                 elseif ($Signature.Status -eq 'CatalogHashNotFound') {
                     'INVALID IMAGE HASH - Microsoft-branded image whose content is in no guest catalog'
+                }
+                elseif ($Signature.Status -eq 'NotPortableExecutable') {
+                    'CORRUPT IMAGE - not a parseable PE and its content is in no guest catalog'
                 }
                 else {
                     "INVALID SIGNATURE (Authenticode=$($Signature.AuthenticodeStatus))"
@@ -5656,16 +5685,27 @@ loaded from them must be unloaded first.
     function RunSFC {
         Write-Host "Executing SFC /scannow"
         try {
-            $sfcCmd = "sfc /SCANNOW /OFFBOOTDIR=$script:WinDriveLetter /OFFWINDIR=$($script:WinDriveLetter)windows"
+            $offWinDir = "$($script:WinDriveLetter)windows"
+            $offBootDir = if (-not [string]::IsNullOrWhiteSpace($script:BootDriveLetter)) { $script:BootDriveLetter } else { $script:WinDriveLetter }
+            $sfcCmd = "sfc /SCANNOW /OFFBOOTDIR=$offBootDir /OFFWINDIR=$offWinDir"
             Write-Host "  [exec] $sfcCmd" -ForegroundColor DarkGray
             $sfcResult = Invoke-NativeCommandLogged -Description 'SFC offline scan and repair' -Details @{
                 Command = $sfcCmd
-                OffBootDir = $script:WinDriveLetter
-                OffWinDir = "$($script:WinDriveLetter)windows"
+                OffBootDir = $offBootDir
+                OffWinDir = $offWinDir
             } -ScriptBlock {
-                & sfc /SCANNOW /OFFBOOTDIR=$script:WinDriveLetter /OFFWINDIR=$($script:WinDriveLetter)windows
+                & sfc.exe /SCANNOW "/OFFBOOTDIR=$offBootDir" "/OFFWINDIR=$offWinDir"
             }
-            $sfcResult.Output | Out-Host
+            # sfc.exe writes UTF-16LE, so captured output is NUL-interleaved and unreadable
+            # until it is decoded.
+            $sfcText = ConvertFrom-NativeUnicodeOutput -Output $sfcResult.Output
+            foreach ($line in ($sfcText -split "`n")) {
+                $trimmed = $line.Trim()
+                if ($trimmed) { Write-Host "  $trimmed" }
+            }
+            if ((Get-OfflineSfcOutcome -Text $sfcText) -eq 'PendingServicing') {
+                Write-Warning "SFC will not run while the image has pending servicing operations. Run -FixPendingUpdates, then retry -RunSFC."
+            }
         }
         catch {
             Write-Error "RunSFC failed: $_"
@@ -9108,6 +9148,11 @@ or delete CBS registry keys. Use -FixPendingUpdates for that.
     }
 
     function ClearPendingUpdates {
+        # -SkipComponentCleanup is for callers that only need the pending transaction cleared
+        # (the offline SFC retry path). Component cleanup is unrelated to that goal and can run
+        # for a long time, so it is not worth blocking an automatic repair on.
+        param([switch]$SkipComponentCleanup)
+
         if (-not (Confirm-CriticalOperation -Operation 'Fix Pending Updates (-FixPendingUpdates)' -Details @"
 Runs DISM /RevertPendingActions to undo in-progress servicing operations.
 Removes pending update packages found by DISM /Get-Packages.
@@ -9253,13 +9298,20 @@ Runs DISM /StartComponentCleanup only if no pending servicing markers remain.
             }
         }
 
-        if ($remainingPendingMarkers.Count -gt 0) {
+        if ($SkipComponentCleanup) {
+            Write-Host "Skipping DISM /StartComponentCleanup - the caller only needed the pending transaction cleared." -ForegroundColor DarkGray
+        }
+        elseif ($remainingPendingMarkers.Count -gt 0) {
             Write-Warning "Skipping DISM /StartComponentCleanup because pending servicing markers are still present: $($remainingPendingMarkers -join ', ')"
             Write-Host "  This is expected when DISM still reports pending operations. Boot once or rerun -FixPendingUpdates, then run -RepairComponentStore if component cleanup/repair is still needed." -ForegroundColor Yellow
         }
         else {
             Write-Host "Running DISM /Cleanup-Image /StartComponentCleanup (best-effort reclaim of superseded components)" -ForegroundColor Yellow
-            $cleanupResult = Invoke-DismWithWatchdog -Description 'DISM StartComponentCleanup' -ImageDriveLetter $WinDriveLetter -Details @{
+            # Armed with real limits. Offline component cleanup can spin indefinitely: measured on
+            # a 14393 image it burned 4,950s of CPU over 85 minutes while its I/O byte counter and
+            # DISM log barely moved. Because that trickle still reads as progress, the stall check
+            # alone never fires, so the absolute cap is what actually bounds the run.
+            $cleanupResult = Invoke-DismWithWatchdog -Description 'DISM StartComponentCleanup' -ImageDriveLetter $WinDriveLetter -StallMinutes 15 -MaximumMinutes 45 -Details @{
                 Image = $WinDriveLetter
             } -ArgumentList @("/Image:$WinDriveLetter", '/Cleanup-Image', '/StartComponentCleanup', '/ScratchDir:C:\Temp')
             $cleanupResult.Output | Out-Host
@@ -17199,6 +17251,173 @@ namespace RepairAzVMDisk
         return $script:FastFileSearchReady
     }
 
+    function Test-RepairSourceContentUsable {
+        # Confirms a candidate is the binary it is named after rather than a servicing
+        # blob that merely carries the same name. The backup store holds all three under
+        # names that look alike: complete PE binaries, "DCS" reverse delta patches and
+        # "DCM"/"PA30" compressed manifests. Installing a delta in place of a driver
+        # would produce a file that is the right name and entirely unloadable.
+        param(
+            [Parameter(Mandatory = $true)][string]$Path,
+            [Parameter(Mandatory = $true)][string]$FileName
+        )
+
+        $header = New-Object byte[] 8
+        $read = 0
+        try {
+            $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            try { $read = $stream.Read($header, 0, 8) } finally { $stream.Dispose() }
+        }
+        catch { return $false }
+        if ($read -lt 4) { return $false }
+
+        # "DCS\x01" (delta compression storage) and "DCM\x01" (compressed manifest).
+        if ($header[0] -eq 0x44 -and $header[1] -eq 0x43 -and ($header[2] -eq 0x53 -or $header[2] -eq 0x4D)) { return $false }
+        # "PA30", the raw MSDelta patch signature.
+        if ($header[0] -eq 0x50 -and $header[1] -eq 0x41 -and $header[2] -eq 0x33 -and $header[3] -eq 0x30) { return $false }
+
+        $ext = [System.IO.Path]::GetExtension($FileName).ToLowerInvariant()
+        if (@('.sys', '.dll', '.exe', '.efi', '.mui', '.ocx', '.cpl', '.drv') -contains $ext) {
+            return ($header[0] -eq 0x4D -and $header[1] -eq 0x5A)
+        }
+        return $true
+    }
+
+    function ConvertFrom-NativeUnicodeOutput {
+        # sfc.exe writes UTF-16LE to its standard handles. Captured rather than shown on a
+        # console, every character arrives followed by a NUL, so ordinary string matching
+        # against the result silently never matches and the text is unreadable in a log.
+        param([object[]]$Output)
+
+        $text = (@($Output) | ForEach-Object { "$_" }) -join "`n"
+        return ($text -replace "`0", '')
+    }
+
+    function Get-OfflineSfcOutcome {
+        # Classifies offline SFC output. The strings are English-only, so they are treated
+        # as a hint: every caller confirms the result by re-examining the file itself.
+        param([string]$Text)
+
+        if ([string]::IsNullOrWhiteSpace($Text)) { return 'Unknown' }
+        if ($Text -match 'system repair pending') { return 'PendingServicing' }
+        if ($Text -match 'could not perform the requested operation') { return 'CannotPerform' }
+        if ($Text -match 'could not start the repair service') { return 'CannotPerform' }
+        if ($Text -match 'found corrupt files and successfully repaired') { return 'Repaired' }
+        if ($Text -match 'unable to fix some of them') { return 'Unrepairable' }
+        if ($Text -match 'did not find any integrity violations') { return 'NoViolations' }
+        return 'Unknown'
+    }
+
+    function Invoke-OfflineSfcScanFile {
+        # Runs Windows Resource Protection against one file on the offline image.
+        #
+        # This is the authoritative repair for a WRP-protected file, and it reaches sources
+        # this script cannot reconstruct on its own: the \WinSxS\Backup store and the
+        # differential payloads servicing keeps beside each component. It is also the only
+        # source that verifies what it installs against the image's own catalogs.
+        param([Parameter(Mandatory = $true)][string]$TargetPath)
+
+        $offWinDir = (Join-Path $script:WinDriveLetter 'Windows').TrimEnd('\')
+        $offBootDir = if (-not [string]::IsNullOrWhiteSpace($script:BootDriveLetter)) { $script:BootDriveLetter } else { $script:WinDriveLetter }
+        $offBootDir = $offBootDir.TrimEnd('\') + '\'
+
+        $sfcCmd = "sfc /scanfile=$TargetPath /offbootdir=$offBootDir /offwindir=$offWinDir"
+        Write-Host "  [exec] $sfcCmd" -ForegroundColor DarkGray
+
+        $text = ''
+        $exitCode = -1
+        try {
+            $run = Invoke-NativeCommandLogged -Description "Offline SFC /scanfile for $TargetPath" -AcceptedExitCodes @(0) -Details @{
+                Command    = $sfcCmd
+                TargetPath = $TargetPath
+                OffBootDir = $offBootDir
+                OffWinDir  = $offWinDir
+            } -ScriptBlock {
+                & sfc.exe "/scanfile=$TargetPath" "/offbootdir=$offBootDir" "/offwindir=$offWinDir"
+            }
+            $text = ConvertFrom-NativeUnicodeOutput -Output $run.Output
+            $exitCode = $run.ExitCode
+        }
+        catch {
+            return [PSCustomObject]@{ Outcome = 'Failed'; Text = $_.Exception.Message; ExitCode = -1 }
+        }
+
+        foreach ($line in ($text -split "`n")) {
+            $trimmed = $line.Trim()
+            if ($trimmed) { Write-Host "    $trimmed" -ForegroundColor DarkGray }
+        }
+
+        return [PSCustomObject]@{
+            Outcome  = (Get-OfflineSfcOutcome -Text $text)
+            Text     = $text
+            ExitCode = $exitCode
+        }
+    }
+
+    function Repair-OfflineSystemFileWithSfc {
+        # Offline SFC with the one precondition it cannot clear for itself.
+        #
+        # SFC refuses to touch an image that still has servicing work queued ("there is a
+        # system repair pending which requires reboot to complete"), which is exactly the
+        # state a VM that failed mid-update is in - so the repair the operator needs is
+        # blocked by the fault they are repairing. Reverting the pending transaction and
+        # retrying once resolves that without them having to discover the sequence.
+        param(
+            [Parameter(Mandatory = $true)][string]$TargetPath,
+            [Parameter(Mandatory = $true)][scriptblock]$IsRepaired
+        )
+
+        if (-not (Get-Command sfc.exe -ErrorAction SilentlyContinue)) {
+            Write-Verbose 'sfc.exe is not available on this host; skipping the offline SFC attempt.'
+            return [PSCustomObject]@{ Attempted = $false; Repaired = $false; Outcome = 'Unavailable' }
+        }
+
+        Write-Host "  Attempting offline SFC repair (Windows Resource Protection)..." -ForegroundColor Cyan
+        $result = Invoke-OfflineSfcScanFile -TargetPath $TargetPath
+
+        if ($result.Outcome -eq 'PendingServicing') {
+            Write-Warning "  SFC will not run while the image has pending servicing operations."
+            Write-Host "  Reverting the pending transaction first, then retrying SFC once." -ForegroundColor Yellow
+            ClearPendingUpdates -SkipComponentCleanup | Out-Null
+            Write-Host "  Retrying offline SFC..." -ForegroundColor Cyan
+            $result = Invoke-OfflineSfcScanFile -TargetPath $TargetPath
+            if ($result.Outcome -eq 'PendingServicing') {
+                Write-Warning "  SFC still reports pending servicing work. The transaction could not be cleared offline."
+            }
+        }
+
+        # The message text is English-only and SFC's exit code is not documented, so the
+        # file itself is the verdict: SFC counts as successful only when the fault that
+        # prompted the repair is measurably gone.
+        $repaired = [bool](& $IsRepaired)
+
+        switch ($result.Outcome) {
+            'Repaired' {
+                if ($repaired) { Write-Host "  [OK] Offline SFC repaired $TargetPath." -ForegroundColor Green }
+                else { Write-Warning "  SFC reported a repair, but $TargetPath still fails validation." }
+            }
+            'NoViolations' {
+                if ($repaired) { Write-Host "  [OK] SFC reports the file matches the image catalogs." -ForegroundColor Green }
+                else { Write-Warning "  SFC found no integrity violation, yet the file still fails validation. It is likely not WRP-protected on this build." }
+            }
+            'Unrepairable' { Write-Warning "  SFC found the file corrupt but could not repair it. Its backup store may be incomplete." }
+            'CannotPerform' { Write-Warning "  SFC could not operate on this image. This is expected when the rescue host and the guest are different Windows builds." }
+            'Failed' { Write-Warning "  SFC could not be started: $($result.Text)" }
+            default {
+                if ($repaired) { Write-Host "  [OK] The file passes validation after SFC." -ForegroundColor Green }
+            }
+        }
+
+        Write-ActionLog -Event 'OfflineSfcScanFile' -Details @{
+            TargetPath = $TargetPath
+            Outcome    = $result.Outcome
+            ExitCode   = $result.ExitCode
+            Repaired   = $repaired
+        }
+
+        return [PSCustomObject]@{ Attempted = $true; Repaired = $repaired; Outcome = $result.Outcome }
+    }
+
     function Get-SystemFileRepairSourceIndex {
         param(
             [Parameter(Mandatory = $true)][string[]]$FileNames,
@@ -17223,19 +17442,26 @@ namespace RepairAzVMDisk
         foreach ($key in $wanted.Keys) { $index[$key] = [System.Collections.Generic.List[PSCustomObject]]::new() }
 
         $roots = @(
-            [PSCustomObject]@{ Path = (Join-Path $WinRoot 'WinSxS'); Source = 'WinSxS' }
-            [PSCustomObject]@{ Path = (Join-Path $WinRoot 'System32\DriverStore\FileRepository'); Source = 'DriverStore' }
+            [PSCustomObject]@{ Path = (Join-Path $WinRoot 'WinSxS'); Source = 'WinSxS'; Mangled = $false }
+            # \Windows\WinSxS\Backup is the Windows Resource Protection backup store: the
+            # store offline SFC itself repairs from. It is reached as its own root because
+            # its file names are mangled to <component-identity>_<filename>_<hash>, so the
+            # exact-leaf match used for every other root never sees them.
+            [PSCustomObject]@{ Path = (Join-Path $WinRoot 'WinSxS\Backup'); Source = 'WinSxSBackup'; Mangled = $true }
+            [PSCustomObject]@{ Path = (Join-Path $WinRoot 'System32\DriverStore\FileRepository'); Source = 'DriverStore'; Mangled = $false }
         )
         if (-not [string]::IsNullOrWhiteSpace($SourcePath) -and (Test-Path -LiteralPath $SourcePath)) {
             # Searched first so an operator-supplied known-good copy outranks the
             # component store, which on a damaged guest may hold the same bad bytes.
-            $roots = @([PSCustomObject]@{ Path = $SourcePath; Source = 'SuppliedSource' }) + $roots
+            $roots = @([PSCustomObject]@{ Path = $SourcePath; Source = 'SuppliedSource'; Mangled = $false }) + $roots
         }
 
         foreach ($root in $roots) {
+            if ($wanted.Count -eq 0) { break }
             if (-not (Test-Path -LiteralPath $root.Path)) { continue }
-            # A supplied source may name the file itself rather than a folder holding it.
+
             if (Test-Path -LiteralPath $root.Path -PathType Leaf) {
+                # A supplied source may name the file itself rather than a folder holding it.
                 $leaf = [System.IO.Path]::GetFileName($root.Path).ToLowerInvariant()
                 if ($wanted.ContainsKey($leaf)) {
                     $index[$leaf].Add([PSCustomObject]@{ Path = $root.Path; Source = $root.Source })
@@ -17244,71 +17470,115 @@ namespace RepairAzVMDisk
                 else {
                     Write-Warning "  The supplied source file is named '$leaf', which is not one of the files being repaired. It was ignored."
                 }
-                continue
             }
-            Write-Host "  Indexing $($root.Source)..." -ForegroundColor DarkGray
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            $dirCount = 0
-            $hitCount = 0
-
-            if (Initialize-FastFileSearchType) {
-                $searchStats = [int[]]@(0)
-                $found = @()
+            elseif ($root.Mangled) {
+                Write-Host "  Indexing $($root.Source)..." -ForegroundColor DarkGray
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                $fileCount = 0
+                $hitCount = 0
+                # The backup store mixes three kinds of content under names that all look
+                # alike, and only one of them is a usable replacement:
+                #   MZ...      a complete, independent PE binary - what SFC restores
+                #   "DCS\x01"  a reverse delta patch, ~40% of the real size
+                #   "DCM\x01"  a compressed manifest
+                # so every name match is confirmed by content signature, never by name.
+                $patterns = @{}
+                foreach ($key in $wanted.Keys) {
+                    $patterns[$key] = '_' + [regex]::Escape($key) + '_[0-9a-f]{4,}$'
+                }
                 try {
-                    $found = @([RepairAzVMDisk.FastFileSearch]::Find($root.Path, [string[]]@($wanted.Keys), $searchStats))
+                    foreach ($file in [System.IO.Directory]::EnumerateFiles($root.Path)) {
+                        $fileCount++
+                        $name = [System.IO.Path]::GetFileName($file).ToLowerInvariant()
+                        foreach ($key in @($patterns.Keys)) {
+                            if ($name -notmatch $patterns[$key]) { continue }
+                            if (-not (Test-RepairSourceContentUsable -Path $file -FileName $key)) { break }
+                            $index[$key].Add([PSCustomObject]@{ Path = $file; Source = $root.Source })
+                            $hitCount++
+                            break
+                        }
+                    }
                 }
                 catch {
-                    Write-Verbose "Native search failed on $($root.Path): $($_.Exception.Message)"
-                    $found = $null
+                    Write-Verbose "Backup store scan failed on $($root.Path): $($_.Exception.Message)"
                 }
-                if ($null -ne $found) {
-                    $dirCount = $searchStats[0]
-                    foreach ($file in $found) {
-                        $leaf = [System.IO.Path]::GetFileName($file).ToLowerInvariant()
-                        if ($index.ContainsKey($leaf)) {
-                            $index[$leaf].Add([PSCustomObject]@{ Path = $file; Source = $root.Source })
-                            $hitCount++
+                $sw.Stop()
+                Write-Host ("    {0}: {1:N0} file(s) examined, {2} candidate file(s), {3:N1}s" -f $root.Source, $fileCount, $hitCount, $sw.Elapsed.TotalSeconds) -ForegroundColor DarkGray
+            }
+            else {
+                Write-Host "  Indexing $($root.Source)..." -ForegroundColor DarkGray
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                $dirCount = 0
+                $hitCount = 0
+                $nativeSearchUsed = $false
+
+                if (Initialize-FastFileSearchType) {
+                    $searchStats = [int[]]@(0)
+                    $found = @()
+                    try {
+                        $found = @([RepairAzVMDisk.FastFileSearch]::Find($root.Path, [string[]]@($wanted.Keys), $searchStats))
+                    }
+                    catch {
+                        Write-Verbose "Native search failed on $($root.Path): $($_.Exception.Message)"
+                        $found = $null
+                    }
+                    if ($null -ne $found) {
+                        $nativeSearchUsed = $true
+                        $dirCount = $searchStats[0]
+                        foreach ($file in $found) {
+                            $leaf = [System.IO.Path]::GetFileName($file).ToLowerInvariant()
+                            if ($wanted.ContainsKey($leaf)) {
+                                $index[$leaf].Add([PSCustomObject]@{ Path = $file; Source = $root.Source })
+                                $hitCount++
+                            }
                         }
                     }
-                    $sw.Stop()
-                    Write-Host ("    {0}: {1:N0} directories scanned, {2} candidate file(s), {3:N1}s" -f $root.Source, $dirCount, $hitCount, $sw.Elapsed.TotalSeconds) -ForegroundColor DarkGray
+                }
+
+                if (-not $nativeSearchUsed) {
+                    $pending = [System.Collections.Generic.Stack[string]]::new()
+                    $pending.Push($root.Path)
+                    while ($pending.Count -gt 0) {
+                        $dir = $pending.Pop()
+                        $dirCount++
+                        # Enumerate per directory so a single ACL-denied or transient failure
+                        # cannot abort the whole traversal (AllDirectories would throw out).
+                        try {
+                            foreach ($sub in [System.IO.Directory]::EnumerateDirectories($dir)) { $pending.Push($sub) }
+                        }
+                        catch { }
+                        try {
+                            foreach ($file in [System.IO.Directory]::EnumerateFiles($dir)) {
+                                $leaf = [System.IO.Path]::GetFileName($file).ToLowerInvariant()
+                                if ($wanted.ContainsKey($leaf)) {
+                                    $index[$leaf].Add([PSCustomObject]@{ Path = $file; Source = $root.Source })
+                                    $hitCount++
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+                }
+                $sw.Stop()
+                Write-Host ("    {0}: {1:N0} directories scanned, {2} candidate file(s), {3:N1}s" -f $root.Source, $dirCount, $hitCount, $sw.Elapsed.TotalSeconds) -ForegroundColor DarkGray
+            }
+
+            if ($root.Source -eq 'SuppliedSource') {
+                # An explicit donor is the operator answering the question the component
+                # store walk exists to answer, so it is not second-guessed. When the donor
+                # covers every requested file the walk is skipped entirely - it is the slow
+                # part of this repair, and running it anyway was simply wasted time.
+                $stillWanted = @($wanted.Keys | Where-Object { $index[$_].Count -eq 0 })
+                if ($stillWanted.Count -eq 0) {
+                    Write-Host "  Supplied source covers every requested file. The WinSxS and DriverStore scan is skipped." -ForegroundColor DarkGray
+                    $wanted = @{}
                     continue
                 }
+                Write-Warning "  The supplied source does not contain: $($stillWanted -join ', '). The component store is searched for those only."
+                $wanted = @{}
+                foreach ($name in $stillWanted) { $wanted[$name] = $true }
             }
-
-            $pending = [System.Collections.Generic.Stack[string]]::new()
-            $pending.Push($root.Path)
-            while ($pending.Count -gt 0) {
-                $dir = $pending.Pop()
-                $dirCount++
-                # Enumerate per directory so a single ACL-denied or transient failure
-                # cannot abort the whole traversal (AllDirectories would throw out).
-                try {
-                    foreach ($sub in [System.IO.Directory]::EnumerateDirectories($dir)) { $pending.Push($sub) }
-                }
-                catch { }
-                try {
-                    foreach ($file in [System.IO.Directory]::EnumerateFiles($dir)) {
-                        $leaf = [System.IO.Path]::GetFileName($file).ToLowerInvariant()
-                        if ($wanted.ContainsKey($leaf)) {
-                            $index[$leaf].Add([PSCustomObject]@{ Path = $file; Source = $root.Source })
-                            $hitCount++
-                        }
-                    }
-                }
-                catch { }
-            }
-            $sw.Stop()
-            Write-Host ("    {0}: {1:N0} directories scanned, {2} candidate file(s), {3:N1}s" -f $root.Source, $dirCount, $hitCount, $sw.Elapsed.TotalSeconds) -ForegroundColor DarkGray
         }
-
-        # \Windows\WinSxS\Backup is deliberately NOT searched. It looks like the ideal
-        # spare - genuinely separate files rather than the hard links the component
-        # directories hold - but its contents are reverse delta patches, not binaries.
-        # Their names are mangled to <component-identity>_<filename>_<hash>, and each
-        # file begins with the "DCS" Delta Compression Storage signature and is roughly
-        # 40% of the size of the binary it relates to. Handing one to a caller as a
-        # replacement would install a compressed blob in place of a driver.
 
         $script:RepairSourceIndexCache[$cacheKey] = $index
         return $index
@@ -17318,14 +17588,26 @@ namespace RepairAzVMDisk
         param(
             [Parameter(Mandatory = $true)]
             [string[]]$FileNames,
-            [string]$SourcePath = ''
+            [string]$SourcePath = '',
+            [switch]$SkipOfflineSfc
         )
-        # Replaces a missing, 0-byte, or wrong-architecture Windows system binary
-        # from the offline disk's WinSxS component store or DriverStore.
+        # Repairs a missing, 0-byte, wrong-architecture or untrusted Windows system binary
+        # on the offline disk.
         #
-        # Search sources:
-        #   1. \Windows\WinSxS\<component>\<filename>          (component store - primary)
-        #   2. \Windows\System32\DriverStore\FileRepository\*\<filename>  (driver packages)
+        # Repair order:
+        #   1. -RepairSystemFileSource, when supplied. An explicit donor is authoritative,
+        #      so neither SFC nor the component-store scan runs.
+        #   2. Offline SFC (/scanfile). Windows Resource Protection restores from the
+        #      \WinSxS\Backup store and the differential payloads that sit beside each
+        #      component, and verifies what it writes against the image's own catalogs.
+        #      Neither of those reconstructions can be done from this script.
+        #   3. A candidate search across the component store, its backup store and the
+        #      driver store, ranked and verified before installation.
+        #
+        # Search sources for step 3:
+        #   \Windows\WinSxS\<component>\<filename>                        (component store)
+        #   \Windows\WinSxS\Backup\<identity>_<filename>_<hash>           (WRP backup store)
+        #   \Windows\System32\DriverStore\FileRepository\*\<filename>     (driver packages)
         #
         # Known PE architecture mismatches are excluded before version/source ranking.
         # Only Microsoft/Windows binaries are expected targets (e.g. storvsc.sys, ntoskrnl.exe).
@@ -17458,7 +17740,83 @@ apply a protected Windows system-file ACL/owner baseline.
             }
             Write-Host "  Target: $targetPath [$stateDesc]" -ForegroundColor Yellow
 
-            # -- 2. Search WinSxS and DriverStore for replacement candidates ------
+            # -- 1a. Prepare the offline SFC fallback -----------------------------
+            # The script's own candidate search runs first: it is transparent, it backs the
+            # original file up, and it works even when the rescue host and the guest are
+            # different Windows builds. Windows Resource Protection is held in reserve for
+            # when that search cannot produce a file, because it reaches sources this script
+            # cannot reconstruct - the differential payloads servicing keeps beside each
+            # component - and verifies what it writes against the image's own catalogs.
+            #
+            # It is not used when a donor was supplied (the operator has already chosen the
+            # source) or for paths outside \Windows such as the EFI System Partition, which
+            # WRP does not cover.
+            $testTargetHealthy = {
+                $item = Get-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue
+                if (-not $item -or $item.PSIsContainer -or $item.Length -eq 0) { return $false }
+                if ($portableExecutableExtensions -notcontains $ext) { return $true }
+                $pe = Get-PortableExecutableInfo -FilePath $targetPath
+                if ($pe.IsPortableExecutable -and $pe.Architecture -ne 'Unknown' -and $guestArchitecture -ne 'Unknown') {
+                    if (-not (Test-PortableExecutableArchitectureCompatible -ExpectedArchitecture $guestArchitecture -ActualArchitecture $pe.Architecture)) { return $false }
+                }
+                $sig = Test-MicrosoftSignature -FilePath $targetPath
+                return (-not $sig.IsHardFailure)
+            }
+
+            $targetIsUnderWindows = $targetPath.StartsWith($winRoot, [System.StringComparison]::OrdinalIgnoreCase)
+
+            $invokeSfcFallback = {
+                param([string]$Reason)
+
+                $giveUp = {
+                    param([string]$Why)
+                    Write-Error "  '$fileName' was not repaired: $Why"
+                    Write-Warning "  Supply a known-good copy taken from a machine on the same OS build and patch level, or extracted from matching installation media:"
+                    Write-Warning "    -RepairSystemFile $fileName -RepairSystemFileSource <file-or-folder>"
+                }
+
+                if (-not [string]::IsNullOrWhiteSpace($SourcePath)) {
+                    Write-Error "  '$fileName' was not repaired from the supplied source."
+                    return $false
+                }
+                if ($SkipOfflineSfc) {
+                    & $giveUp 'no replacement was installed and the offline SFC fallback was disabled with -SkipOfflineSfc'
+                    return $false
+                }
+                if (-not $targetIsUnderWindows) {
+                    & $giveUp 'no replacement was installed, and Windows Resource Protection only covers files under \Windows so it cannot repair this target'
+                    return $false
+                }
+
+                Write-Host ""
+                Write-Host "  Falling back to offline SFC - $Reason" -ForegroundColor Yellow
+                $attempt = Repair-OfflineSystemFileWithSfc -TargetPath $targetPath -IsRepaired $testTargetHealthy
+                if (-not $attempt.Repaired) {
+                    & $giveUp 'neither the offline stores nor Windows Resource Protection produced a usable copy'
+                    return $false
+                }
+
+                $repairedItem = Get-Item -LiteralPath $targetPath -Force
+                Write-Host "  [OK] Repaired by offline SFC: $targetPath ($("{0:N0}" -f $repairedItem.Length) bytes)" -ForegroundColor Green
+                Write-ActionLog -Event 'SystemFileReplaced' -Details @{
+                    FileName          = $fileName
+                    TargetPath        = $targetPath
+                    Source            = 'OfflineSfc'
+                    SfcOutcome        = $attempt.Outcome
+                    Size              = $repairedItem.Length
+                    Version           = $repairedItem.VersionInfo.FileVersion
+                    GuestArchitecture = $guestArchitecture
+                    PreviousState     = $stateDesc
+                    FallbackReason    = $Reason
+                }
+                return $true
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($SourcePath)) {
+                Write-Host "  A repair source was supplied, so the component-store scan is skipped." -ForegroundColor DarkGray
+            }
+
+            # -- 2. Search the offline stores for replacement candidates ----------
             # Sources are indexed once for the whole batch (see
             # Get-SystemFileRepairSourceIndex) instead of re-walking WinSxS per file.
             $candidates = [System.Collections.Generic.List[PSCustomObject]]::new()
@@ -17522,15 +17880,14 @@ apply a protected Windows system-file ACL/owner baseline.
 
             if ($candidates.Count -eq 0) {
                 if ($hardLinkedCandidates.Count -gt 0) {
-                    Write-Error "  No independent replacement source exists on this disk for '$fileName'."
+                    Write-Warning "  No independent replacement source exists on this disk for '$fileName'."
                     Write-Warning "  Every copy found is a hard link to the damaged file, which is what Windows does for inbox files: the component store holds one instance and links it into place. A file damaged where it lies is therefore damaged in the store too."
-                    Write-Warning "  \Windows\WinSxS\Backup is not an alternative: it holds reverse delta patches (DCS), not usable binaries."
-                    Write-Warning "  Supply a known-good copy instead, taken from a machine running the same OS build and patch level, or extracted from matching installation media:"
-                    Write-Warning "    -RepairSystemFile $fileName -RepairSystemFileSource <file-or-folder>"
+                    Write-Warning "  \Windows\WinSxS\Backup was searched as well and holds no usable copy of this file. It stores complete binaries for some components and reverse delta patches for others, and only a complete binary can be installed."
+                    $null = & $invokeSfcFallback 'every copy on the disk is a hard link to the damaged file'
                 }
                 else {
-                    Write-Warning "  No replacement candidates found for '$fileName' in WinSxS or DriverStore."
-                    Write-Warning "  The file may need to be copied from another VM with the same OS version, then supplied with -RepairSystemFileSource <file-or-folder>."
+                    Write-Warning "  No replacement candidates found for '$fileName' in WinSxS, its backup store or the DriverStore."
+                    $null = & $invokeSfcFallback 'no replacement candidate was found in the offline stores'
                 }
                 continue
             }
@@ -17563,6 +17920,7 @@ apply a protected Windows system-file ACL/owner baseline.
             if ($eligibleCandidates.Count -eq 0) {
                 Write-Warning "  No candidate matches the offline guest architecture ($guestArchitecture)."
                 Write-Warning "  Do not use a binary from a different architecture. Use matching installation media or a same-build VM if the local stores are incomplete."
+                $null = & $invokeSfcFallback "no candidate matched the guest architecture ($guestArchitecture)"
                 continue
             }
             if ($candidateSelection.UsedUnverifiedFallback) {
@@ -17618,8 +17976,9 @@ apply a protected Windows system-file ACL/owner baseline.
                 }
                 $trustRanked = @($eligibleCandidates | Where-Object { -not $_.TrustBad })
                 if ($trustRanked.Count -eq 0) {
-                    Write-Error "  Every replacement candidate for '$fileName' failed image trust validation. Refusing to install a known-bad binary."
-                    Write-Warning "  The component store itself may be damaged. Copy the file from another VM with the same OS build, or run DISM /RestoreHealth online."
+                    Write-Warning "  Every replacement candidate for '$fileName' failed image trust validation. Refusing to install a known-bad binary."
+                    Write-Warning "  The component store itself may be damaged."
+                    $null = & $invokeSfcFallback 'every candidate failed image trust validation'
                     continue
                 }
                 $eligibleCandidates = $trustRanked
@@ -17698,7 +18057,7 @@ apply a protected Windows system-file ACL/owner baseline.
                 -Description "system file '$fileName'"
 
             if (-not $install.Installed) {
-                Write-Error "  '$fileName' was not replaced: $($install.Reason)"
+                Write-Warning "  '$fileName' was not replaced: $($install.Reason)"
                 Write-ActionLog -Event 'SystemFileReplacementFailed' -Details @{
                     FileName   = $fileName
                     TargetPath = $targetPath
@@ -17706,6 +18065,7 @@ apply a protected Windows system-file ACL/owner baseline.
                     RolledBack = $install.RolledBack
                     Reason     = $install.Reason
                 }
+                $null = & $invokeSfcFallback "the selected candidate could not be installed ($($install.Reason))"
                 continue
             }
 
@@ -20682,6 +21042,7 @@ No destructive file or registry cleanup is performed.
             [switch]$RepairComponentStore,
             [string]$RepairSource = '',
             [string]$RepairSystemFileSource = '',
+            [switch]$SkipOfflineSfc,
             [switch]$AnalyzeComponentStore,
             [switch]$TryLGKC,
             [switch]$TryOtherBootConfig,        
@@ -20852,7 +21213,8 @@ PARAMETERS:
   -FixBoot               Rebuild BCD from scratch
         -FixSecureBootCodeIntegrity  Refresh Gen2 EFI boot manager + SKUSiPolicy.p7b and repair CodeIntegrity Driver.stl/DriverSiPolicy.p7b for winload.efi / 0xc0430001
             -CodeIntegrityPolicySourcePath <path> Optional known-good CodeIntegrity folder/file source; otherwise uses offline WinSxS, then same-build rescue host fallback
-            -RepairSystemFileSource <path> Optional known-good file or folder to repair from, for when every copy on the disk is a hard link to the damaged file
+            -RepairSystemFileSource <path> Optional known-good file or folder to repair from. Skips the component-store scan and the offline SFC fallback entirely
+            -SkipOfflineSfc        (sub-option) Do not fall back to offline SFC when no replacement can be installed from the offline stores
   -FixBootSector         Inspect and repair the MBR bootstrap + NTFS volume boot record (Gen1/BIOS only).
                          Fixes what -FixBoot cannot: "Operating system not found", "Missing operating
                          system", "A disk read error occurred" and a stale BPB HiddenSectors after a
@@ -21037,7 +21399,7 @@ AVAILABLE DISKS:
         # Initialize logging and target (resolve VM/disk, bring disk online, detect partitions)
         # Determine if any write/repair action was requested (exclude pure read-only switches)
         $readOnlySwitches = @('SysCheck', 'CheckDiskHealth', 'ScanNetBindings', 'CheckRDPPolicies', 'CollectEventLogs', 'CollectMinidumps', 'ShowLastSession', 'GetServicesReport', 'GetCatalogStoreReport', 'GetAppLockerReport', 'ListInstalledUpdates', 'ListStartupPrograms', 'AnalyzeCriticalBootFiles', 'AnalyzeSyntheticDrivers', 'AnalyzeProxyState', 'GetBootPathReport', 'AnalyzeBcdConsistency', 'AnalyzeComponentStore', 'AnalyzeServicingState', 'AnalyzeRecentChanges', 'AnalyzeDomainTrustState')
-        $hasRepairAction = $PSBoundParameters.Keys | Where-Object { $readOnlySwitches -notcontains $_ -and $_ -notin @('VMName', 'DiskNumber', 'Force', 'LeaveDiskOnline', 'DriveLetter', 'RepairSource', 'CodeIntegrityPolicySourcePath', 'RepairSystemFileSource', 'IncludeServices', 'IssuesOnly', 'KeepDefaultFilters', 'DriverStartType', 'RecentChangeDays', 'LoadHive', 'UnloadHive', 'TransactionLogScope') }
+        $hasRepairAction = $PSBoundParameters.Keys | Where-Object { $readOnlySwitches -notcontains $_ -and $_ -notin @('VMName', 'DiskNumber', 'Force', 'LeaveDiskOnline', 'DriveLetter', 'RepairSource', 'CodeIntegrityPolicySourcePath', 'RepairSystemFileSource', 'SkipOfflineSfc', 'IncludeServices', 'IssuesOnly', 'KeepDefaultFilters', 'DriverStartType', 'RecentChangeDays', 'LoadHive', 'UnloadHive', 'TransactionLogScope') }
         if ($hasRepairAction) {
             Write-Host "  Tip: if you haven't already, a VM snapshot or disk backup before making changes is always a safe starting point." -ForegroundColor DarkGray
             Write-Host ""
@@ -21131,7 +21493,7 @@ AVAILABLE DISKS:
             if ($CheckDiskHealth) { CheckDiskHealth }
             if ($CollectEventLogs) { CollectEventLogs }
             if ($AnalyzeCriticalBootFiles) { AnalyzeCriticalBootFiles }
-            if ($RepairSystemFile.Count -gt 0) { RepairBrokenSystemFile -FileNames $RepairSystemFile -SourcePath $RepairSystemFileSource }
+            if ($RepairSystemFile.Count -gt 0) { RepairBrokenSystemFile -FileNames $RepairSystemFile -SourcePath $RepairSystemFileSource -SkipOfflineSfc:$SkipOfflineSfc }
             if ($AnalyzeSyntheticDrivers) { AnalyzeSyntheticDrivers }
             if ($EnsureSyntheticDriversEnabled) { EnsureSyntheticDriversEnabled }
             if ($ResetInterfacesToDHCP) { ResetInterfacesToDHCP }
@@ -21217,6 +21579,7 @@ AVAILABLE DISKS:
     $DriveLetter = if ($PSBoundParameters.ContainsKey('DriveLetter')) { $PSBoundParameters['DriveLetter'] }      else { '' }
     $RepairSource = if ($PSBoundParameters.ContainsKey('RepairSource')) { $PSBoundParameters['RepairSource'] }     else { '' }
     $RepairSystemFileSource = if ($PSBoundParameters.ContainsKey('RepairSystemFileSource')) { $PSBoundParameters['RepairSystemFileSource'] } else { '' }
+    $SkipOfflineSfc = if ($PSBoundParameters.ContainsKey('SkipOfflineSfc')) { [switch]$PSBoundParameters['SkipOfflineSfc'] } else { [switch]$false }
     $IncludeServices = [bool]$PSBoundParameters.ContainsKey('IncludeServices')
     $IssuesOnly = [bool]$PSBoundParameters.ContainsKey('IssuesOnly')
     $KeepDefaultFilters = [bool]$PSBoundParameters.ContainsKey('KeepDefaultFilters')

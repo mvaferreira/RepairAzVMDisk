@@ -151,10 +151,21 @@ You can also target a Hyper-V VM by name instead of disk number:
 # Repair component store using a known-good source image
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -RepairComponentStore -RepairSource "D:\sources\install.wim"
 
-# Repair a system file using architecture-validated WinSxS/DriverStore candidates
+# Repair a system file using architecture-validated WinSxS/DriverStore candidates.
+# Candidates also come from the Windows Resource Protection backup store
+# (WinSxS\Backup), which holds independent copies of inbox binaries; a candidate
+# that is a hard link to the damaged target, or whose content is not a real
+# binary, is rejected. If no candidate can be installed the script falls back to
+# offline "sfc /scanfile", first reverting pending servicing if SFC reports a
+# pending system repair, then retrying once.
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -RepairSystemFile "ntoskrnl.exe","ci.dll"
 
-# Supply your own known-good binaries instead of searching the guest
+# Disable the offline SFC fallback and fail with a donor hint instead
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -RepairSystemFile "winload.efi" -SkipOfflineSfc
+
+# Supply your own known-good binaries instead of searching the guest.
+# An explicit source is authoritative: both the component-store scan and the
+# offline SFC fallback are skipped entirely.
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -RepairSystemFile "filecrypt.sys" -RepairSystemFileSource C:\Temp\KnownGood
 
 # Report on the guest's catalog store — use this before replacing any driver that
