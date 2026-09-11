@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.8.2
+        Version: 0.8.3
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -9148,11 +9148,6 @@ or delete CBS registry keys. Use -FixPendingUpdates for that.
     }
 
     function ClearPendingUpdates {
-        # -SkipComponentCleanup is for callers that only need the pending transaction cleared
-        # (the offline SFC retry path). Component cleanup is unrelated to that goal and can run
-        # for a long time, so it is not worth blocking an automatic repair on.
-        param([switch]$SkipComponentCleanup)
-
         if (-not (Confirm-CriticalOperation -Operation 'Fix Pending Updates (-FixPendingUpdates)' -Details @"
 Runs DISM /RevertPendingActions to undo in-progress servicing operations.
 Removes pending update packages found by DISM /Get-Packages.
@@ -9298,10 +9293,7 @@ Runs DISM /StartComponentCleanup only if no pending servicing markers remain.
             }
         }
 
-        if ($SkipComponentCleanup) {
-            Write-Host "Skipping DISM /StartComponentCleanup - the caller only needed the pending transaction cleared." -ForegroundColor DarkGray
-        }
-        elseif ($remainingPendingMarkers.Count -gt 0) {
+        if ($remainingPendingMarkers.Count -gt 0) {
             Write-Warning "Skipping DISM /StartComponentCleanup because pending servicing markers are still present: $($remainingPendingMarkers -join ', ')"
             Write-Host "  This is expected when DISM still reports pending operations. Boot once or rerun -FixPendingUpdates, then run -RepairComponentStore if component cleanup/repair is still needed." -ForegroundColor Yellow
         }
@@ -17360,8 +17352,14 @@ namespace RepairAzVMDisk
         # SFC refuses to touch an image that still has servicing work queued ("there is a
         # system repair pending which requires reboot to complete"), which is exactly the
         # state a VM that failed mid-update is in - so the repair the operator needs is
-        # blocked by the fault they are repairing. Reverting the pending transaction and
-        # retrying once resolves that without them having to discover the sequence.
+        # blocked by the fault they are repairing.
+        #
+        # Clearing that queue is deliberately NOT done here. It means DISM
+        # /RevertPendingActions plus removal of every package in Pending state, which
+        # discards the servicing queue - far wider than the single-file repair that was
+        # asked for, and invisible under -Force because that bypasses the confirmation.
+        # So this reports the blocker and names the switch that clears it, the same way
+        # -RunSFC already does, and the operator decides.
         param(
             [Parameter(Mandatory = $true)][string]$TargetPath,
             [Parameter(Mandatory = $true)][scriptblock]$IsRepaired
@@ -17376,14 +17374,23 @@ namespace RepairAzVMDisk
         $result = Invoke-OfflineSfcScanFile -TargetPath $TargetPath
 
         if ($result.Outcome -eq 'PendingServicing') {
+            $targetLeaf = [System.IO.Path]::GetFileName($TargetPath)
             Write-Warning "  SFC will not run while the image has pending servicing operations."
-            Write-Host "  Reverting the pending transaction first, then retrying SFC once." -ForegroundColor Yellow
-            ClearPendingUpdates -SkipComponentCleanup | Out-Null
-            Write-Host "  Retrying offline SFC..." -ForegroundColor Cyan
-            $result = Invoke-OfflineSfcScanFile -TargetPath $TargetPath
-            if ($result.Outcome -eq 'PendingServicing') {
-                Write-Warning "  SFC still reports pending servicing work. The transaction could not be cleared offline."
+            Write-Host "  Clearing that queue reverts in-progress servicing and removes every pending package," -ForegroundColor Yellow
+            Write-Host "  which is a much wider change than the file repair requested here, so it is not done" -ForegroundColor Yellow
+            Write-Host "  automatically. To continue, run these two steps in order:" -ForegroundColor Yellow
+            Write-Host "    1. Re-run this script with -FixPendingUpdates" -ForegroundColor Yellow
+            Write-Host "    2. Then retry -RepairSystemFile $targetLeaf" -ForegroundColor Yellow
+
+            Write-ActionLog -Event 'OfflineSfcScanFile' -Details @{
+                TargetPath = $TargetPath
+                Outcome    = $result.Outcome
+                ExitCode   = $result.ExitCode
+                Repaired   = $false
+                Skipped    = 'Pending servicing operations block SFC. -FixPendingUpdates was not run on the operator''s behalf.'
             }
+
+            return [PSCustomObject]@{ Attempted = $true; Repaired = $false; Outcome = 'PendingServicing' }
         }
 
         # The message text is English-only and SFC's exit code is not documented, so the
@@ -17792,7 +17799,12 @@ apply a protected Windows system-file ACL/owner baseline.
                 Write-Host "  Falling back to offline SFC - $Reason" -ForegroundColor Yellow
                 $attempt = Repair-OfflineSystemFileWithSfc -TargetPath $targetPath -IsRepaired $testTargetHealthy
                 if (-not $attempt.Repaired) {
-                    & $giveUp 'neither the offline stores nor Windows Resource Protection produced a usable copy'
+                    if ($attempt.Outcome -eq 'PendingServicing') {
+                        & $giveUp 'the offline stores held no usable copy, and Windows Resource Protection is blocked until the pending servicing queue is cleared with -FixPendingUpdates'
+                    }
+                    else {
+                        & $giveUp 'neither the offline stores nor Windows Resource Protection produced a usable copy'
+                    }
                     return $false
                 }
 
