@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.8.3
+        Version: 0.8.4
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -2263,6 +2263,36 @@ exit `$exitCode
             -replace '(?i)^"?[A-Z]:\\', "$drive\"
         if ($resolved -match '^(.+?\.(?:sys|exe|dll))') { $resolved = $Matches[1] }
         return $resolved
+    }
+
+    # Splits a Session Manager SubSystems value into its image path token and the rest of
+    # the command line, then resolves that token against the attached offline disk. The
+    # value is a command line, not a bare path - SubSystems\Windows names csrss.exe and is
+    # followed by SharedSection sizes and the ServerDll list - so only the first token
+    # names a file.
+    function Get-SubsystemImageReference {
+        param([string]$Value)
+
+        $result = [PSCustomObject]@{ Token = ''; Arguments = ''; ResolvedPath = ''; Exists = $false; Size = 0 }
+        if ([string]::IsNullOrWhiteSpace($Value)) { return $result }
+
+        $trimmed = $Value.TrimStart()
+        if ($trimmed.StartsWith('"')) {
+            $closing = $trimmed.IndexOf('"', 1)
+            $result.Token = if ($closing -gt 0) { $trimmed.Substring(0, $closing + 1) } else { $trimmed }
+        }
+        else {
+            $result.Token = ($trimmed -split '\s+', 2)[0]
+        }
+        $result.Arguments = $trimmed.Substring($result.Token.Length)
+
+        $result.ResolvedPath = Resolve-GuestImagePath -ImagePath $result.Token
+        $item = Get-Item -LiteralPath $result.ResolvedPath -Force -ErrorAction SilentlyContinue
+        if ($item -and -not $item.PSIsContainer) {
+            $result.Size = $item.Length
+            $result.Exists = ($item.Length -gt 0)
+        }
+        return $result
     }
 
     function Resolve-DriverBinaryCandidate {
@@ -12659,6 +12689,10 @@ complete recovery.
         #   3. ExcludeFromKnownDlls - Forces the loader to skip the KnownDlls section for listed
         #      DLLs, loading them from the application directory instead. Legitimate uses exist
         #      (app compat shims) but this is also a common DLL hijack/preloading vector.
+        #   4. SubSystems - The Windows value holds the csrss.exe command line that Smss.exe runs
+        #      to start the Win32 subsystem, and Kmode names win32k.sys. These are pointers, so a
+        #      healthy csrss.exe on disk does not make them valid: a value naming a path that does
+        #      not resolve ends the boot in STOP 0xC000021A. Only the image token is rewritten.
         #
         # Decision logic for BootExecute / SetupExecute entries:
         #   - "autocheck autochk *" is the only default BootExecute entry (always kept).
@@ -12783,6 +12817,72 @@ complete recovery.
             }
             else {
                 Write-Host "`n  SetupExecute: (empty - normal)" -ForegroundColor DarkGray
+            }
+
+            # -- SubSystems -------------------------------------------------------
+            # Only the image path token is rewritten. The rest of the command line holds
+            # build- and edition-specific settings (SharedSection sizes, the ServerDll
+            # list), so replacing the whole value with a canonical string would overwrite
+            # working configuration in order to fix a file name.
+            $subsysPath = Join-Path $smPath 'SubSystems'
+            if (Test-Path $subsysPath) {
+                Write-Host "`n  SubSystems:" -ForegroundColor Cyan
+                $subsysKey = Get-Item -LiteralPath $subsysPath -ErrorAction SilentlyContinue
+                $ssProps = Get-ItemProperty $subsysPath -ErrorAction SilentlyContinue
+                $ssExpected = [ordered]@{ 'Windows' = 'csrss.exe'; 'Kmode' = 'win32k.sys' }
+
+                foreach ($ssName in $ssExpected.Keys) {
+                    $ssValue = [string]$ssProps.$ssName
+                    if ([string]::IsNullOrWhiteSpace($ssValue)) {
+                        Write-Host "    [SKIP  ] $ssName is empty - nothing to validate" -ForegroundColor DarkGray
+                        continue
+                    }
+
+                    $ssRef = Get-SubsystemImageReference -Value $ssValue
+                    if ($ssRef.Exists) {
+                        Write-Host "    [KEEP  ] $ssName -> $($ssRef.Token)" -ForegroundColor Green
+                        continue
+                    }
+
+                    # Broken. Try the directory the value already names with the expected
+                    # file name, then fall back to the canonical System32 location.
+                    $expectedLeaf = $ssExpected[$ssName]
+                    $candidates = [System.Collections.Generic.List[string]]::new()
+                    $tokenDir = [System.IO.Path]::GetDirectoryName($ssRef.Token.Trim('"'))
+                    if (-not [string]::IsNullOrWhiteSpace($tokenDir)) { $candidates.Add((Join-Path $tokenDir $expectedLeaf)) }
+                    $candidates.Add("%SystemRoot%\system32\$expectedLeaf")
+
+                    $fixedToken = $null
+                    foreach ($candidate in $candidates) {
+                        $candidateRef = Get-SubsystemImageReference -Value $candidate
+                        if ($candidateRef.Exists) { $fixedToken = $candidate; break }
+                    }
+
+                    if (-not $fixedToken) {
+                        Write-Warning "    [FAIL  ] $ssName -> $($ssRef.Token) does not resolve, and no usable $expectedLeaf was found to point it at."
+                        Write-Host "             Restore the binary first, then re-run: -RepairSystemFile $expectedLeaf" -ForegroundColor Yellow
+                        continue
+                    }
+
+                    $newValue = $fixedToken + $ssRef.Arguments
+                    $ssKind = 'ExpandString'
+                    if ($subsysKey) {
+                        try { $ssKind = [string]$subsysKey.GetValueKind($ssName) } catch { $ssKind = 'ExpandString' }
+                    }
+
+                    Write-Host "    [FIX   ] $ssName -> $($ssRef.Token) is missing or empty (resolved to $($ssRef.ResolvedPath))" -ForegroundColor Red
+                    Write-Host "             Repointing to $fixedToken and keeping the existing arguments." -ForegroundColor Yellow
+                    Write-ActionLog -Event 'SessionManagerSubsystemRepaired' -Details @{
+                        ValueName = $ssName
+                        OldValue  = $ssValue
+                        NewValue  = $newValue
+                        Expected  = $expectedLeaf
+                        ValueKind = $ssKind
+                        Reason    = 'DanglingSubsystemImage'
+                    }
+                    Set-ItemProperty-Logged -Path $subsysPath -Name $ssName -Value $newValue -Type $ssKind -Force
+                    $anyChanges = $true
+                }
             }
 
             # -- ExcludeFromKnownDlls ---------------------------------------------
@@ -13377,6 +13477,7 @@ complete recovery.
         $sevSetupExecDangling = 2   # SetupExecute entry references missing native binary
         $sevSetupExecPresent = 1   # SetupExecute is non-empty (unusual outside servicing)
         $sevKnownDllExclude = 1   # ExcludeFromKnownDlls populated (DLL hijack vector or app compat)
+        $sevSubsystemDangling = 2   # SubSystems\Windows or Kmode names an image that is missing or 0-byte (STOP 0xC000021A)
 
         # Critical boot files (on-disk binary presence checks)
         $sevCriticalBootFileMissing = 2   # Core boot binary (winload/bootmgr/hal/ntdll/kernel32) missing or 0-byte
@@ -13529,6 +13630,16 @@ complete recovery.
             else { & $emit 'Crash' 'OK' 'No minidump files' }
         }
         else { & $emit 'Crash' 'OK' 'No Minidump folder' }
+
+        # A complete/kernel dump is written to a single file rather than the Minidump
+        # folder, so a guest that bugchecks with CrashDumpEnabled=1 leaves this behind and
+        # nothing in Minidump. Reporting only the folder made a crashed guest look clean.
+        $memoryDumpPath = Join-Path $script:WinDriveLetter 'Windows\MEMORY.DMP'
+        $memoryDumpItem = Get-Item -LiteralPath $memoryDumpPath -Force -ErrorAction SilentlyContinue
+        if ($memoryDumpItem -and -not $memoryDumpItem.PSIsContainer -and $memoryDumpItem.Length -gt 0) {
+            $memoryDumpMB = [math]::Round($memoryDumpItem.Length / 1MB, 1)
+            & $emit 'Crash' (& $toSev $sevCrashMinidumps) "MEMORY.DMP present ($memoryDumpMB MB, written $($memoryDumpItem.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))) - the guest bugchecked; collect it for the stop code" "-CollectMinidumps"
+        }
 
         $ntbtlogpath = Join-Path $script:WinDriveLetter 'Windows\ntbtlog.txt'
         if (Test-Path $ntbtlogpath) {
@@ -14869,6 +14980,47 @@ complete recovery.
                     $knownDllExcl = @($smProps.ExcludeFromKnownDlls | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
                     if ($knownDllExcl.Count -gt 0) {
                         & $emit 'Security' (& $toSev $sevKnownDllExclude) "ExcludeFromKnownDlls has $($knownDllExcl.Count) entry/entries (app compat or DLL hijack vector): $($knownDllExcl -join ', ')"
+                    }
+
+                    # -- SubSystems ---------------------------------------------------
+                    # Smss.exe starts the Win32 subsystem from the command line held in
+                    # SubSystems\Windows, and Kmode names its kernel-mode half. These are
+                    # registry pointers, so an intact, signed csrss.exe sitting in System32
+                    # proves nothing: if the value names a path that does not resolve, smss
+                    # cannot start the subsystem and the guest bugchecks with STOP
+                    # 0xC000021A before anything reaches the event log. Only the first token
+                    # is a file - the rest is SharedSection sizes and the ServerDll list.
+                    $subsysPath = Join-Path $smPath 'SubSystems'
+                    if (Test-Path $subsysPath) {
+                        $ssProps = Get-ItemProperty $subsysPath -ErrorAction SilentlyContinue
+                        $ssDangling = @()
+                        $ssUnsigned = @()
+                        $ssChecked = 0
+                        foreach ($ssName in @('Windows', 'Kmode')) {
+                            $ssValue = [string]$ssProps.$ssName
+                            # An empty Debug/Optional value is normal, and Required lists
+                            # 'Debug' on a healthy server, so absence is never a finding.
+                            if ([string]::IsNullOrWhiteSpace($ssValue)) { continue }
+                            $ssRef = Get-SubsystemImageReference -Value $ssValue
+                            if ([string]::IsNullOrWhiteSpace($ssRef.ResolvedPath)) { continue }
+                            $ssChecked++
+                            if (-not $ssRef.Exists) {
+                                $ssDangling += "$ssName -> $($ssRef.Token)"
+                            }
+                            else {
+                                $ssSig = Test-MicrosoftSignature -FilePath $ssRef.ResolvedPath
+                                if (-not $ssSig.IsAcceptableMicrosoft) { $ssUnsigned += "$ssName -> $($ssRef.Token) ($(Get-TrustStateDescription -Signature $ssSig))" }
+                            }
+                        }
+                        if ($ssDangling.Count -gt 0) {
+                            & $emit 'Boot' (& $toSev $sevSubsystemDangling) "Session Manager SubSystems names $($ssDangling.Count) image(s) that are missing or 0 bytes - smss.exe cannot start the subsystem and the guest bugchecks with STOP 0xC000021A: $($ssDangling -join '; ')" "-FixSessionManager"
+                        }
+                        elseif ($ssUnsigned.Count -gt 0) {
+                            & $emit 'Security' (& $toSev $sevBinarySignatureBad) "Session Manager SubSystems names $($ssUnsigned.Count) image(s) that failed trust validation (possible tampering): $($ssUnsigned -join '; ')" "-FixSessionManager"
+                        }
+                        elseif ($ssChecked -gt 0) {
+                            & $emit 'Boot' 'OK' "Session Manager SubSystems images resolve and are Microsoft-signed ($ssChecked checked)"
+                        }
                     }
                 }
 
@@ -21238,7 +21390,9 @@ PARAMETERS:
   -RemoveSafeModeFlag    Remove Safe Mode flag
   -TryLGKC               Switch boot to Last Known Good Control Set
   -TryOtherBootConfig    Switch boot to a different HKLM ControlSet
-  -FixSessionManager     Remove BootExecute/SetupExecute entries with missing binaries (black screen fix)
+  -FixSessionManager     Repair Session Manager: remove BootExecute/SetupExecute entries with missing
+                         binaries, and repoint SubSystems Windows/Kmode at a real csrss.exe/win32k.sys
+                         (black screen and STOP 0xC000021A fix)
   -TrySafeMode           Set boot to Safe Mode (minimal)
 
 --- DISK & FILESYSTEM ---------------------------------------------------------
