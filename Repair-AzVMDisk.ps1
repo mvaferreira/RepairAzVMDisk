@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.8.4
+        Version: 0.8.5
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -268,7 +268,7 @@ param (
     [Parameter(ParameterSetName = 'Repair')][switch]$DisableTestSigning,
     [Parameter(ParameterSetName = 'Repair')][switch]$CheckDiskHealth,
     [Parameter(ParameterSetName = 'Repair')][switch]$CollectEventLogs,
-    [Parameter(ParameterSetName = 'Repair')][switch]$CollectMinidumps,
+    [Parameter(ParameterSetName = 'Repair')][switch]$CollectCrashDumps,
     [Parameter(ParameterSetName = 'Repair')][switch]$AnalyzeCriticalBootFiles,
     [Parameter(ParameterSetName = 'Repair')][switch]$SkipCatalogVerification,
     [Parameter(ParameterSetName = 'Repair')][string[]]$RepairSystemFile = @(),
@@ -2789,9 +2789,25 @@ namespace RepairAzVMDisk
         if (-not (Test-Path -LiteralPath $FilePath) -or -not $item -or $item.PSIsContainer) { return $result }
 
         # Extensions that must always resolve to a parseable PE image. Anything here
-        # that is not a PE is damaged; extensionless boot stubs are deliberately absent.
+        # that is not a PE is damaged.
         $peImageExtensions = @('.sys', '.dll', '.exe', '.efi', '.mui', '.ocx', '.cpl', '.drv')
+
+        # The exception to that rule. The boot manager ships as a compressed stub rather
+        # than a PE image on some builds, and unlike the extensionless bootmgr it does
+        # carry a PE extension, so judging it by extension alone reports a healthy file
+        # as corruption. These leaf names are therefore exempt. winload.efi and
+        # winresume.efi are always real PE images and stay covered.
+        #
+        # The cost is that a corrupt boot manager is tolerated as NotVerifiable instead
+        # of being reported Invalid - exactly the treatment bootmgr has always had, and
+        # for the same reason: a genuine compressed stub and a damaged one are not
+        # distinguishable here without decompressing them. A missing or zero-byte file
+        # is still caught earlier, and -AnalyzeCriticalBootFiles covers presence
+        # independently. Guessing the other way is worse: a false corruption verdict on
+        # a boot file sends the operator to replace something that was never broken.
+        $compressedBootStubNames = @('bootmgr', 'bootmgr.efi', 'bootmgfw.efi')
         $fileExtension = [System.IO.Path]::GetExtension($FilePath).ToLowerInvariant()
+        $fileLeafName = [System.IO.Path]::GetFileName($FilePath).ToLowerInvariant()
 
         # Trust evaluation is pure with respect to (path, size, mtime), and several
         # report sections inspect the same binaries. Cache to keep large reports fast.
@@ -2884,12 +2900,15 @@ namespace RepairAzVMDisk
                 $result.Subject = $result.VendorHint
             }
             elseif ($peImageExtensions -contains $fileExtension -and
+                $compressedBootStubNames -notcontains $fileLeafName -and
                 -not (Get-PortableExecutableInfo -FilePath $FilePath).IsPortableExecutable) {
                 # A .sys/.dll/.exe/.efi whose content is in no guest catalog and which
                 # cannot even be parsed as a PE image. Overwritten headers destroy the
                 # version resource too, so the Microsoft vendor hint above is gone and
                 # the file would otherwise fall into the compressed-stub tolerance and
-                # be reported as acceptable. It is corruption, not a format quirk.
+                # be reported as acceptable. It is corruption, not a format quirk - the
+                # boot manager, the one file legitimately shipped as a non-PE stub under
+                # a PE extension, is excluded by leaf name above.
                 $result.TrustState = 'Invalid'
                 $result.IsHardFailure = $true
                 $result.Status = 'NotPortableExecutable'
@@ -2897,8 +2916,9 @@ namespace RepairAzVMDisk
             }
             elseif ($sig.Status -in @('UnknownError', 'NotSupportedFileFormat')) {
                 # Compressed boot stubs (bootmgr, and bootmgfw.efi on some builds) are
-                # not standard PE images  -  inconclusive rather than suspect. They carry
-                # no PE extension, so the corruption branch above does not catch them.
+                # not standard PE images  -  inconclusive rather than suspect. The
+                # corruption branch above skips them by leaf name, because bootmgfw.efi
+                # does carry a PE extension and would otherwise be judged by it.
                 $result.TrustState = 'NotVerifiable'
                 $result.Status = 'NotVerifiable'
             }
@@ -13638,7 +13658,7 @@ complete recovery.
         $memoryDumpItem = Get-Item -LiteralPath $memoryDumpPath -Force -ErrorAction SilentlyContinue
         if ($memoryDumpItem -and -not $memoryDumpItem.PSIsContainer -and $memoryDumpItem.Length -gt 0) {
             $memoryDumpMB = [math]::Round($memoryDumpItem.Length / 1MB, 1)
-            & $emit 'Crash' (& $toSev $sevCrashMinidumps) "MEMORY.DMP present ($memoryDumpMB MB, written $($memoryDumpItem.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))) - the guest bugchecked; collect it for the stop code" "-CollectMinidumps"
+            & $emit 'Crash' (& $toSev $sevCrashMinidumps) "MEMORY.DMP present ($memoryDumpMB MB, written $($memoryDumpItem.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))) - the guest bugchecked; collect it for the stop code" "-CollectCrashDumps"
         }
 
         $ntbtlogpath = Join-Path $script:WinDriveLetter 'Windows\ntbtlog.txt'
@@ -16195,9 +16215,13 @@ del /F C:\temp\resetuserrights.cmd > NUL
         }
     }
 
-    function CollectMinidumps {
+    function CollectCrashDumps {
+        # Named for what it collects. A small memory dump lands in Windows\Minidump, but
+        # kernel, complete and automatic dumps - the Server default - are written to the
+        # single file Windows\MEMORY.DMP instead, so collecting only the folder would
+        # miss the dump on most bugchecked guests.
         $destBase = if (Test-Path "C:\temp") { "C:\temp" } else { New-Item "C:\temp" -ItemType Directory -Force | Select-Object -ExpandProperty FullName }
-        $destFolder = Join-Path $destBase "Minidumps_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+        $destFolder = Join-Path $destBase "CrashDumps_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
 
         Write-Host "Collecting crash dump files from guest disk..." -ForegroundColor Yellow
 
@@ -17512,6 +17536,14 @@ namespace RepairAzVMDisk
         # asked for, and invisible under -Force because that bypasses the confirmation.
         # So this reports the blocker and names the switch that clears it, the same way
         # -RunSFC already does, and the operator decides.
+        #
+        # Note that a repair made here is one-way. The candidate path backs the original
+        # up before overwriting it and can put it back; SFC writes in place and leaves
+        # nothing to restore from. That is acceptable because WRP only installs content
+        # it has verified against the guest catalogs, and this runs only after the file
+        # has already failed validation - but it is a real difference in blast radius,
+        # so it is stated on the console and recorded in the action log rather than left
+        # for the operator to discover.
         param(
             [Parameter(Mandatory = $true)][string]$TargetPath,
             [Parameter(Mandatory = $true)][scriptblock]$IsRepaired
@@ -17962,6 +17994,9 @@ apply a protected Windows system-file ACL/owner baseline.
 
                 $repairedItem = Get-Item -LiteralPath $targetPath -Force
                 Write-Host "  [OK] Repaired by offline SFC: $targetPath ($("{0:N0}" -f $repairedItem.Length) bytes)" -ForegroundColor Green
+                Write-Host "  Note: this path takes no backup, so it cannot be rolled back. Windows Resource" -ForegroundColor DarkGray
+                Write-Host "  Protection only installs content it has verified against the guest catalogs, and" -ForegroundColor DarkGray
+                Write-Host "  the file it overwrote had already failed validation." -ForegroundColor DarkGray
                 Write-ActionLog -Event 'SystemFileReplaced' -Details @{
                     FileName          = $fileName
                     TargetPath        = $targetPath
@@ -17972,6 +18007,9 @@ apply a protected Windows system-file ACL/owner baseline.
                     GuestArchitecture = $guestArchitecture
                     PreviousState     = $stateDesc
                     FallbackReason    = $Reason
+                    BackupPath        = $null
+                    Reversible        = $false
+                    BackupSkipReason  = 'Windows Resource Protection writes the file in place; the overwritten copy had already failed validation.'
                 }
                 return $true
             }
@@ -21269,7 +21307,7 @@ No destructive file or registry cleanup is performed.
             [switch]$DisableTestSigning,
             [switch]$CheckDiskHealth,
             [switch]$CollectEventLogs,
-            [switch]$CollectMinidumps,
+            [switch]$CollectCrashDumps,
             [switch]$AnalyzeCriticalBootFiles,
             [string[]]$RepairSystemFile = @(),
             [switch]$AnalyzeSyntheticDrivers,
@@ -21350,7 +21388,7 @@ PARAMETERS:
   -CheckDiskHealth       Show disk/partition/filesystem health report
   -CheckRDPPolicies      Show current RDP auth policy values
   -CollectEventLogs      Copy guest event logs and crash dumps to C:\temp on the host
-  -CollectMinidumps      Copy minidumps, MEMORY.DMP and LiveKernelReports to C:\temp on the host
+  -CollectCrashDumps     Copy Minidump, MEMORY.DMP and LiveKernelReports to C:\temp on the host
   -AnalyzeCriticalBootFiles  Validate presence of critical boot/system binaries used during startup
   -AnalyzeSyntheticDrivers  Validate Azure/Hyper-V synthetic drivers (vmbus/storvsc/netvsc)
   -AnalyzeProxyState     Show machine proxy/PAC settings that may block remote management
@@ -21564,7 +21602,7 @@ AVAILABLE DISKS:
 
         # Initialize logging and target (resolve VM/disk, bring disk online, detect partitions)
         # Determine if any write/repair action was requested (exclude pure read-only switches)
-        $readOnlySwitches = @('SysCheck', 'CheckDiskHealth', 'ScanNetBindings', 'CheckRDPPolicies', 'CollectEventLogs', 'CollectMinidumps', 'ShowLastSession', 'GetServicesReport', 'GetCatalogStoreReport', 'GetAppLockerReport', 'ListInstalledUpdates', 'ListStartupPrograms', 'AnalyzeCriticalBootFiles', 'AnalyzeSyntheticDrivers', 'AnalyzeProxyState', 'GetBootPathReport', 'AnalyzeBcdConsistency', 'AnalyzeComponentStore', 'AnalyzeServicingState', 'AnalyzeRecentChanges', 'AnalyzeDomainTrustState')
+        $readOnlySwitches = @('SysCheck', 'CheckDiskHealth', 'ScanNetBindings', 'CheckRDPPolicies', 'CollectEventLogs', 'CollectCrashDumps', 'ShowLastSession', 'GetServicesReport', 'GetCatalogStoreReport', 'GetAppLockerReport', 'ListInstalledUpdates', 'ListStartupPrograms', 'AnalyzeCriticalBootFiles', 'AnalyzeSyntheticDrivers', 'AnalyzeProxyState', 'GetBootPathReport', 'AnalyzeBcdConsistency', 'AnalyzeComponentStore', 'AnalyzeServicingState', 'AnalyzeRecentChanges', 'AnalyzeDomainTrustState')
         $hasRepairAction = $PSBoundParameters.Keys | Where-Object { $readOnlySwitches -notcontains $_ -and $_ -notin @('VMName', 'DiskNumber', 'Force', 'LeaveDiskOnline', 'DriveLetter', 'RepairSource', 'CodeIntegrityPolicySourcePath', 'RepairSystemFileSource', 'SkipOfflineSfc', 'IncludeServices', 'IssuesOnly', 'KeepDefaultFilters', 'DriverStartType', 'RecentChangeDays', 'LoadHive', 'UnloadHive', 'TransactionLogScope') }
         if ($hasRepairAction) {
             Write-Host "  Tip: if you haven't already, a VM snapshot or disk backup before making changes is always a safe starting point." -ForegroundColor DarkGray
@@ -21675,7 +21713,7 @@ AVAILABLE DISKS:
             if ($FixRDPAuth) { SetRdpAuthPolicyOptimal }
             if ($DisableDriverVerifier) { DisableDriverVerifier }
             if ($PSBoundParameters.ContainsKey('EnableDriverVerifier')) { EnableDriverVerifier -DriverList $EnableDriverVerifier }
-            if ($CollectMinidumps) { CollectMinidumps }
+            if ($CollectCrashDumps) { CollectCrashDumps }
             if ($ResetGroupPolicy) { ResetGroupPolicy }
             if ($FixWinlogon) { FixWinlogon }
             if ($FixProfileLoad) { FixProfileLoad }
