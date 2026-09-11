@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.8.5
+        Version: 0.8.6
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -3065,6 +3065,60 @@ namespace RepairAzVMDisk
         }
 
         return [pscustomobject]$result
+    }
+
+    function Test-BootPayloadPeParity {
+        # Decides whether a boot payload on the EFI System Partition is damaged, without
+        # needing to know what a compressed boot stub looks like.
+        #
+        # The boot manager is the one file this script cannot judge by format alone: on
+        # most builds it is a PE image, on some it is a compressed stub, and a stub is
+        # not distinguishable from garbage here. So do not judge it alone. The copy
+        # staged under Windows\Boot\EFI is the same file from the same build, so the two
+        # are always the same kind of file on a healthy disk. If exactly one of them
+        # parses as a PE image, that disagreement is the damage - and the test stays
+        # quiet on a stub build, where neither parses.
+        param(
+            [Parameter(Mandatory = $true)][string]$TargetPath,
+            [Parameter(Mandatory = $true)][string]$SourcePath
+        )
+
+        $verdict = [PSCustomObject]@{
+            Conclusive = $false
+            Damaged    = $false
+            TargetIsPe = $false
+            SourceIsPe = $false
+            Suspect    = ''
+            Reason     = ''
+        }
+
+        $targetItem = Get-Item -LiteralPath $TargetPath -Force -ErrorAction SilentlyContinue
+        if (-not $targetItem -or $targetItem.PSIsContainer -or $targetItem.Length -eq 0) {
+            $verdict.Reason = 'target is missing or empty (already reported separately)'
+            return $verdict
+        }
+        $sourceItem = Get-Item -LiteralPath $SourcePath -Force -ErrorAction SilentlyContinue
+        if (-not $sourceItem -or $sourceItem.PSIsContainer -or $sourceItem.Length -eq 0) {
+            $verdict.Reason = 'no usable Windows-staged copy to compare against'
+            return $verdict
+        }
+
+        $verdict.TargetIsPe = [bool](Get-PortableExecutableInfo -FilePath $TargetPath).IsPortableExecutable
+        $verdict.SourceIsPe = [bool](Get-PortableExecutableInfo -FilePath $SourcePath).IsPortableExecutable
+        $verdict.Conclusive = $true
+        $verdict.Damaged = ($verdict.TargetIsPe -ne $verdict.SourceIsPe)
+        if (-not $verdict.Damaged) {
+            $verdict.Reason = 'both copies are the same kind of file'
+        }
+        elseif ($verdict.SourceIsPe) {
+            $verdict.Suspect = 'Target'
+            $verdict.Reason = "the EFI System Partition copy cannot be parsed as a PE image, while the Windows-staged copy at $SourcePath can"
+        }
+        else {
+            $verdict.Suspect = 'Source'
+            $verdict.Reason = "the Windows-staged copy at $SourcePath cannot be parsed as a PE image, while the EFI System Partition copy can"
+        }
+        return $verdict
     }
 
     function Test-PortableExecutableArchitectureCompatible {
@@ -13932,6 +13986,10 @@ complete recovery.
         if ($script:VMGen -eq 2) {
             $efiBootmgfw = Join-Path $script:BootDriveLetter 'EFI\Microsoft\Boot\bootmgfw.efi'
             $efiBootx64 = Join-Path $script:BootDriveLetter 'EFI\Boot\bootx64.efi'
+            # Both ESP loaders are copies of the same Windows-staged file, which is the
+            # reference Test-BootPayloadPeParity compares them against.
+            $stagedBootmgfw = Join-Path $script:WinDriveLetter 'Windows\Boot\EFI\bootmgfw.efi'
+            $espFix = '-FixSecureBootCodeIntegrity'
 
             if (-not (Test-Path $efiBootmgfw)) {
                 & $emit 'BCD' (& $toSev $sevBootmgfwMissing) "bootmgfw.efi missing from EFI System Partition ($efiBootmgfw) - UEFI firmware cannot start Windows Boot Manager" $bcdFix
@@ -13940,8 +13998,17 @@ complete recovery.
                 & $emit 'BCD' (& $toSev $sevBootmgfwMissing) "bootmgfw.efi is 0 bytes (corrupt) on EFI System Partition ($efiBootmgfw) - UEFI firmware cannot start Windows Boot Manager" $bcdFix
             }
             else {
+                $mgfwParity = Test-BootPayloadPeParity -TargetPath $efiBootmgfw -SourcePath $stagedBootmgfw
                 $efiMgfwSig = Test-MicrosoftSignature -FilePath $efiBootmgfw
-                if (-not $efiMgfwSig.IsAcceptableMicrosoft) {
+                if ($mgfwParity.Damaged) {
+                    # Whichever copy is the odd one out, one of them is damaged. Repair
+                    # the ESP by recopying the staged file; repair a damaged staged file
+                    # from the component store first, or the recopy has nothing good to
+                    # copy from.
+                    $mgfwFix = if ($mgfwParity.Suspect -eq 'Source') { '-RepairSystemFile bootmgfw.efi' } else { $espFix }
+                    & $emit 'BCD' (& $toSev $sevBootmgfwMissing) "bootmgfw.efi is damaged - $($mgfwParity.Reason). UEFI firmware may be unable to start Windows Boot Manager" $mgfwFix
+                }
+                elseif (-not $efiMgfwSig.IsAcceptableMicrosoft) {
                     $mgfwSev = if ($efiMgfwSig.IsHardFailure) { 'CRIT' } else { & $toSev $sevBinarySignatureBad }
                     & $emit 'Security' $mgfwSev "bootmgfw.efi failed trust validation - $(Get-TrustStateDescription -Signature $efiMgfwSig)" $bcdFix
                 }
@@ -13956,8 +14023,13 @@ complete recovery.
                 & $emit 'BCD' (& $toSev $sevBootx64Missing) "EFI\\Boot\\bootx64.efi is 0 bytes (corrupt) - some UEFI firmware relies on this path" $bcdFix
             }
             else {
+                $x64Parity = Test-BootPayloadPeParity -TargetPath $efiBootx64 -SourcePath $stagedBootmgfw
                 $efiX64Sig = Test-MicrosoftSignature -FilePath $efiBootx64
-                if (-not $efiX64Sig.IsAcceptableMicrosoft) {
+                if ($x64Parity.Damaged) {
+                    $x64Fix = if ($x64Parity.Suspect -eq 'Source') { '-RepairSystemFile bootmgfw.efi' } else { $espFix }
+                    & $emit 'BCD' (& $toSev $sevBootx64Missing) "EFI\\Boot\\bootx64.efi is damaged - $($x64Parity.Reason). Some UEFI firmware relies on this path" $x64Fix
+                }
+                elseif (-not $efiX64Sig.IsAcceptableMicrosoft) {
                     $x64Sev = if ($efiX64Sig.IsHardFailure) { 'CRIT' } else { & $toSev $sevBinarySignatureBad }
                     & $emit 'Security' $x64Sev "bootx64.efi failed trust validation - $(Get-TrustStateDescription -Signature $efiX64Sig)" $bcdFix
                 }
@@ -17128,8 +17200,8 @@ Default and LastKnownGood control sets are not modified.
             Write-Host "`nSecure Boot payload comparison (advisory):" -ForegroundColor Cyan
 
             $secureBootPayloadPairs = @(
-                @{ Label = 'bootmgfw.efi'; Source = (Join-Path $script:WinDriveLetter 'Windows\Boot\EFI\bootmgfw.efi'); Target = (Join-Path $script:BootDriveLetter 'EFI\Microsoft\Boot\bootmgfw.efi'); TargetRole = 'EFI\Microsoft\Boot' }
-                @{ Label = 'bootx64.efi fallback loader'; Source = (Join-Path $script:WinDriveLetter 'Windows\Boot\EFI\bootmgfw.efi'); Target = (Join-Path $script:BootDriveLetter 'EFI\Boot\bootx64.efi'); TargetRole = 'EFI\Boot' }
+                @{ Label = 'bootmgfw.efi'; Source = (Join-Path $script:WinDriveLetter 'Windows\Boot\EFI\bootmgfw.efi'); Target = (Join-Path $script:BootDriveLetter 'EFI\Microsoft\Boot\bootmgfw.efi'); TargetRole = 'EFI\Microsoft\Boot'; ComparePeFormat = $true }
+                @{ Label = 'bootx64.efi fallback loader'; Source = (Join-Path $script:WinDriveLetter 'Windows\Boot\EFI\bootmgfw.efi'); Target = (Join-Path $script:BootDriveLetter 'EFI\Boot\bootx64.efi'); TargetRole = 'EFI\Boot'; ComparePeFormat = $true }
                 @{ Label = 'SKUSiPolicy.p7b'; Source = (Join-Path $script:WinDriveLetter 'Windows\System32\SecureBootUpdates\SKUSiPolicy.p7b'); Target = (Join-Path $script:BootDriveLetter 'EFI\Microsoft\Boot\SKUSiPolicy.p7b'); TargetRole = 'EFI\Microsoft\Boot' }
             )
 
@@ -17156,9 +17228,21 @@ Default and LastKnownGood control sets are not modified.
                 else {
                     $sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $pair.Source -ErrorAction SilentlyContinue).Hash
                     $targetHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $pair.Target -ErrorAction SilentlyContinue).Hash
+                    $parity = if ($pair.ComparePeFormat) {
+                        Test-BootPayloadPeParity -TargetPath $pair.Target -SourcePath $pair.Source
+                    }
+                    else { $null }
+
                     if (-not $sourceHash -or -not $targetHash) {
                         $status = 'WARN'
                         $detail = 'Could not hash source or ESP target.'
+                    }
+                    elseif ($parity -and $parity.Damaged) {
+                        # A differing hash is normal; differing file *format* is not. Both
+                        # copies come from the same build, so only damage makes one of
+                        # them stop being a PE image.
+                        $status = 'WARN'
+                        $detail = "ESP target is damaged - $($parity.Reason)."
                     }
                     elseif ($sourceItem.Length -eq $targetItem.Length -and $sourceHash -eq $targetHash) {
                         $detail = 'ESP target matches Windows-staged source.'
@@ -17185,7 +17269,7 @@ Default and LastKnownGood control sets are not modified.
                 Write-Host "If the VM fails with winload.efi / Code Integrity error 0xc0430001, run -FixSecureBootCodeIntegrity." -ForegroundColor Yellow
             }
             else {
-                Write-Host "Secure Boot payload comparison found no suspicious zero-byte or unreadable payloads." -ForegroundColor Green
+                Write-Host "Secure Boot payload comparison found no zero-byte, unreadable or format-mismatched payloads." -ForegroundColor Green
             }
         }
 
