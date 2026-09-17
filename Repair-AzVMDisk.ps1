@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.8.6
+        Version: 0.8.7
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -49,6 +49,35 @@
 
     .PARAMETER VMName
         Name of the Hyper-V VM whose disk should be attached automatically. Use instead of -DiskNumber.
+
+    .PARAMETER TryLKGC
+        Selects the existing ControlSet recorded in offline Select\LastKnownGood, rather
+        than guessing a control set number. This is offline selection of the configuration
+        used by Windows' Last Known Good option, not a rollback of files or updates.
+        Backs up Select and sets Current and Default to that target for the next normal
+        boot. Failed, LastKnownGood and all ControlSet contents are preserved.
+        Matching selectors cause no writes. The legacy spelling -TryLGKC remains an alias.
+
+    .PARAMETER TryOtherBootConfig
+        Cycles through existing ControlSetNNN keys in numeric order, starting after Current
+        and wrapping to the first: 001 -> 002 -> 003 -> 001 when those sets exist.
+        Gaps are skipped. Backs up Select and updates Current and Default together.
+        Refuses an invalid Current selection or a missing alternate without changing it.
+        Failed, LastKnownGood and all ControlSet contents are preserved.
+
+    .PARAMETER FixRpcHostSplit
+        Repairs a confirmed RpcSs/RpcEptMapper service-host command-line mismatch in the
+        active offline Current ControlSet. Inconsistent executable-path quoting can put
+        these services in separate processes, causing local RPC/COM initialization failures,
+        service-start timeouts, and a black screen before sign-in.
+
+        Copies RpcSs ImagePath to RpcEptMapper only when RpcSs retains its standard
+        expandable svchost command and both services identify the same executable and
+        arguments with the expected shared-process configuration. Exports the RpcEptMapper
+        service key before the single logged REG_EXPAND_SZ write and verifies the result.
+        Matching paths are left unchanged. Unsupported configurations are refused, even
+        with -Force. RpcSs, service protection arguments, TLS settings and Select values
+        are not changed; other ControlSets are not modified. Cold-boot the guest afterwards.
 
     .PARAMETER FixFirewallDebugLoopbackApps
         Archives the active offline ControlSet value
@@ -151,6 +180,18 @@
         PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -SysCheck
 
     .EXAMPLE
+        # Repair the RPC service-host path mismatch reported by -SysCheck
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixRpcHostSplit
+
+    .EXAMPLE
+        # Select the control set Windows recorded as Last Known Good
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -TryLKGC
+
+    .EXAMPLE
+        # Select the next existing control set; repeat to cycle and wrap around
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -TryOtherBootConfig
+
+    .EXAMPLE
         # Preserve and disable the duplicated Windows Firewall loopback-app value
         PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixFirewallDebugLoopbackApps
 
@@ -213,7 +254,7 @@ param (
     [Parameter(ParameterSetName = 'Repair')][switch]$RecreateBootPartition,
     [Parameter(ParameterSetName = 'Repair')][switch]$RepairComponentStore,
     [Parameter(ParameterSetName = 'Repair')][switch]$AnalyzeComponentStore,
-    [Parameter(ParameterSetName = 'Repair')][switch]$TryLGKC,
+    [Parameter(ParameterSetName = 'Repair')][Alias('TryLGKC')][switch]$TryLKGC,
     [Parameter(ParameterSetName = 'Repair')][switch]$TryOtherBootConfig,
     [Parameter(ParameterSetName = 'Repair')][switch]$TrySafeMode,
     [Parameter(ParameterSetName = 'Repair')][switch]$RemoveSafeModeFlag,
@@ -259,6 +300,7 @@ param (
     [Parameter(ParameterSetName = 'Repair')][switch]$InstallAzureVMAgent,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixDeviceFilters,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixSessionManager,
+    [Parameter(ParameterSetName = 'Repair')][switch]$FixRpcHostSplit,
     [Parameter(ParameterSetName = 'Repair')][switch]$CopyACPISettings,
     [Parameter(ParameterSetName = 'Repair')][switch]$ScanNetBindings,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixNetBindings,
@@ -369,7 +411,7 @@ dynamicparam {
         [pscustomobject]@{ Left = 'EnableTestSigning';       Right = 'DisableTestSigning' }
         [pscustomobject]@{ Left = 'DisableDriverVerifier';   Right = 'EnableDriverVerifier' }
         [pscustomobject]@{ Left = 'TrySafeMode';             Right = 'RemoveSafeModeFlag' }
-        [pscustomobject]@{ Left = 'TryLGKC';                 Right = 'TryOtherBootConfig' }
+        [pscustomobject]@{ Left = 'TryLKGC';                 Right = 'TryOtherBootConfig' }
         [pscustomobject]@{ Left = 'DisableLsaProtection';    Right = 'EnableCredentialGuard' }
     )
     if ($hasSubParameterParent) {
@@ -3482,6 +3524,113 @@ namespace RepairAzVMDisk
         return (Split-Path -Path (Get-SystemRootPath) -Leaf)
     }
 
+    function Get-RpcHostSplitState {
+        # SYSTEM and SOFTWARE must already be mounted through Invoke-WithHive.
+        $csName = Get-CurrentOfflineControlSetName
+        $selectKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('BROKENSYSTEM\Select')
+        if ($null -eq $selectKey) { throw 'Cannot assess RPC hosting: offline Select key is missing.' }
+        try {
+            $current = $selectKey.GetValue('Current', $null)
+            if ($current -isnot [int] -or $current -lt 1 -or $current -gt 999 -or
+                $csName -cne ('ControlSet{0:d3}' -f $current)) {
+                throw 'Cannot assess RPC hosting: the active offline Current ControlSet is not explicit and valid.'
+            }
+        }
+        finally { $selectKey.Dispose() }
+
+        $state = [PSCustomObject]@{
+            ControlSet = $csName
+            RpcSs = $null
+            RpcEptMapper = $null
+            HasMismatch = $false
+            CanRepair = $false
+            Reason = ''
+        }
+        foreach ($name in @('RpcSs', 'RpcEptMapper')) {
+            $subKey = "BROKENSYSTEM\$csName\Services\$name"
+            $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($subKey)
+            if ($null -eq $key) { throw "Cannot assess RPC hosting: offline $name service key is missing." }
+            try {
+                $rawPath = $key.GetValue('ImagePath', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                if ($rawPath -isnot [string] -or [string]::IsNullOrWhiteSpace($rawPath)) {
+                    throw "Cannot assess RPC hosting: $name ImagePath is missing or is not a non-empty string."
+                }
+                $kind = $key.GetValueKind('ImagePath')
+                if ($kind -ne [Microsoft.Win32.RegistryValueKind]::ExpandString) {
+                    throw "Cannot assess RPC hosting safely: $name ImagePath is $kind, not REG_EXPAND_SZ."
+                }
+                $state.$name = [PSCustomObject]@{
+                    Path = "HKLM:\$subKey"
+                    ImagePath = $rawPath
+                    ValueType = $kind.ToString()
+                    EffectiveImagePath = ''
+                    Type = $key.GetValue('Type', $null)
+                    Start = $key.GetValue('Start', $null)
+                    ObjectName = $key.GetValue('ObjectName', $null)
+                    Group = $key.GetValue('Group', $null)
+                }
+            }
+            finally { $key.Dispose() }
+        }
+
+        $cvKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion')
+        if ($null -eq $cvKey) { throw 'Cannot assess RPC hosting: offline Windows CurrentVersion key is missing.' }
+        try {
+            $guestSystemRoot = $cvKey.GetValue('SystemRoot', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        }
+        finally { $cvKey.Dispose() }
+        if ($guestSystemRoot -isnot [string] -or $guestSystemRoot -notmatch '^[A-Za-z]:\\[^%"]+[^\\]$') {
+            throw 'Cannot assess RPC hosting: offline SystemRoot is not an absolute, unexpanded Windows directory.'
+        }
+
+        foreach ($service in @($state.RpcSs, $state.RpcEptMapper)) {
+            # Use the guest's environment, never the rescue host's. Keep quotes and
+            # whitespace: resolving only the executable would hide this failure.
+            $service.EffectiveImagePath = [regex]::Replace(
+                $service.ImagePath, '(?i)%(SystemRoot|windir|SystemDrive)%',
+                [System.Text.RegularExpressions.MatchEvaluator]{
+                    param($match)
+                    if ($match.Groups[1].Value -ieq 'SystemDrive') { return $guestSystemRoot.Substring(0, 2) }
+                    return $guestSystemRoot
+                })
+            if ($service.EffectiveImagePath.Contains('%')) {
+                throw 'Cannot assess RPC hosting safely: ImagePath contains an unresolved guest environment variable.'
+            }
+        }
+        $state.HasMismatch = -not [string]::Equals(
+            $state.RpcSs.EffectiveImagePath, $state.RpcEptMapper.EffectiveImagePath,
+            [StringComparison]::OrdinalIgnoreCase)
+        if (-not $state.HasMismatch) {
+            $state.Reason = 'RPC service ImagePath command lines match after guest environment expansion (case-insensitive).'
+            return $state
+        }
+
+        $state.Reason = 'RPC ImagePath command lines differ; the services can start in separate hosts and lose required local RPC/COM interfaces.'
+        foreach ($service in @($state.RpcSs, $state.RpcEptMapper)) {
+            if ($service.Type -ne 32 -or $service.Start -ne 2 -or
+                $service.ObjectName -ine 'NT AUTHORITY\NetworkService' -or $service.Group -ine 'COM Infrastructure') {
+                $state.Reason += ' Automatic repair requires both services to retain their expected shared-process type, automatic start, NetworkService account and COM Infrastructure group.'
+                return $state
+            }
+        }
+        $reference = [regex]::Match($state.RpcSs.ImagePath, '(?i)^%SystemRoot%\\system32\\svchost\.exe(?<Args> -k rpcss(?: -p)?)$')
+        $mapper = [regex]::Match($state.RpcEptMapper.EffectiveImagePath, '(?i)^(?:"(?<Exe>[^"]+)"|(?<Exe>[^\s"]+))(?<Args> -k rpcss(?: -p)?)$')
+        if (-not $reference.Success -or -not $mapper.Success -or $guestSystemRoot -match '\s' -or
+            $mapper.Groups['Exe'].Value -ine "$guestSystemRoot\system32\svchost.exe" -or
+            $mapper.Groups['Args'].Value -ine $reference.Groups['Args'].Value) {
+            $state.Reason += ' No automatic repair: RpcSs must have its standard expandable command, and RpcEptMapper must name the same svchost executable and arguments, including the -p protection flag when present.'
+            return $state
+        }
+        $svchostPath = Resolve-GuestImagePath -ImagePath $state.RpcSs.ImagePath
+        if (-not (Test-Path -LiteralPath $svchostPath -PathType Leaf -ErrorAction Stop) -or
+            (Get-Item -LiteralPath $svchostPath -ErrorAction Stop).Length -eq 0) {
+            $state.Reason += ' No automatic repair: the referenced offline svchost.exe is missing or empty.'
+            return $state
+        }
+        $state.CanRepair = $true
+        return $state
+    }
+
     function Invoke-FirewallDebugLoopbackAppsAsSystem {
         param(
             [Parameter(Mandatory = $true)][string]$AppCsPath,
@@ -4357,9 +4506,20 @@ finally {
         return 'OK'
     }
 
-    # Returns Current/Default/LKGC control sets for explicit multi-control-set diagnostics or repairs.
+    # Returns selected control sets, or every existing numeric set when cycling is requested.
     # Default repair writes should use Get-CurrentOfflineControlSetName to preserve LKGC.
     function Get-OfflineControlSetNames {
+        param([switch]$AllExisting)
+        if ($AllExisting) {
+            $system = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('BROKENSYSTEM')
+            if ($null -eq $system) { throw 'The offline SYSTEM hive is not loaded.' }
+            try {
+                return @($system.GetSubKeyNames() |
+                    Where-Object { $_ -match '^ControlSet\d{3}$' -and [int]$_.Substring(10) -gt 0 } |
+                    Sort-Object { [int]$_.Substring(10) })
+            }
+            finally { $system.Dispose() }
+        }
         $names = [System.Collections.Generic.List[string]]::new()
         $select = Get-ItemProperty 'HKLM:\BROKENSYSTEM\Select' -ErrorAction SilentlyContinue
         foreach ($value in @($select.Current, $select.Default, $select.LastKnownGood)) {
@@ -5816,34 +5976,151 @@ loaded from them must be unloaded first.
         }
     }
 
-    function SetLKGC {
-        Invoke-WithHive 'SYSTEM' {
-            $CurrentBoot = (Get-ItemProperty -Path "HKLM:\BROKENSYSTEM\Select" -Name Current).Current
-            $LastKnownGood = (Get-ItemProperty -Path "HKLM:\BROKENSYSTEM\Select" -Name LastKnownGood).LastKnownGood
-            Write-Host "Current HKLM: $CurrentBoot`r`nLast Known Good: $LastKnownGood" -ForegroundColor Green
-            Write-Host "`r`nSetting next boot to LKGD: $LastKnownGood" -ForegroundColor Yellow
-            Set-ItemProperty-Logged -Path "HKLM:\BROKENSYSTEM\Select" -Name Current -Value $LastKnownGood -Type DWord -Force
+    function Export-OfflineSystemKeyBackup {
+        param(
+            [Parameter(Mandatory = $true)][ValidatePattern('^HKLM:\\BROKENSYSTEM\\.+$')][string]$Path,
+            [Parameter(Mandatory = $true)][ValidatePattern('^[A-Za-z0-9_-]+$')][string]$Label
+        )
+        $directory = Join-Path $script:WinDriveLetter 'Windows\Temp\RepairAzVMDisk'
+        if (-not (Test-Path -LiteralPath $directory)) {
+            New-Item-Logged -Path $directory -ItemType Directory -Force | Out-Null
+        }
+        $backup = New-UniqueBackupPath -BasePath (Join-Path $directory ("{0}_{1}" -f $Label, [guid]::NewGuid().ToString('N'))) -BakSuffix '.reg'
+        $nativePath = $Path -replace '^HKLM:\\', 'HKLM\'
+        Invoke-Logged -Description 'Back up offline registry key' -Details @{
+            Operation = 'RegistryExport'; Path = $Path; Backup = $backup
+        } -ScriptBlock {
+            $output = reg.exe export $nativePath $backup 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0) { throw "Offline registry export failed: $($output.Trim())" }
+            if ((Get-Item -LiteralPath $backup -ErrorAction Stop).Length -eq 0) {
+                throw 'Offline registry export produced an empty backup. No repair was applied.'
+            }
+            $output
+        } | Out-Null
+        return $backup
+    }
+
+    function Get-OfflineBootSelectionState {
+        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('BROKENSYSTEM\Select')
+        if ($null -eq $key) { throw 'Offline Select key is missing; no boot selector was changed.' }
+        try {
+            $values = [ordered]@{}
+            $names = $key.GetValueNames()
+            foreach ($name in @('Current', 'Default', 'Failed', 'LastKnownGood')) {
+                $exists = $names -contains $name
+                $values[$name] = [PSCustomObject]@{
+                    Exists = $exists
+                    Value = if ($exists) { $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) } else { $null }
+                    Kind = if ($exists) { $key.GetValueKind($name).ToString() } else { '' }
+                }
+            }
+        }
+        finally { $key.Dispose() }
+        foreach ($name in @('Current', 'Default')) {
+            if (-not $values[$name].Exists -or $values[$name].Kind -ne 'DWord') {
+                throw "Offline Select\$name must exist as REG_DWORD; no boot selector was changed."
+            }
+        }
+        return [PSCustomObject]@{
+            ControlSets = @(Get-OfflineControlSetNames -AllExisting | ForEach-Object { [int]$_.Substring(10) })
+            Values = $values
         }
     }
 
-    function RevertLKGC {
+    function Set-OfflineBootControlSet {
+        param([Parameter(Mandatory = $true)][ValidateSet('LastKnownGood', 'Next')][string]$Mode)
         Invoke-WithHive 'SYSTEM' {
-            $CurrentBoot = (Get-ItemProperty -Path "HKLM:\BROKENSYSTEM\Select" -Name Current).Current
-            Write-Host "Current HKLM: $CurrentBoot" -ForegroundColor Green
-
-            # Pick a control set other than the current one. Parse the numeric suffix
-            # robustly (strip all non-digits) so ControlSet010+ is handled correctly;
-            # the old 'ControlSet00' trim produced wrong numbers / parse errors for those.
-            $NextSetting = Get-ChildItem 'HKLM:\BROKENSYSTEM' |
-                Where-Object { $_.PSChildName -like 'ControlSet*' } |
-                ForEach-Object { [int]($_.PSChildName -replace '\D', '') } |
-                Where-Object { $_ -ne $CurrentBoot } |
-                Select-Object -First 1
-
-            Write-Host "`r`nSetting boot registry to: $NextSetting" -ForegroundColor Yellow
-            Set-ItemProperty-Logged -Path "HKLM:\BROKENSYSTEM\Select" -Name Current -Value $NextSetting -Type DWord -Force
+            $state = Get-OfflineBootSelectionState
+            $operation = if ($Mode -eq 'LastKnownGood') { '-TryLKGC' } else { '-TryOtherBootConfig' }
+            if ($Mode -eq 'LastKnownGood') {
+                $lkg = $state.Values.LastKnownGood
+                if (-not $lkg.Exists -or $lkg.Kind -ne 'DWord' -or $lkg.Value -notin $state.ControlSets) {
+                    throw "$operation refused: Select\LastKnownGood must be REG_DWORD and name an existing ControlSetNNN. No changes were made."
+                }
+                $target = [int]$lkg.Value
+            }
+            else {
+                $current = [int]$state.Values.Current.Value
+                if ($current -notin $state.ControlSets) {
+                    throw "$operation refused: Select\Current does not name an existing ControlSetNNN. No changes were made."
+                }
+                if ($state.ControlSets.Count -lt 2) {
+                    throw "$operation refused: no alternate ControlSet exists. No changes were made."
+                }
+                $higher = @($state.ControlSets | Where-Object { $_ -gt $current })
+                $target = if ($higher.Count -gt 0) { [int]$higher[0] } else { [int]$state.ControlSets[0] }
+            }
+            $changes = @('Current', 'Default' | Where-Object { $state.Values[$_].Value -ne $target })
+            $targetName = 'ControlSet{0:d3}' -f $target
+            if ($changes.Count -eq 0) {
+                Write-Host "  [OK] Current and Default already select $targetName. No changes were made." -ForegroundColor Green
+                return
+            }
+            if (-not (Confirm-CriticalOperation -Operation "$operation - select $targetName" -Details @"
+Current: $($state.Values.Current.Value) -> $target
+Default (next normal boot): $($state.Values.Default.Value) -> $target
+The offline Select key is backed up before changing these selectors.
+Failed, LastKnownGood and all ControlSet contents are preserved.
+"@)) { return }
+            $fresh = Get-OfflineBootSelectionState
+            if (($fresh | ConvertTo-Json -Depth 6 -Compress) -cne ($state | ConvertTo-Json -Depth 6 -Compress)) {
+                throw 'Offline boot selection changed after assessment. No repair was applied; rerun the command.'
+            }
+            $path = 'HKLM:\BROKENSYSTEM\Select'
+            $backup = Export-OfflineSystemKeyBackup -Path $path -Label 'BootControlSet_Select'
+            $attempted = [System.Collections.Generic.List[string]]::new()
+            try {
+                foreach ($name in $changes) {
+                    $attempted.Add($name)
+                    Set-ItemProperty-Logged -Path $path -Name $name -Value $target -Type DWord -Force | Out-Null
+                }
+                $after = Get-OfflineBootSelectionState
+                if ($target -notin $after.ControlSets -or
+                    $after.Values.Current.Value -ne $target -or $after.Values.Default.Value -ne $target) {
+                    throw 'Current and Default did not retain the selected control set.'
+                }
+                foreach ($name in @('Failed', 'LastKnownGood')) {
+                    if (($after.Values[$name] | ConvertTo-Json -Compress) -cne ($state.Values[$name] | ConvertTo-Json -Compress)) {
+                        throw "Select\$name changed during the operation."
+                    }
+                }
+            }
+            catch {
+                $failure = $_.Exception.Message
+                $rollbackErrors = [System.Collections.Generic.List[string]]::new()
+                for ($i = $attempted.Count - 1; $i -ge 0; $i--) {
+                    $name = $attempted[$i]
+                    try {
+                        $observed = Get-OfflineBootSelectionState
+                        if ($observed.Values[$name].Value -ne $state.Values[$name].Value) {
+                            if ($observed.Values[$name].Value -ne $target) { throw "Unexpected concurrent value in Select\$name; not overwriting it." }
+                            Set-ItemProperty-Logged -Path $path -Name $name -Value $state.Values[$name].Value -Type DWord -Force | Out-Null
+                        }
+                        $restored = Get-OfflineBootSelectionState
+                        if ($restored.Values[$name].Value -ne $state.Values[$name].Value) { throw "Could not restore Select\$name." }
+                    }
+                    catch { $rollbackErrors.Add($_.Exception.Message) }
+                }
+                Write-ActionLog -Event 'BootControlSetSwitchFailed' -Details @{
+                    Operation = $operation; Error = $failure; Backup = $backup; RollbackErrors = @($rollbackErrors)
+                }
+                $rollbackStatus = if ($rollbackErrors.Count) { "Rollback incomplete: $($rollbackErrors -join '; ')" } else { 'Previous Current/Default values restored.' }
+                throw "$operation failed: $failure $rollbackStatus Backup: $backup"
+            }
+            Write-ActionLog -Event 'BootControlSetSelected' -Details @{
+                Operation = $operation; Target = $targetName; BeforeCurrent = $state.Values.Current.Value
+                BeforeDefault = $state.Values.Default.Value; AfterCurrent = $target; AfterDefault = $target
+                ChangedValues = $changes; Backup = $backup; Verified = $true
+            }
+            Write-Host "  [OK] Current and Default now select $targetName for the next normal boot." -ForegroundColor Green
+            Write-Host "  Select backup: $backup" -ForegroundColor DarkGray
+            Write-Warning 'Cold-boot the guest to use the selected control set; do not resume saved memory.'
         }
     }
+
+    function SetLKGC { Set-OfflineBootControlSet -Mode LastKnownGood }
+
+    function RevertLKGC { Set-OfflineBootControlSet -Mode Next }
 
     function SetBootLog {
         $storePath = Get-BcdStorePath -Generation $script:VMGen -BootDrive $script:BootDriveLetter
@@ -12753,6 +13030,59 @@ complete recovery.
         }
     }
 
+    function FixRpcHostSplit {
+        Write-Host 'Checking offline RPC service-host ImagePath consistency...' -ForegroundColor Yellow
+        Invoke-WithHive 'SYSTEM', 'SOFTWARE' {
+            $state = Get-RpcHostSplitState
+            if (-not $state.HasMismatch) {
+                Write-Host "  [OK] $($state.ControlSet): RPC ImagePath command lines match. No changes were made." -ForegroundColor Green
+                return
+            }
+            if (-not $state.CanRepair) { throw "-FixRpcHostSplit refused: $($state.Reason)" }
+            $target = $state.RpcEptMapper.Path
+            $before = $state.RpcEptMapper.ImagePath
+            $after = $state.RpcSs.ImagePath
+            if (-not (Confirm-CriticalOperation -Operation 'Repair RPC service-host path mismatch (-FixRpcHostSplit)' -Details @"
+Changes only ImagePath at:
+  $target
+Before: $before
+After:  $after
+The RpcEptMapper service key is exported before writing; REG_EXPAND_SZ is preserved.
+RpcSs, TLS settings, service protection arguments, Select values and other ControlSets are unchanged.
+"@)) { return }
+
+            $fresh = Get-RpcHostSplitState
+            if (-not $fresh.HasMismatch) {
+                Write-Host '  [OK] RPC ImagePath mismatch is already resolved. No changes were made.' -ForegroundColor Green
+                return
+            }
+            if (-not $fresh.CanRepair -or $fresh.ControlSet -cne $state.ControlSet -or
+                $fresh.RpcSs.ImagePath -cne $after -or $fresh.RpcEptMapper.ImagePath -cne $before) {
+                throw 'RPC configuration changed after assessment. No repair was applied; rerun -SysCheck.'
+            }
+            $backupPath = Export-OfflineSystemKeyBackup -Path $target -Label "RpcHostSplit_$($state.ControlSet)"
+            Set-ItemProperty-Logged -Path $target -Name 'ImagePath' -Value $after -PropertyType ExpandString -Force | Out-Null
+            $verified = Get-RpcHostSplitState
+            if ($verified.ControlSet -cne $state.ControlSet -or $verified.HasMismatch -or
+                $verified.RpcEptMapper.ImagePath -cne $after -or $verified.RpcSs.ImagePath -cne $after) {
+                throw "RPC ImagePath repair verification failed. Preserved service-key backup: $backupPath"
+            }
+            Write-ActionLog -Event 'FixRpcHostSplit' -Details @{
+                Path = $target
+                Name = 'ImagePath'
+                ValueType = 'REG_EXPAND_SZ'
+                Before = $before
+                After = $after
+                ControlSet = $state.ControlSet
+                Backup = $backupPath
+                Verified = $true
+            }
+            Write-Host "  [OK] Repaired RPC host-split ImagePath mismatch in $($state.ControlSet); verified REG_EXPAND_SZ and matching command lines." -ForegroundColor Green
+            Write-Host "  Backup: $backupPath" -ForegroundColor DarkGray
+            Write-Warning 'Cold-boot the repaired guest and confirm RPC services share a process. Do not resume its previous saved memory state.'
+        }
+    }
+
     function FixSessionManagerBootEntries {
         # Scans the Session Manager registry key for known boot-blocking issues:
         #   1. BootExecute  - Native NT executables run by Smss.exe before Win32 starts.
@@ -13429,6 +13759,7 @@ complete recovery.
 
         # Critical Services
         $sevCriticalSvcDisabled = 2   # A critical boot/system driver is disabled
+        $sevRpcHostSplit = 2   # RpcSs/RpcEptMapper command lines differ and can split required local RPC interfaces
         $sevBootStorageReadiness = 2   # Boot storage Start/StartOverride settings may block migration boot
 
         # RDP
@@ -14198,7 +14529,7 @@ complete recovery.
 
                 # ControlSet mismatch
                 if ($null -ne $curSet -and $null -ne $defSet -and $curSet -ne $defSet) {
-                    & $emit 'Registry' (& $toSev $sevControlSetMismatch) "ControlSet mismatch: Current=$curSet Default=$defSet - LKGC switch may help" "-TryLGKC"
+                    & $emit 'Registry' (& $toSev $sevControlSetMismatch) "ControlSet mismatch: Current=$curSet Default=$defSet (next normal boot) - review which configuration to select" "-TryLKGC"
                 }
                 else {
                     & $emit 'Registry' 'OK' "ControlSet: Current=ControlSet$("{0:d3}" -f $curSet)  LKGC=ControlSet$("{0:d3}" -f $lkgcSet)"
@@ -14251,7 +14582,8 @@ complete recovery.
                     @{ N = 'NTFS'; ExpStart = 1; Desc = 'NTFS filesystem driver (0x7B if disabled)' }
                     @{ N = 'volsnap'; ExpStart = 1; Desc = 'volume shadow copy filter' }
                     @{ N = 'msrpc'; ExpStart = 2; Desc = 'RPC subsystem' }
-                    @{ N = 'rpcss'; ExpStart = 2; Desc = 'RPC Endpoint Mapper' }
+                    @{ N = 'rpcss'; ExpStart = 2; Desc = 'Remote Procedure Call (RPC)' }
+                    @{ N = 'RpcEptMapper'; ExpStart = 2; Desc = 'RPC Endpoint Mapper' }
                     @{ N = 'LSM'; ExpStart = 2; Desc = 'Local Session Manager' }
                 )
                 foreach ($s in $critical) {
@@ -14262,6 +14594,24 @@ complete recovery.
                             & $emit 'Services' (& $toSev $sevCriticalSvcDisabled) "$($s.N) is DISABLED (Start=4) - $($s.Desc) [ re-enable: Set Start=$($s.ExpStart) ]" "-EnableDriverOrService $($s.N) -DriverStartType $(ConvertTo-DriverStartTypeName -StartValue $s.ExpStart)"
                         }
                     }
+                }
+
+                # -- RPC shared service host ----------------------------------------
+                try {
+                    $rpcHostState = Invoke-WithHive 'SOFTWARE' { Get-RpcHostSplitState }
+                    if ($rpcHostState.HasMismatch) {
+                        $rpcFix = if ($rpcHostState.CanRepair) { '-FixRpcHostSplit' } else { '' }
+                        & $emit 'Services' (& $toSev $sevRpcHostSplit) "$csName RPC host-split ImagePath mismatch: RpcSs='$($rpcHostState.RpcSs.ImagePath)'; RpcEptMapper='$($rpcHostState.RpcEptMapper.ImagePath)'. Can cause service-start timeouts, DWM/LogonUI failures and a black screen before sign-in." $rpcFix
+                        if (-not $rpcHostState.CanRepair) {
+                            & $emit 'Services' 'WARN' $rpcHostState.Reason
+                        }
+                    }
+                    else {
+                        & $emit 'Services' 'OK' "$csName RPC ImagePath command lines match; no path-induced host split detected."
+                    }
+                }
+                catch {
+                    & $emit 'Services' 'WARN' "RPC service-host ImagePath check could not complete: $($_.Exception.Message). No automatic repair is recommended."
                 }
 
                 # -- Migration boot storage readiness ------------------------------
@@ -21330,7 +21680,7 @@ No destructive file or registry cleanup is performed.
             [string]$RepairSystemFileSource = '',
             [switch]$SkipOfflineSfc,
             [switch]$AnalyzeComponentStore,
-            [switch]$TryLGKC,
+            [Alias('TryLGKC')][switch]$TryLKGC,
             [switch]$TryOtherBootConfig,        
             [switch]$TrySafeMode,
             [switch]$RemoveSafeModeFlag,
@@ -21380,6 +21730,7 @@ No destructive file or registry cleanup is performed.
             [switch]$FixAzureGuestAgent,
             [switch]$InstallAzureVMAgent,
             [switch]$FixSessionManager,
+            [switch]$FixRpcHostSplit,
             [switch]$FixDeviceFilters,
             [switch]$KeepDefaultFilters,
             [switch]$CopyACPISettings,
@@ -21438,6 +21789,9 @@ No destructive file or registry cleanup is performed.
         foreach ($pair in $mutuallyExclusiveParameterPairs) {
             if ($PSBoundParameters.ContainsKey($pair.Left) -and
                 $PSBoundParameters.ContainsKey($pair.Right)) {
+                if ($pair.Left -eq 'TryLKGC') {
+                    throw 'Parameters -TryLKGC and -TryOtherBootConfig cannot be used together.'
+                }
                 Write-Error "Parameters -$($pair.Left) and -$($pair.Right) cannot be used together."
                 return
             }
@@ -21510,11 +21864,16 @@ PARAMETERS:
     -FixBootStorageDrivers Repair boot storage Start/StartOverride settings and recreate safe missing inbox service keys
   -RecreateBootPartition Recreate missing boot partition (System Reserved for Gen1, EFI SP for Gen2) and run bcdboot
   -RemoveSafeModeFlag    Remove Safe Mode flag
-  -TryLGKC               Switch boot to Last Known Good Control Set
-  -TryOtherBootConfig    Switch boot to a different HKLM ControlSet
+  -TryLKGC               Select the existing LastKnownGood ControlSet for Current and Default
+                         (legacy alias: -TryLGKC); preserves Failed/LastKnownGood and control-set contents
+  -TryOtherBootConfig    Cycle existing ControlSets numerically and wrap to the first (001 -> 002 -> 003 -> 001)
+                         Sets Current and Default; skips gaps and refuses a missing alternate
   -FixSessionManager     Repair Session Manager: remove BootExecute/SetupExecute entries with missing
                          binaries, and repoint SubSystems Windows/Kmode at a real csrss.exe/win32k.sys
                          (black screen and STOP 0xC000021A fix)
+  -FixRpcHostSplit       Repair a confirmed RpcSs/RpcEptMapper ImagePath mismatch in the active
+                         Current ControlSet; export the service key and change only RpcEptMapper
+                         REG_EXPAND_SZ ImagePath. Refuses unsupported configurations; matching paths are unchanged.
   -TrySafeMode           Set boot to Safe Mode (minimal)
 
 --- DISK & FILESYSTEM ---------------------------------------------------------
@@ -21715,7 +22074,7 @@ AVAILABLE DISKS:
             if ($RepairComponentStore) { RunDismHealth -RepairSource $RepairSource }
             if ($AnalyzeComponentStore) { AnalyzeComponentStore }
             if ($RunSFC) { RunSFC }
-            if ($TryLGKC) { SetLKGC }
+            if ($TryLKGC) { SetLKGC }
             if ($TryOtherBootConfig) { RevertLKGC }
             if ($TrySafeMode) { SetSafeMode }
             if ($RemoveSafeModeFlag) { RemoveSafeMode }
@@ -21771,6 +22130,7 @@ AVAILABLE DISKS:
             if ($InstallAzureVMAgent) { InstallAzureVMAgentOffline }
             if ($FixDeviceFilters) { FixDeviceClassFilters -KeepDefaultFilters:$KeepDefaultFilters }
             if ($FixSessionManager) { FixSessionManagerBootEntries }
+            if ($FixRpcHostSplit) { FixRpcHostSplit }
             if ($CopyACPISettings) { CopyACPISettings }
             if ($ScanNetBindings) { ScanNetAdapterBindings }
             if ($FixNetBindings) { RemoveOrphanedNetBindings }

@@ -104,10 +104,11 @@ You can also target a Hyper-V VM by name instead of disk number:
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixBoot
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixBootSector
 
-# Try Last Known Good Configuration
-.\Repair-AzVMDisk.ps1 -DiskNumber 3 -TryLGKC
+# Select the existing control set recorded in Select\LastKnownGood
+# -TryLGKC remains supported as a legacy alias.
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -TryLKGC
 
-# Try a different offline ControlSet when the current one is damaged
+# Cycle existing control sets numerically, wrapping at the end: 001 -> 002 -> 003 -> 001
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -TryOtherBootConfig
 
 # Boot into Safe Mode on next start
@@ -123,6 +124,18 @@ You can also target a Hyper-V VM by name instead of disk number:
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -DisableStartupRepair
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -EnableStartupRepair
 ```
+
+Both control-set switches update **Current and Default** so the selected configuration
+is used by subsequent offline operations and the next normal boot. They export `Select`
+to `Windows\Temp\RepairAzVMDisk\BootControlSet_Select_*.reg` on the offline disk,
+write only changed values, and preserve `Failed`, `LastKnownGood` and control-set contents.
+`-TryOtherBootConfig` skips gaps, handles `ControlSet010` numerically, and refuses a missing
+alternate. `-TryLKGC` refuses a missing or invalid LastKnownGood target and performs no
+writes when both selectors already match. Do not combine the two switches.
+
+This is offline selection of Windows' recorded configuration, not a restoration of files
+or updates or a simulation of all F8 boot-time bookkeeping. Confirmation is required
+unless `-Force` is supplied. Cold-boot the guest rather than resuming saved memory.
 
 ### File System & Component Store Repair
 
@@ -254,6 +267,9 @@ You can also target a Hyper-V VM by name instead of disk number:
 # Include Win32 services in the services/drivers report
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -GetServicesReport -IncludeServices
 
+# Repair the specific RPC service-host ImagePath mismatch reported by -SysCheck
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixRpcHostSplit
+
 # Ensure Hyper-V synthetic drivers are enabled (storvsc, netvsc, etc.)
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -EnsureSyntheticDriversEnabled
 
@@ -261,6 +277,20 @@ You can also target a Hyper-V VM by name instead of disk number:
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -DisableDriverVerifier
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -EnableDriverVerifier "nt*"
 ```
+
+`-SysCheck` compares **RpcSs and RpcEptMapper** in the active offline control set.
+It expands Windows environment variables using the guest's settings, compares complete
+command lines case-insensitively, and preserves quotes and whitespace during comparison.
+A quoting mismatch can split these shared-host services and cause startup timeouts or a
+black screen before sign-in; equivalent unquoted paths and case-only differences are not flagged.
+
+`-FixRpcHostSplit` exports the RpcEptMapper key and changes only its `ImagePath` to match
+the standard RpcSs value, retaining `REG_EXPAND_SZ`. It requires the expected service
+configuration, executable and matching arguments, including `-p` when present.
+Unsupported configurations are refused even with `-Force`; matching paths cause no writes.
+It does not change TLS, RpcSs, protection arguments, boot selectors or other control sets.
+**Do not remove quotes from service paths globally.** After repair, cold-boot the guest
+and confirm the RPC services share a process.
 
 ### Security & Policy
 
@@ -457,6 +487,7 @@ underlying fault may have more than one cause.
 | "Checking file system on C:" loop, or **UNMOUNTABLE_BOOT_VOLUME** | NTFS / file-system corruption on the boot volume | `-CheckDiskHealth` → `-FixFileSystem -DriveLetter H:` | [Check-disk boot error][chk], [Disk corruption][dsk] |
 | Stuck on **"Getting Windows ready. Don't turn off your computer"** or update reboot loop | Pending CBS / servicing transaction won't complete | `-AnalyzeServicingState` → `-FixPendingUpdates` → `-DisableWindowsUpdate` → `-UninstallWindowsUpdate <KB>` → `-RepairComponentStore` | [Stuck updating][upd], [Getting Windows ready][gwr] |
 | Continuous reboot / automatic-repair loop | Failed update, bad driver, or startup-repair churn | `-SysCheck` → `-FixPendingUpdates` → `-DisableStartupRepair` → `-TrySafeMode` | [Reboot loop][rbl] |
+| Black screen before sign-in with an RPC host-split ImagePath finding | RpcSs and RpcEptMapper command lines differ and may start in separate hosts | `-SysCheck`, then `-FixRpcHostSplit` only when the reported configuration is supported | See Drivers & Services above |
 | Black screen after logon (no desktop) | Winlogon Shell/Userinit changed, or `explorer.exe` missing | `-FixWinlogon` → `-RepairSystemFile explorer.exe` | [Critical service failed][csf] |
 | **"CRITICAL SERVICE FAILED"** blue screen | Boot-critical driver/service disabled or missing binary | `-SysCheck` → `-GetServicesReport -IssuesOnly` → `-EnsureSyntheticDriversEnabled` → `-FixBootStorageDrivers` | [Critical service failed][csf] |
 | Random driver blue screens (0x7E, 0xD1, 0x50, 0x1E) or Driver Verifier crashes | Faulty third-party driver or active Driver Verifier | `-CollectMinidumps` → `-DisableDriverVerifier` → `-DisableThirdPartyDrivers` / `-DisableDriverOrService <name>` → `-TrySafeMode` | [Common blue screen][bsod] |
