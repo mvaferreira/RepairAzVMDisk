@@ -8,6 +8,20 @@ Repair-AzVMDisk attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM
 >
 > The sample scripts are not supported under any Microsoft standard support program or service. The sample scripts are provided AS IS without warranty of any kind. Microsoft further disclaims all implied warranties including, without limitation, any implied warranties of merchantability or of fitness for a particular purpose. The entire risk arising out of the use or performance of the sample scripts and documentation remains with you. In no event shall Microsoft, its authors, or anyone else involved in the creation, production, or delivery of the scripts be liable for any damages whatsoever (including, without limitation, damages for loss of business profits, business interruption, loss of business information, or other pecuniary loss) arising out of the use of or inability to use the sample scripts or documentation, even if Microsoft has been advised of the possibility of such damages.
 
+## Download
+
+[Download the latest release ZIP](https://github.com/mvaferreira/RepairAzVMDisk/releases/latest/download/Repair-AzVMDisk.zip)
+and extract it before running the script. The ZIP contains `Repair-AzVMDisk.ps1`,
+this README, and the license.
+
+The download URL stays the same across versions, so it can be used as the destination
+of a short URL. Each tagged release publishes an asset named `Repair-AzVMDisk.zip`;
+GitHub serves the asset from the release marked **Latest**.
+
+The [standalone script](https://github.com/mvaferreira/RepairAzVMDisk/releases/latest/download/Repair-AzVMDisk.ps1)
+and [latest release page](https://github.com/mvaferreira/RepairAzVMDisk/releases/latest)
+are also available at fixed URLs.
+
 ## Prerequisites
 
 - Must be run **as Administrator** on the Hyper-V rescue VM.
