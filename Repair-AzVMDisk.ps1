@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.8.7
+        Version: 0.8.8
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -90,6 +90,33 @@
         helper. Before changing the value, the exact AppCs owner and DACL are captured,
         SYSTEM temporarily obtains FullControl, and the captured owner and DACL are restored
         and verified afterward. Each mutation is written to the action log.
+
+    .PARAMETER FixWFPRules
+        Neutralises IPsec connection security rules (ConSecRules) that require inbound
+        security on a scope covering RDP, in both the local store
+        (Services\SharedAccess\Parameters\FirewallPolicy\ConSecRules in the active offline
+        ControlSet) and the Group Policy store
+        (Software\Policies\Microsoft\WindowsFirewall\ConSecRules).
+
+        A rule with Action=SecureServer or Action=Secure makes MpsSvc demand a completed
+        IPsec negotiation before accepting any inbound packet in its scope. When the client
+        cannot satisfy the rule's auth suites the SYN is dropped inside the Windows
+        Filtering Platform at FWPM_CALLOUT_IPSEC_INBOUND_INITIATE_SECURE_V4, so RDP fails
+        as a bare timeout while the listener, the service state and the inbound firewall
+        rules all look healthy. A rule carrying no Protocol, port or address scope applies
+        to ALL inbound traffic and locks the VM out completely.
+
+        Only the Active token is changed, from TRUE to FALSE; every other token in the rule
+        string is preserved byte for byte and no rule is deleted. Rules whose scope cannot
+        be resolved from a dismounted disk - address-scoped, remote-port-scoped, or using a
+        port keyword - are reported by -SysCheck and deliberately left unchanged. Each
+        affected key is exported to a .reg backup first, only the active ControlSet is
+        written, and every rule is re-parsed afterwards to confirm it became inactive and
+        that nothing else in the string moved. Mutations are written to the action log.
+
+        Neutralising a Group Policy rule restores access but the cached copy is rewritten
+        at the next policy refresh, so the durable fix is in the GPO itself. After the
+        guest boots, remove the rule through the supported path with Remove-NetIPsecRule.
 
     .PARAMETER FixNtfsAttributeList
         Repairs ATTRIBUTE_LIST_ENTRY records in the reserved MFT range (file records 0-31)
@@ -194,6 +221,12 @@
     .EXAMPLE
         # Preserve and disable the duplicated Windows Firewall loopback-app value
         PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixFirewallDebugLoopbackApps
+
+    .EXAMPLE
+        # RDP times out although the listener and firewall rules are healthy:
+        # disable the IPsec connection security rule that is blocking it
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -SysCheck
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixWFPRules
 
     .EXAMPLE
         # Rebuild BCD and fix RDP settings on disk 3
@@ -339,6 +372,7 @@ param (
     [Parameter(ParameterSetName = 'Repair')][switch]$DisableStartupPrograms,
     [Parameter(ParameterSetName = 'Repair')][switch]$DisableFirewall,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixFirewallDebugLoopbackApps,
+    [Parameter(ParameterSetName = 'Repair')][switch]$FixWFPRules,
     [Parameter(ParameterSetName = 'Repair')][switch]$LeaveDiskOnline,
     [Parameter(ParameterSetName = 'Repair')][ValidateSet('SYSTEM', 'SOFTWARE', 'COMPONENTS', 'SAM', 'SECURITY')][string[]]$LoadHive = @(),
     [Parameter(ParameterSetName = 'Repair')][ValidateSet('SYSTEM', 'SOFTWARE', 'COMPONENTS', 'SAM', 'SECURITY')][string[]]$UnloadHive = @(),
@@ -4506,6 +4540,318 @@ finally {
         return 'OK'
     }
 
+    # ---------------------------------------------------------------------------
+    # IPsec connection security rules (ConSecRules)
+    #
+    # A connection security rule whose action REQUIRES inbound security makes MpsSvc
+    # demand a completed IPsec negotiation before any inbound packet in the rule's scope
+    # is accepted. When the peer cannot satisfy the rule's auth suites the SYN is dropped
+    # inside WFP at FWPM_CALLOUT_IPSEC_INBOUND_INITIATE_SECURE_V4, so RDP fails as a bare
+    # timeout: the listener is healthy, the firewall rules allow 3389, and nothing is
+    # logged as a drop. A rule carrying no Protocol, no port and no address scope covers
+    # ALL inbound IP traffic and locks the VM out completely.
+    #
+    # The value grammar is [MS-GPFAS] section 2.2.6.2, mapping to FW_CS_RULE in [MS-FASP]
+    # section 2.2.55:
+    #   v2.31|Action=SecureServer|Name=X|Desc=|Active=TRUE|Auth1Set=...|EmbedCtxt=|
+    # The rule id is the registry value NAME, not a token. Tokens may legitimately repeat
+    # (EP1Port, EP1_4, Profile), so every token is collected as a list.
+    # ---------------------------------------------------------------------------
+    function Get-ConSecToken {
+        param($Tokens, [Parameter(Mandatory = $true)][string]$Name)
+        if ($Tokens -and $Tokens.ContainsKey($Name)) { return [string[]]@($Tokens[$Name]) }
+        return [string[]]@()
+    }
+
+    function ConvertFrom-ConSecRuleString {
+        param(
+            [Parameter(Mandatory = $true)][AllowEmptyString()][string]$RuleString,
+            [string]$RuleId = ''
+        )
+
+        $tokens = @{}
+        $version = ''
+        $malformed = $false
+        $lastName = ''
+        $segments = $RuleString -split '\|'
+
+        for ($i = 0; $i -lt $segments.Count; $i++) {
+            $segment = $segments[$i]
+            if ($i -eq 0) {
+                if ($segment -match '^v[\d.]+$') { $version = $segment.Substring(1) }
+                else { $malformed = $true }
+                continue
+            }
+            if ([string]::IsNullOrEmpty($segment)) { continue }
+
+            $split = $segment.IndexOf('=')
+            if ($split -lt 1) {
+                # A literal '|' inside a free-text Name= or Desc= lands here. Appending it
+                # back to the previous token keeps the original text intact instead of
+                # inventing a token, and the rule is marked so callers never treat a
+                # partially understood rule as authoritative.
+                if ($lastName -and $tokens[$lastName].Count -gt 0) {
+                    $tokens[$lastName][$tokens[$lastName].Count - 1] += '|' + $segment
+                }
+                $malformed = $true
+                continue
+            }
+
+            $name = $segment.Substring(0, $split)
+            if (-not $tokens.ContainsKey($name)) { $tokens[$name] = [System.Collections.Generic.List[string]]::new() }
+            $tokens[$name].Add($segment.Substring($split + 1))
+            $lastName = $name
+        }
+
+        return [PSCustomObject]@{
+            RuleId    = $RuleId
+            Version   = $version
+            Tokens    = $tokens
+            Malformed = $malformed
+        }
+    }
+
+    function Test-ConSecPortCoverage {
+        # $true  - the port falls inside the declared scope (or no scope was declared)
+        # $false - the port falls outside it
+        # $null  - the scope contains an entry this parser cannot evaluate, so coverage is
+        #          genuinely unknown. Callers must not collapse that into either answer.
+        param(
+            [string[]]$SinglePorts,
+            [string[]]$PortRanges,
+            [Parameter(Mandatory = $true)][ValidateRange(1, 65535)][int]$Port
+        )
+
+        $entries = @(@($SinglePorts) + @($PortRanges) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($entries.Count -eq 0) { return $true }
+
+        $unknown = $false
+        foreach ($entry in $entries) {
+            if ($entry -match '^\s*(\d{1,5})\s*-\s*(\d{1,5})\s*$') {
+                if ($Port -ge [int]$Matches[1] -and $Port -le [int]$Matches[2]) { return $true }
+            }
+            elseif ($entry -match '^\s*(\d{1,5})\s*$') {
+                if ($Port -eq [int]$Matches[1]) { return $true }
+            }
+            else { $unknown = $true }
+        }
+        if ($unknown) { return $null }
+        return $false
+    }
+
+    function Get-ConSecRuleRdpImpact {
+        param(
+            [Parameter(Mandatory = $true)]$Rule,
+            [ValidateRange(1, 65535)][int]$RdpPort = 3389
+        )
+
+        $tokens = $Rule.Tokens
+        $action = @(Get-ConSecToken $tokens 'Action') | Select-Object -First 1
+        $active = @(Get-ConSecToken $tokens 'Active') | Select-Object -First 1
+        $protocols = @(Get-ConSecToken $tokens 'Protocol')
+        $ep1Ports = @(Get-ConSecToken $tokens 'EP1Port')
+        $ep1Ranges = @(Get-ConSecToken $tokens 'EP1Port2_10')
+        $ep2Ports = @(Get-ConSecToken $tokens 'EP2Port')
+        $ep2Ranges = @(Get-ConSecToken $tokens 'EP2Port2_10')
+        $addresses = @(@('EP1_4', 'EP1_6', 'EP2_4', 'EP2_6') | ForEach-Object { Get-ConSecToken $tokens $_ })
+        $authSets = @(@('Auth1Set', 'Auth2Set') | ForEach-Object { Get-ConSecToken $tokens $_ })
+
+        $result = [ordered]@{
+            RuleId        = $Rule.RuleId
+            Name          = (@(Get-ConSecToken $tokens 'Name') | Select-Object -First 1)
+            Action        = $action
+            Active        = $false
+            Verdict       = 'NotBlocking'
+            Reason        = ''
+            Unscoped      = $false
+            AddressScoped = $false
+            Profiles      = [string[]]@(Get-ConSecToken $tokens 'Profile')
+            AuthSets      = [string[]]$authSets
+            Malformed     = [bool]$Rule.Malformed
+        }
+
+        # An absent Active= token means FALSE ([MS-GPFAS] 2.2.6.2), so a rule is only
+        # enforced when the token is present and TRUE.
+        if (-not ($active -and $active -ieq 'TRUE')) {
+            $result.Verdict = 'Inert'
+            $result.Reason = 'the rule is stored but Active is not TRUE, so MpsSvc does not enforce it'
+            return [PSCustomObject]$result
+        }
+        $result.Active = $true
+
+        # Only the two require-inbound actions can drop an unsecured inbound SYN.
+        # Boundary requests security and falls back to clear text; DoNotSecure exempts.
+        if ($action -ieq 'Boundary' -or $action -ieq 'DoNotSecure') {
+            $result.Reason = "Action=$action does not require inbound security"
+            return [PSCustomObject]$result
+        }
+        if (@('SecureServer', 'Secure') -notcontains $action) {
+            $result.Verdict = 'Unknown'
+            $result.Reason = "Action=$(if ($action) { $action } else { '(absent)' }) is not a recognised connection security action, so its effect on RDP could not be determined"
+            return [PSCustomObject]$result
+        }
+
+        # Protocol absent means every protocol. RDP is TCP, IP protocol 6.
+        if ($protocols.Count -gt 0) {
+            $numeric = @($protocols | Where-Object { $_ -match '^\d{1,3}$' } | ForEach-Object { [int]$_ })
+            if ($numeric.Count -ne $protocols.Count) {
+                $result.Verdict = 'Conditional'
+                $result.Reason = "Action=$action requires inbound security and the Protocol scope ($($protocols -join ', ')) could not be evaluated offline"
+                return [PSCustomObject]$result
+            }
+            if ($numeric -notcontains 6) {
+                $result.Reason = "Action=$action requires inbound security but the rule is scoped to IP protocol $($numeric -join ', '), not TCP (6)"
+                return [PSCustomObject]$result
+            }
+        }
+
+        # Endpoint1 is the local machine for an inbound connection, so EP1Port is the
+        # listener port. Absent means every port.
+        $localCoverage = Test-ConSecPortCoverage -SinglePorts $ep1Ports -PortRanges $ep1Ranges -Port $RdpPort
+        if ($false -eq $localCoverage) {
+            $result.Reason = "Action=$action requires inbound security but the local port scope ($(@($ep1Ports + $ep1Ranges) -join ', ')) does not include the RDP port $RdpPort"
+            return [PSCustomObject]$result
+        }
+
+        $addressList = @($addresses | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        $remotePortList = @(@($ep2Ports + $ep2Ranges) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        $portScoped = (@($ep1Ports).Count + @($ep1Ranges).Count + $remotePortList.Count) -gt 0
+        $result.AddressScoped = $addressList.Count -gt 0
+        $result.Unscoped = (-not $portScoped -and $addressList.Count -eq 0 -and $protocols.Count -eq 0)
+
+        # Anything that cannot be resolved from a dismounted disk downgrades the verdict
+        # to Conditional. Reporting a scoped rule as a confirmed block would invite a
+        # repair that changes something the evidence never proved was at fault.
+        $uncertain = [System.Collections.Generic.List[string]]::new()
+        if ($null -eq $localCoverage) {
+            $uncertain.Add("the local port scope ($(@($ep1Ports + $ep1Ranges) -join ', ')) uses a keyword this check cannot resolve offline")
+        }
+        if ($addressList.Count -gt 0) {
+            $uncertain.Add("the rule is address-scoped ($($addressList -join ', ')) and the client address is not knowable offline")
+        }
+        if ($remotePortList.Count -gt 0) {
+            $uncertain.Add("the rule restricts the remote port ($($remotePortList -join ', ')) while an RDP client's source port is ephemeral")
+        }
+
+        if ($uncertain.Count -gt 0) {
+            $result.Verdict = 'Conditional'
+            $result.Reason = "Action=$action requires inbound IPsec on a scope that can include TCP port $RdpPort, but $($uncertain -join '; ')"
+        }
+        elseif ($result.Unscoped) {
+            $result.Verdict = 'Blocking'
+            $result.Reason = "Action=$action requires inbound IPsec and the rule carries no protocol, port or address scope, so it applies to ALL inbound traffic including RDP on TCP $RdpPort"
+        }
+        else {
+            $result.Verdict = 'Blocking'
+            $result.Reason = "Action=$action requires inbound IPsec on a scope that includes TCP port $RdpPort"
+        }
+        return [PSCustomObject]$result
+    }
+
+    function Get-ConSecRuleStoreState {
+        param(
+            [Parameter(Mandatory = $true)][string]$StorePath,
+            [Parameter(Mandatory = $true)][string]$StoreLabel,
+            [ValidateRange(1, 65535)][int]$RdpPort = 3389
+        )
+
+        $state = [ordered]@{
+            Path                = $StorePath
+            Label               = $StoreLabel
+            PathExists          = $false
+            ReadFailed          = $false
+            ReadError           = ''
+            PermissionsAdjusted = $false
+            RuleCount           = 0
+            Rules               = @()
+        }
+
+        if (-not (Test-Path -LiteralPath $StorePath)) { return [PSCustomObject]$state }
+        $state.PathExists = $true
+
+        $read = {
+            $collected = [System.Collections.Generic.List[object]]::new()
+            $key = Get-Item -LiteralPath $StorePath -ErrorAction Stop
+            foreach ($valueName in @($key.GetValueNames() | Sort-Object)) {
+                if ([string]::IsNullOrEmpty($valueName)) { continue }
+                $raw = $key.GetValue($valueName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                if ($raw -isnot [string]) { continue }
+                $parsed = ConvertFrom-ConSecRuleString -RuleString $raw -RuleId $valueName
+                $collected.Add([PSCustomObject]@{
+                        RuleId = $valueName
+                        Raw    = $raw
+                        Kind   = $key.GetValueKind($valueName).ToString()
+                        Parsed = $parsed
+                        Impact = Get-ConSecRuleRdpImpact -Rule $parsed -RdpPort $RdpPort
+                    })
+            }
+            return , @($collected)
+        }
+
+        $rules = $null
+        try { $rules = & $read }
+        catch {
+            $firstError = $_
+            # Same ownership dance Get-ProtectedRegistryValue performs: a key locked to
+            # SYSTEM denies Administrators even READ_CONTROL, and reporting "no rules"
+            # for a key that simply could not be opened would be a false all-clear.
+            if (-not (Test-RegistryAccessDenied -ErrorRecord $firstError)) {
+                $state.ReadFailed = $true
+                $state.ReadError = $firstError.Exception.Message
+                return [PSCustomObject]$state
+            }
+            $guardPath = Get-NearestExistingRegistryKey -Path $StorePath
+            $originalSddl = if ($guardPath) { Get-ProtectedRegistryKeySddl -Path $guardPath } else { $null }
+            if (-not $originalSddl) {
+                $state.ReadFailed = $true
+                $state.ReadError = $firstError.Exception.Message
+                return [PSCustomObject]$state
+            }
+            try {
+                Grant-ProtectedRegistryKeyAccess -Path $guardPath -KeyOnly
+                $rules = & $read
+                $state.PermissionsAdjusted = $true
+            }
+            catch {
+                $state.ReadFailed = $true
+                $state.ReadError = $_.Exception.Message
+                return [PSCustomObject]$state
+            }
+            finally { Restore-ProtectedRegistryKeyAccess -Path $guardPath -Sddl $originalSddl }
+        }
+
+        $state.Rules = @($rules)
+        $state.RuleCount = @($rules).Count
+        return [PSCustomObject]$state
+    }
+
+    function Get-ConSecRuleDescription {
+        param([Parameter(Mandatory = $true)]$Rule)
+
+        $name = $Rule.Impact.Name
+        $parts = [System.Collections.Generic.List[string]]::new()
+        $parts.Add("'$(if ([string]::IsNullOrWhiteSpace($name)) { '(unnamed)' } else { $name })'")
+        $parts.Add("id $($Rule.RuleId)")
+        if ($Rule.Impact.Action) { $parts.Add("Action=$($Rule.Impact.Action)") }
+        if (@($Rule.Impact.Profiles).Count -gt 0) { $parts.Add("Profile=$(@($Rule.Impact.Profiles) -join '+')") }
+        if (@($Rule.Impact.AuthSets).Count -gt 0) { $parts.Add("auth set(s) $(@($Rule.Impact.AuthSets) -join ', ')") }
+        return ($parts -join ', ')
+    }
+
+    function Get-ConSecRuleDisabledString {
+        # Flips exactly the Active token and leaves every other byte of the rule alone.
+        # Returns $null when the rule is not in the expected shape, so a caller can never
+        # write a string it did not fully understand.
+        param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$RuleString)
+
+        $pattern = '(?<=\|)Active=TRUE(?=\|)'
+        # Not named $matches: that is an automatic variable and shadowing it here would
+        # silently break any -match in this scope.
+        $hits = [regex]::Matches($RuleString, $pattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if ($hits.Count -ne 1) { return $null }
+        return [regex]::Replace($RuleString, $pattern, 'Active=FALSE', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    }
+
     # Returns selected control sets, or every existing numeric set when cycling is requested.
     # Default repair writes should use Get-CurrentOfflineControlSetName to preserve LKGC.
     function Get-OfflineControlSetNames {
@@ -5978,7 +6324,7 @@ loaded from them must be unloaded first.
 
     function Export-OfflineSystemKeyBackup {
         param(
-            [Parameter(Mandatory = $true)][ValidatePattern('^HKLM:\\BROKENSYSTEM\\.+$')][string]$Path,
+            [Parameter(Mandatory = $true)][ValidatePattern('^HKLM:\\BROKEN(SYSTEM|SOFTWARE)\\.+$')][string]$Path,
             [Parameter(Mandatory = $true)][ValidatePattern('^[A-Za-z0-9_-]+$')][string]$Label
         )
         $directory = Join-Path $script:WinDriveLetter 'Windows\Temp\RepairAzVMDisk'
@@ -13694,6 +14040,10 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
         Write-Host "===================================================================`n" -ForegroundColor Cyan
 
         $findings = [System.Collections.Generic.List[PSCustomObject]]::new()
+        # The listener port drives the IPsec connection security rule scope test below.
+        # Initialised here so a guest with no RDP-Tcp key still evaluates against the
+        # documented default rather than carrying a value over from an earlier call.
+        $script:_sysCheckRdpPort = 3389
         $scriptFile = if ($PSCommandPath) { Split-Path -Leaf $PSCommandPath } else { 'Repair-AzVMDisk.ps1' }
 
         # Inline helper: emit one finding to the console and add it to $findings.
@@ -13845,6 +14195,13 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
         # Firewall
         $sevFirewallRdpBlocked = 1   # No inbound RDP rule enabled in firewall
         $sevFirewallLoopbackAccess = 1   # Protected AppCs value could not be inspected as SYSTEM
+        # IPsec connection security rules (ConSecRules) - see -FixWFPRules
+        $sevConSecRdpBlocked = 2   # Active require-inbound-IPsec rule proven to cover RDP
+        $sevConSecRdpConditional = 1   # Active require-inbound-IPsec rule that may cover RDP (scope unresolvable offline)
+        $sevConSecGpoRdpBlocked = 2   # Same, delivered by Group Policy (returns at next policy refresh)
+        $sevConSecUnknownAction = 0   # Active rule whose Action token is not a recognised value
+        $sevConSecReadFailed = 1   # ConSecRules store exists but could not be read
+        $sevConSecMalformed = 0   # Rule string did not parse cleanly against the [MS-GPFAS] grammar
         # Image File Execution Options (IFEO)
         $sevIFEODebugger = 2   # IFEO Debugger set on critical service binary (prevents service from starting)
         $sevIFEODebuggerNonCritical = 1   # IFEO Debugger set on non-critical executable
@@ -13906,6 +14263,52 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
 
         # Inline converter: integer level -> severity string used by $emit
         $toSev = { param([int]$L) switch ($L) { 0 { 'INFO' } 1 { 'WARN' } 2 { 'CRIT' } default { 'INFO' } } }
+
+        # Shared reporting for both ConSecRules stores. Called as:
+        #   & $emitConSec $state $blockedLevel $conditionalLevel '-FixWFPRules' $extraNote
+        $emitConSec = {
+            param($State, [int]$BlockedLevel, [int]$ConditionalLevel, [string]$FixSwitch, [string]$ExtraNote = '')
+
+            $where = $State.Label
+            $port = $script:_sysCheckRdpPort
+
+            if (-not $State.PathExists -or ($State.RuleCount -eq 0 -and -not $State.ReadFailed)) {
+                & $emit 'Firewall' 'OK' "No IPsec connection security rules present ($where)"
+                return
+            }
+            if ($State.ReadFailed) {
+                # Reporting "none found" for a key that could not be opened would be a
+                # false all-clear on exactly the fault this check exists to catch.
+                & $emit 'Firewall' (& $toSev $sevConSecReadFailed) "Could not read the IPsec connection security rules ($where) - a rule requiring inbound IPsec would not be visible here: $($State.ReadError)"
+                return
+            }
+            if ($State.PermissionsAdjusted) {
+                & $emit 'Firewall' 'INFO' "$where denied read access; SYSTEM temporarily took ownership and restored the captured owner and DACL after reading"
+            }
+
+            $blocking = @($State.Rules | Where-Object { $_.Impact.Verdict -eq 'Blocking' })
+            $conditional = @($State.Rules | Where-Object { $_.Impact.Verdict -eq 'Conditional' })
+            $unknownAction = @($State.Rules | Where-Object { $_.Impact.Verdict -eq 'Unknown' })
+            $inert = @($State.Rules | Where-Object { $_.Impact.Verdict -eq 'Inert' })
+            $malformed = @($State.Rules | Where-Object { $_.Impact.Malformed })
+
+            foreach ($rule in $blocking) {
+                & $emit 'RDP' (& $toSev $BlockedLevel) ("IPsec connection security rule is BLOCKING inbound RDP ({0}): {1} - {2}. Inbound RDP is dropped inside WFP before the listener sees it, so the connection just times out{3}" -f $where, (Get-ConSecRuleDescription $rule), $rule.Impact.Reason, $ExtraNote) $FixSwitch
+            }
+            foreach ($rule in $conditional) {
+                & $emit 'RDP' (& $toSev $ConditionalLevel) ("IPsec connection security rule MAY block inbound RDP ({0}): {1} - {2}. {3} only neutralises rules proven to cover RDP, so review this one by hand{4}" -f $where, (Get-ConSecRuleDescription $rule), $rule.Impact.Reason, $FixSwitch, $ExtraNote)
+            }
+            foreach ($rule in $unknownAction) {
+                & $emit 'Firewall' (& $toSev $sevConSecUnknownAction) ("IPsec connection security rule with an unrecognised action ({0}): {1} - {2}" -f $where, (Get-ConSecRuleDescription $rule), $rule.Impact.Reason)
+            }
+            if ($malformed.Count -gt 0) {
+                & $emit 'Firewall' (& $toSev $sevConSecMalformed) "$($malformed.Count) of $($State.RuleCount) IPsec connection security rule string(s) ($where) did not parse cleanly against the [MS-GPFAS] grammar; their effect on RDP may be understated"
+            }
+            if ($blocking.Count -eq 0 -and $conditional.Count -eq 0) {
+                $inertNote = if ($inert.Count -gt 0) { ", $($inert.Count) inactive" } else { '' }
+                & $emit 'Firewall' 'OK' "$($State.RuleCount) IPsec connection security rule(s) present ($where)$inertNote; none require inbound IPsec on a scope covering RDP on TCP $port"
+            }
+        }
 
         # -- 1. Disk & Filesystem -------------------------------------------------
         Write-Host "--- Disk & Filesystem" -ForegroundColor DarkGray
@@ -14763,6 +15166,7 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
 
                     # Port number
                     $rdpPort = $rdpP.PortNumber
+                    if ($null -ne $rdpPort -and $rdpPort -ge 1 -and $rdpPort -le 65535) { $script:_sysCheckRdpPort = [int]$rdpPort }
                     if ($null -ne $rdpPort -and $rdpPort -ne 3389) {
                         & $emit 'RDP' (& $toSev $sevRdpNonDefaultPort) "RDP-Tcp port is $rdpPort (not the default 3389) - ensure firewall allows this port or run -FixRDP to reset" "-FixRDP"
                     }
@@ -15212,6 +15616,14 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
                     }
                 }
 
+                # An IPsec connection security rule that requires inbound security drops
+                # unsecured inbound SYNs inside WFP, so RDP times out while the listener,
+                # the service state and the inbound firewall rules all look correct.
+                $conSecState = Get-ConSecRuleStoreState `
+                    -StorePath "$svcRoot\SharedAccess\Parameters\FirewallPolicy\ConSecRules" `
+                    -StoreLabel 'local store' -RdpPort $script:_sysCheckRdpPort
+                & $emitConSec $conSecState $sevConSecRdpBlocked $sevConSecRdpConditional '-FixWFPRules'
+
                 # -- Gen2 UEFI / Trusted Launch security (registry-based) ------------
                 if ($script:VMGen -eq 2) {
                     Write-Host "--- Gen2 UEFI / Trusted Launch Security" -ForegroundColor DarkGray
@@ -15627,6 +16039,15 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
 
                 # AppIDSvc - if enforcing above, check service state
                 # (service state is in SYSTEM hive, checked there; this just notes correlation)
+
+                # Group Policy can deliver its own connection security rules. These are
+                # enforced exactly like the local ones, but a local edit only survives
+                # until the next policy refresh rewrites the cached copy.
+                $conSecGpoState = Get-ConSecRuleStoreState `
+                    -StorePath 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\WindowsFirewall\ConSecRules' `
+                    -StoreLabel 'Group Policy store' -RdpPort $script:_sysCheckRdpPort
+                & $emitConSec $conSecGpoState $sevConSecGpoRdpBlocked $sevConSecRdpConditional '-FixWFPRules' `
+                    '. This rule is delivered by Group Policy, so neutralising it offline gets the VM back but it returns at the next policy refresh - the durable fix is in the GPO'
 
                 # NLA policy via Group Policy / TS Policy path (SOFTWARE side)
                 $tsPolicyBase = 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
@@ -17443,6 +17864,145 @@ Default and LastKnownGood control sets are not modified.
                     ReplacedExistingRenamed = [bool]$afterState.ReplacedExistingRenamed
                     EmptyValueCreated    = [bool]$afterState.EmptyValueCreated
                     ExecutedAsSystem      = $true
+                }
+            }
+        }
+    }
+
+    function FixWFPRules {
+        # Neutralises an IPsec connection security rule that requires inbound security on
+        # a scope covering RDP. Only the Active token is flipped: that is the smallest
+        # change that restores inbound RDP, it is reversible, and it leaves the rule's
+        # definition intact for review. Deleting the rule belongs to Remove-NetIPsecRule
+        # once the guest is running and BFE/MpsSvc are available to validate the store.
+        Write-Host "Checking the offline IPsec connection security rules (ConSecRules)..." -ForegroundColor Yellow
+        Invoke-WithHive 'SYSTEM', 'SOFTWARE' {
+            & {
+                $systemRoot = Get-SystemRootPath
+                $controlSet = Get-CurrentOfflineControlSetName
+
+                # A port-scoped rule only matters if its scope covers the real listener
+                # port, so the guest's own RDP-Tcp port drives the test, not a constant.
+                $rdpPort = 3389
+                $rdpTcp = Get-ItemProperty "$systemRoot\Control\Terminal Server\WinStations\RDP-Tcp" -ErrorAction SilentlyContinue
+                if ($null -ne $rdpTcp -and $null -ne $rdpTcp.PortNumber) {
+                    $candidate = 0
+                    if ([int]::TryParse([string]$rdpTcp.PortNumber, [ref]$candidate) -and $candidate -ge 1 -and $candidate -le 65535) {
+                        $rdpPort = $candidate
+                    }
+                }
+
+                $stores = @(
+                    [PSCustomObject]@{ Label = 'local store'; Path = "$systemRoot\Services\SharedAccess\Parameters\FirewallPolicy\ConSecRules"; BackupLabel = 'ConSecRules'; IsPolicy = $false },
+                    [PSCustomObject]@{ Label = 'Group Policy store'; Path = 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\WindowsFirewall\ConSecRules'; BackupLabel = 'ConSecRulesPolicy'; IsPolicy = $true }
+                )
+
+                $targets = [System.Collections.Generic.List[object]]::new()
+                $policyTargeted = $false
+                foreach ($store in $stores) {
+                    $state = Get-ConSecRuleStoreState -StorePath $store.Path -StoreLabel $store.Label -RdpPort $rdpPort
+                    if ($state.ReadFailed) {
+                        Write-Warning "Could not read the IPsec connection security rules in the $($store.Label): $($state.ReadError)"
+                        continue
+                    }
+                    if (-not $state.PathExists) { continue }
+
+                    foreach ($rule in @($state.Rules | Where-Object { $_.Impact.Verdict -eq 'Conditional' })) {
+                        Write-Host "  [skip] $($store.Label): $(Get-ConSecRuleDescription $rule) - $($rule.Impact.Reason). Left unchanged; its scope could not be proven from the offline disk." -ForegroundColor DarkYellow
+                    }
+                    foreach ($rule in @($state.Rules | Where-Object { $_.Impact.Verdict -eq 'Blocking' })) {
+                        if ($rule.Kind -ne 'String') {
+                            Write-Warning "Rule $($rule.RuleId) in the $($store.Label) is $($rule.Kind), not REG_SZ as the documented grammar requires. It was left unchanged."
+                            continue
+                        }
+                        $disabled = Get-ConSecRuleDisabledString -RuleString $rule.Raw
+                        if (-not $disabled) {
+                            Write-Warning "Rule $($rule.RuleId) in the $($store.Label) blocks RDP but its Active token is not in the expected single 'Active=TRUE' form. It was left unchanged."
+                            continue
+                        }
+                        $targets.Add([PSCustomObject]@{ Store = $store; Rule = $rule; After = $disabled })
+                        if ($store.IsPolicy) { $policyTargeted = $true }
+                    }
+                }
+
+                if ($targets.Count -eq 0) {
+                    Write-Host "  [OK] No active IPsec connection security rule requires inbound security on a scope covering RDP on TCP $rdpPort. No changes were made." -ForegroundColor Green
+                    return
+                }
+
+                $detailLines = foreach ($target in $targets) {
+                    "  $($target.Store.Label): $(Get-ConSecRuleDescription $target.Rule)`n    $($target.Rule.Impact.Reason)`n    before: $($target.Rule.Raw)`n    after : $($target.After)"
+                }
+                $policyNote = if ($policyTargeted) {
+                    "`nOne or more rules come from Group Policy. Neutralising them offline restores`nRDP, but the next policy refresh rewrites the cached copy - fix the GPO as well."
+                }
+                else { '' }
+
+                if (-not (Confirm-CriticalOperation -Operation 'Neutralise IPsec connection security rules blocking RDP (-FixWFPRules)' -Details @"
+Sets Active=TRUE to Active=FALSE on $($targets.Count) connection security rule(s) that
+require inbound IPsec on a scope covering RDP on TCP $rdpPort. Every other token in each
+rule string is preserved byte for byte, and no rule is deleted.
+
+$($detailLines -join "`n")
+
+Each store is exported to a .reg backup first. Only $controlSet is modified;
+Default and LastKnownGood control sets are not touched.$policyNote
+"@)) { return }
+
+                $backups = @{}
+                foreach ($storePath in @($targets | ForEach-Object { $_.Store.Path } | Sort-Object -Unique)) {
+                    $store = @($targets | Where-Object { $_.Store.Path -eq $storePath })[0].Store
+                    $backups[$storePath] = Export-OfflineSystemKeyBackup -Path $storePath -Label $store.BackupLabel
+                }
+
+                foreach ($target in $targets) {
+                    Set-ItemProperty-Logged -Path $target.Store.Path -Name $target.Rule.RuleId -Value $target.After -PropertyType String
+                }
+
+                # Re-read through the same parser that classified the fault. Confirming the
+                # verdict flipped to Inert proves the write achieved its purpose, and
+                # comparing the raw string proves nothing else in the rule moved.
+                $verified = 0
+                foreach ($storePath in @($targets | ForEach-Object { $_.Store.Path } | Sort-Object -Unique)) {
+                    $store = @($targets | Where-Object { $_.Store.Path -eq $storePath })[0].Store
+                    $after = Get-ConSecRuleStoreState -StorePath $storePath -StoreLabel $store.Label -RdpPort $rdpPort
+                    foreach ($target in @($targets | Where-Object { $_.Store.Path -eq $storePath })) {
+                        $now = @($after.Rules | Where-Object { $_.RuleId -eq $target.Rule.RuleId })
+                        if ($now.Count -ne 1 -or $now[0].Raw -cne $target.After -or $now[0].Impact.Verdict -ne 'Inert') {
+                            throw "Verification failed for rule $($target.Rule.RuleId) in the $($store.Label). A .reg backup of the key was written to $($backups[$storePath])."
+                        }
+                        $verified++
+                    }
+                }
+
+                foreach ($target in $targets) {
+                    Write-Host "  [OK] $($target.Store.Label): neutralised $(Get-ConSecRuleDescription $target.Rule)" -ForegroundColor Green
+                }
+                Write-Host "  [OK] $verified of $($targets.Count) rule(s) verified inactive in $controlSet." -ForegroundColor Green
+                Write-Warning "Boot the guest and confirm RDP, then remove the rule through the supported path: Remove-NetIPsecRule -Name '<rule id>'. BFE and MpsSvc must be running for that cmdlet to work."
+                if ($policyTargeted) {
+                    Write-Warning "A Group Policy connection security rule was neutralised in the cached policy store. It will return at the next policy refresh unless the GPO itself is corrected."
+                }
+
+                Write-ActionLog -Event 'FixWFPRules' -Details @{
+                    ControlSet    = $controlSet
+                    RdpPort       = $rdpPort
+                    RuleCount     = $targets.Count
+                    VerifiedCount = $verified
+                    PolicyStoreTouched = $policyTargeted
+                    Backups       = [string[]]@($backups.Values)
+                    Rules         = @($targets | ForEach-Object {
+                            @{
+                                Store   = $_.Store.Label
+                                Path    = $_.Store.Path
+                                RuleId  = $_.Rule.RuleId
+                                Name    = $_.Rule.Impact.Name
+                                Action  = $_.Rule.Impact.Action
+                                Reason  = $_.Rule.Impact.Reason
+                                Before  = $_.Rule.Raw
+                                After   = $_.After
+                            }
+                        })
                 }
             }
         }
@@ -21771,6 +22331,7 @@ No destructive file or registry cleanup is performed.
             [switch]$DisableStartupPrograms,
             [switch]$DisableFirewall,
             [switch]$FixFirewallDebugLoopbackApps,
+            [switch]$FixWFPRules,
             [switch]$LeaveDiskOnline,
             [switch]$SkipCatalogVerification,
             [ValidateSet('SYSTEM', 'SOFTWARE', 'COMPONENTS', 'SAM', 'SECURITY')][string[]]$LoadHive = @(),
@@ -21933,6 +22494,7 @@ PARAMETERS:
   -DisableFirewall       Disable Windows Firewall for all profiles (Domain/Private/Public)
   -EnableBFE             Re-enable Base Filtering Engine service
   -FixFirewallDebugLoopbackApps  Archive mpssvc DebugedLoopbackApps and recreate an empty value
+  -FixWFPRules               Neutralise IPsec connection security rules that block inbound RDP
                                   when duplicate SIDs risk the Firewall error 0x45b start/stop loop;
                                   captures/restores the existing AppCs owner/DACL around the repair
   -FixNetBindings        Remove orphaned third-party network binding components (missing binary; prevents NDIS init failure)
@@ -22170,6 +22732,7 @@ AVAILABLE DISKS:
             if ($DisableStartupPrograms) { DisableStartupPrograms }
             if ($DisableFirewall) { DisableFirewall }
             if ($FixFirewallDebugLoopbackApps) { FixFirewallDebugLoopbackApps }
+            if ($FixWFPRules) { FixWFPRules }
 
             # -LoadHive: mount requested hives and leave them loaded for manual inspection
             foreach ($hive in $LoadHive) {
