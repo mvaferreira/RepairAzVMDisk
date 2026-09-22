@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.8.8
+        Version: 0.8.9
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -7890,6 +7890,115 @@ del /F C:\Temp\adduser.cmd > NUL
         }
     }
 
+    # NT AUTHORITY\SYSTEM. Well-known SIDs are issued identically on every Windows
+    # installation, so matching a descriptor by SID rather than by the translated name is
+    # what makes these checks work against an offline hive, where name resolution would
+    # depend on a SAM this process is not using.
+    $script:SidSystem = 'S-1-5-18'
+
+    function Get-RdpCertificateStoreKeySpec {
+        # The Remote Desktop certificate store, as it appears in the mounted SOFTWARE hive.
+        #
+        # "Cert:\LocalMachine\Remote Desktop" is only a provider view over the registry.
+        # The store really is HKLM\SOFTWARE\Microsoft\SystemCertificates\Remote Desktop,
+        # with one subkey per certificate under Certificates, which is why an offline
+        # repair can reach it at all.
+        #
+        # BOTH keys are judged, because they are not the same key and a deny on either one
+        # is enough. "Remote Desktop" is the store that has to be opened; "Certificates"
+        # below it is where the certificate is actually written, as a subkey named for its
+        # thumbprint. A check covering only one of the two would pass a machine that is
+        # still broken.
+        return @(
+            [PSCustomObject]@{ Path = 'HKLM:\BROKENSOFTWARE\Microsoft\SystemCertificates\Remote Desktop'; Label = 'Remote Desktop' }
+            [PSCustomObject]@{ Path = 'HKLM:\BROKENSOFTWARE\Microsoft\SystemCertificates\Remote Desktop\Certificates'; Label = 'Remote Desktop\Certificates' }
+        )
+    }
+
+    function Get-RdpCertificateStoreDenyState {
+        # Must be called inside Invoke-WithHive 'SOFTWARE'.
+        #
+        # Reports, for each store key, whether NT AUTHORITY\SYSTEM is denied the rights
+        # that creating the listener certificate needs, and whether that deny is written
+        # on the key itself or inherited from a key above it.
+        #
+        # This is the registry half of the RDP certificate path. Repairing the MachineKeys
+        # permissions and leaving a deny here produces a VM that still fails with "An
+        # internal error has occurred": Windows never gets as far as needing the private
+        # key, because it cannot create the certificate entry in the first place.
+        return @(Get-RdpCertificateStoreKeySpec | ForEach-Object {
+                $probe = Get-RegistryKeyAccessProbe -Path $_.Path
+                $deny = if ($probe.Sddl) {
+                    # KEY_SET_VALUE | KEY_CREATE_SUB_KEY. Registry rights are a different
+                    # set from the file rights used on MachineKeys; these two are what a
+                    # deny has to block to stop the certificate being written to the store.
+                    Get-RegistrySddlDeny -Sddl $probe.Sddl -Sid $script:SidSystem -Mask 0x0006
+                }
+                else { $null }
+
+                [PSCustomObject]@{
+                    Path     = $_.Path
+                    Label    = $_.Label
+                    Exists   = $probe.Exists
+                    Sddl     = $probe.Sddl
+                    Refused  = $probe.Refused
+                    Denied   = [bool]($deny -and $deny.Denied)
+                    Explicit = [bool]($deny -and $deny.Explicit)
+                }
+            })
+    }
+
+    function ResetRDPCertificateStoreAccess {
+        # Removes a Deny entry for SYSTEM from the Remote Desktop certificate store keys.
+        #
+        # This is the one repair in the script that takes an access control entry away
+        # rather than granting one, and the narrowness is deliberate: only Deny entries,
+        # only for SYSTEM, only those written on the key itself, only on these two keys.
+        # SYSTEM is the account that creates the listener certificate, so a deny against
+        # it on the store the certificate is created in has no legitimate purpose.
+        # Everything else in the descriptor - including entries an administrator added on
+        # purpose - is carried across untouched, and the original SDDL is logged.
+        #
+        # An INHERITED deny is reported and left alone. It is a copy of an entry on
+        # HKLM\SOFTWARE\Microsoft\SystemCertificates or higher, which every machine
+        # certificate store on the VM lives under. Removing the copy would leave the
+        # original to be propagated again, and editing the parent to fix one store changes
+        # the permissions of all of them - an operator's decision, not this script's.
+        #
+        # An absent store is not a fault: Windows recreates the store, the Certificates
+        # key and the certificate in it. Only a store that refuses SYSTEM is.
+        Write-Host "Checking Remote Desktop certificate store permissions..." -ForegroundColor Green
+
+        Invoke-WithHive 'SOFTWARE' {
+            # Child scope: the registry data dies with the block, releasing .NET
+            # RegistryKey handles before the finally block calls UnmountOffHive.
+            & {
+                foreach ($state in (Get-RdpCertificateStoreDenyState)) {
+                    if (-not $state.Exists) {
+                        Write-Host "  $($state.Label): not present - not a fault, Windows recreates the store and the certificate in it." -ForegroundColor DarkGray
+                        continue
+                    }
+                    if (-not $state.Sddl) {
+                        Write-Warning "  $($state.Label): the security descriptor could not be read, so whether Windows can create a certificate there is unknown. It was left alone."
+                        continue
+                    }
+                    if (-not $state.Denied) {
+                        Write-Host "  $($state.Label): NT AUTHORITY\SYSTEM is not denied (no change needed)." -ForegroundColor DarkGray
+                        continue
+                    }
+                    if (-not $state.Explicit) {
+                        Write-Warning "  $($state.Label): the deny on NT AUTHORITY\SYSTEM is INHERITED from a parent key rather than written here, so removing it here would not hold. Remove it from HKLM\SOFTWARE\Microsoft\SystemCertificates (or higher) by hand - that key is shared by every machine certificate store on this VM. Current: $($state.Sddl)"
+                        continue
+                    }
+
+                    Write-Host "  $($state.Label): NT AUTHORITY\SYSTEM is explicitly denied - removing the deny entries..." -ForegroundColor Yellow
+                    $null = Remove-ProtectedRegistryKeyDeny -Path $state.Path -Sid $script:SidSystem -GrantMask 0xF003F `
+                        -Description "$($state.Label): removed the entries denying NT AUTHORITY\SYSTEM, so Windows can create the listener certificate again."
+                }
+            } # end & { } child scope - registry handles die here
+        }
+    }
+
     function ResetRDPPrivKeyPermissions {
         Write-Host "Resetting Windows RSA MachineKeys permissions..." -ForegroundColor Green
         $machineKeysPath = "$($script:WinDriveLetter)ProgramData\Microsoft\Crypto\RSA\MachineKeys"
@@ -7959,6 +8068,13 @@ del /F C:\Temp\adduser.cmd > NUL
         Enable-ServiceOrDriver -ServiceName KeyIso -StartValue 3
         Enable-ServiceOrDriver -ServiceName CryptSvc -StartValue 2
         Enable-ServiceOrDriver -ServiceName SessionEnv -StartValue 3
+
+        # The private key is only half the certificate path. The other half is the
+        # registry store the certificate itself is written into, and a deny for SYSTEM
+        # there stops the certificate being created at all - so the key permissions above
+        # would be repaired on a VM that still refuses every RDP client. Repaired last so
+        # the store is already reachable when the services start.
+        ResetRDPCertificateStoreAccess
     }
 
     function RecreateRDPCertificate {
@@ -9445,6 +9561,278 @@ public static class RepairAzVmDiskBackupRegistry
         # later reg unload from failing.
         [System.GC]::Collect()
         [System.GC]::WaitForPendingFinalizers()
+    }
+
+    function Get-RegistryKeyAccessProbe {
+        # Whether an offline hive key exists, plus its descriptor, telling "not there"
+        # apart from "there and refusing this account".
+        #
+        # Test-Path answers $false for both, and on a certificate store path that single
+        # answer is the dangerous one: a store key denied to SYSTEM would be reported as
+        # "no store, and an absent store is not a fault" - the exact opposite of the
+        # truth, on the very machine the check exists to catch.
+        #
+        # OpenSubKey separates them. It returns null only for a key that is absent, and
+        # throws for one that is present and refused, so the two are never confused. The
+        # owner of a key keeps READ_CONTROL and WRITE_DAC whatever the DACL says, so a key
+        # denied to SYSTEM is usually still readable from here; when it is not,
+        # Get-ProtectedRegistryKeySddl falls back to the backup-privilege read, and only a
+        # null from that means genuinely unreadable.
+        param([Parameter(Mandatory = $true)][string]$Path)
+
+        $subKey = ConvertTo-HklmSubKeyPath -Path $Path
+        if (-not $subKey) { return [PSCustomObject]@{ Exists = $false; Sddl = $null; Refused = $false } }
+
+        $exists = $false
+        $key = $null
+        try {
+            $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+                $subKey,
+                [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadSubTree,
+                [System.Security.AccessControl.RegistryRights]::ReadPermissions)
+            $exists = ($null -ne $key)
+        }
+        catch {
+            # Thrown rather than null: the key is there and this account may not open it.
+            $exists = $true
+        }
+        finally {
+            # Every handle must be closed or the hive will refuse to unload later.
+            if ($key) { $key.Close() }
+        }
+
+        if (-not $exists) { return [PSCustomObject]@{ Exists = $false; Sddl = $null; Refused = $false } }
+
+        $sddl = Get-ProtectedRegistryKeySddl -Path $Path
+        return [PSCustomObject]@{ Exists = $true; Sddl = $sddl; Refused = (-not $sddl) }
+    }
+
+    function Get-RegistrySddlDeny {
+        # Whether a SID is denied an access by a descriptor, and whether that deny is
+        # written on the key itself rather than inherited from a key above it.
+        #
+        # The distinction decides what may be repaired. An explicit entry on the key can
+        # be removed there. An inherited one is a copy of an entry on a parent - for the
+        # certificate stores that is HKLM\SOFTWARE\Microsoft\SystemCertificates or higher,
+        # which every machine certificate store on the VM lives under. Removing the copy
+        # would leave the original to be propagated again, and reaching up to the original
+        # would change the permissions of every other store on the machine to fix one. So
+        # an inherited deny is named and left to an operator.
+        param(
+            [Parameter(Mandatory = $true)][string]$Sddl,
+            [Parameter(Mandatory = $true)][string]$Sid,
+            [Parameter(Mandatory = $true)][int]$Mask
+        )
+
+        $any = $false
+        $explicit = $false
+        $inheritedFlag = [int][System.Security.AccessControl.AceFlags]::Inherited
+
+        $raw = [System.Security.AccessControl.RawSecurityDescriptor]::new($Sddl)
+        if ($null -ne $raw.DiscretionaryAcl) {
+            foreach ($ace in $raw.DiscretionaryAcl) {
+                if ($ace.SecurityIdentifier.Value -ne $Sid) { continue }
+                if ($ace.AceType.ToString() -notlike '*Denied*') { continue }
+                if (-not ($ace.AccessMask -band $Mask)) { continue }
+                $any = $true
+                if (-not ([int]$ace.AceFlags -band $inheritedFlag)) { $explicit = $true }
+            }
+        }
+
+        return [PSCustomObject]@{ Denied = $any; Explicit = $explicit }
+    }
+
+    function Remove-ProtectedRegistryKeyDeny {
+        # Removes the Deny entries for one SID from an offline hive key, leaving the rest
+        # of the descriptor exactly as found.
+        #
+        # Every other registry helper here only ever ADDS access, so this one is
+        # deliberately narrow: only entries of type Deny, only for the SID it is given,
+        # only those written on the key itself, only on the key it is given. Inherited
+        # entries are left alone - they belong to a key above this one and are removed by
+        # repairing that key, not by stamping a copy of the parent's list here. Every
+        # other entry, including anything an administrator added on purpose, is carried
+        # across untouched.
+        #
+        # The new descriptor is built from the ORIGINAL capture, not from whatever is on
+        # the key after ownership has been taken. That matters: Grant-ProtectedRegistry-
+        # KeyAccess adds a FullControl entry for this account so the write can happen at
+        # all, and building from the original is what keeps that borrowed entry out of the
+        # result. It also means Restore-ProtectedRegistryKeyAccess must NOT be called
+        # against this key after a successful write - replaying the capture would put the
+        # deny straight back. The owner is handed back by hand instead.
+        #
+        # An allow entry is added only when removing the deny would leave the SID without
+        # the access. A key that already grants it, explicitly or by inheritance, comes
+        # away with nothing added.
+        param(
+            [Parameter(Mandatory = $true)][string]$Path,
+            [Parameter(Mandatory = $true)][string]$Sid,
+            [Parameter(Mandatory = $true)][int]$GrantMask,
+            [Parameter(Mandatory = $true)][string]$Description
+        )
+
+        # Offline hives only. The other helpers are reached through BROKEN* paths too, but
+        # this is the one that takes access away, so the guard is explicit rather than
+        # implied: a live HKLM path must never reach it.
+        if ($Path -notmatch '^(?i)HKLM:\\BROKEN') {
+            throw "Remove-ProtectedRegistryKeyDeny refuses '$Path': it is not a key in a mounted offline hive."
+        }
+
+        $originalSddl = Get-ProtectedRegistryKeySddl -Path $Path
+        if (-not $originalSddl) {
+            Write-Warning "Could not read the security descriptor of $Path, so it was left alone."
+            return $false
+        }
+
+        $target = [System.Security.Principal.SecurityIdentifier]::new($Sid)
+
+        # Built once, from the original, and reused by both the plain attempt and the retry.
+        $desired = {
+            $raw = [System.Security.AccessControl.RawSecurityDescriptor]::new($originalSddl)
+            $acl = $raw.DiscretionaryAcl
+            $inheritedFlag = [int][System.Security.AccessControl.AceFlags]::Inherited
+            $kept = @()
+            if ($null -ne $acl) {
+                $kept = @($acl | Where-Object {
+                        -not ($_.SecurityIdentifier -eq $target -and
+                            $_.AceType.ToString() -like '*Denied*' -and
+                            -not ([int]$_.AceFlags -band $inheritedFlag))
+                    })
+            }
+
+            # Inherited allows count. On a measured healthy store the access SYSTEM needs
+            # arrives entirely by inheritance, so a key whose only fault was the deny comes
+            # away byte-identical to the baseline rather than carrying an added entry.
+            $granted = @($kept | Where-Object {
+                    $_.SecurityIdentifier -eq $target -and $_.AceType -eq 'AccessAllowed' -and
+                    (($_.AccessMask -band $GrantMask) -eq $GrantMask)
+                }).Count -gt 0
+
+            if (-not $granted) {
+                $kept += [System.Security.AccessControl.CommonAce]::new(
+                    [System.Security.AccessControl.AceFlags]::None,
+                    [System.Security.AccessControl.AceQualifier]::AccessAllowed,
+                    $GrantMask, $target, $false, $null)
+            }
+
+            # Canonical order: explicit deny, explicit allow, inherited deny, inherited
+            # allow. .NET refuses to work with a list that is out of order, and a hardening
+            # tool is exactly what produces one.
+            $ordered = @(
+                @($kept | Where-Object { -not ([int]$_.AceFlags -band $inheritedFlag) -and $_.AceType.ToString() -like '*Denied*' })
+                @($kept | Where-Object { -not ([int]$_.AceFlags -band $inheritedFlag) -and $_.AceType.ToString() -notlike '*Denied*' })
+                @($kept | Where-Object { ([int]$_.AceFlags -band $inheritedFlag) -and $_.AceType.ToString() -like '*Denied*' })
+                @($kept | Where-Object { ([int]$_.AceFlags -band $inheritedFlag) -and $_.AceType.ToString() -notlike '*Denied*' })
+            )
+
+            $revision = if ($null -ne $acl) { $acl.Revision } else { 2 }
+            $newAcl = [System.Security.AccessControl.RawAcl]::new($revision, $ordered.Count)
+            for ($i = 0; $i -lt $ordered.Count; $i++) { $newAcl.InsertAce($i, $ordered[$i]) }
+            $raw.DiscretionaryAcl = $newAcl
+
+            $bytes = [byte[]]::new($raw.BinaryLength)
+            $raw.GetBinaryForm($bytes, 0)
+
+            $sd = [System.Security.AccessControl.RegistrySecurity]::new()
+            # The Access section alone, so the owner is not rewritten by a repair that is
+            # about the DACL.
+            $sd.SetSecurityDescriptorBinaryForm($bytes, [System.Security.AccessControl.AccessControlSections]::Access)
+            return $sd
+        }
+
+        $write = {
+            $subKey = ConvertTo-HklmSubKeyPath -Path $Path
+            if (-not $subKey) { throw "$Path is not a key in a mounted offline hive." }
+
+            $key = $null
+            try {
+                $rights = [System.Security.AccessControl.RegistryRights]::ReadPermissions -bor
+                [System.Security.AccessControl.RegistryRights]::ChangePermissions
+                $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+                    $subKey, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, $rights)
+                if (-not $key) { throw "$subKey could not be opened to change its permissions." }
+                $key.SetAccessControl((& $desired))
+            }
+            finally { if ($key) { $key.Close() } }
+        }
+
+        $verify = {
+            $probe = Get-RegistryKeyAccessProbe -Path $Path
+            if (-not $probe.Sddl) { return $false }
+            return -not (Get-RegistrySddlDeny -Sddl $probe.Sddl -Sid $Sid -Mask $GrantMask).Explicit
+        }
+
+        $logRepair = {
+            param([bool]$TookOwnership)
+            Write-ActionLog -Event 'RegistryDenyRemoved' -Details @{
+                Path           = $Path
+                Sid            = $Sid
+                Description    = $Description
+                TookOwnership  = $TookOwnership
+                OriginalSddl   = $originalSddl
+            }
+        }
+
+        try {
+            & $write
+            if (& $verify) {
+                Write-Host "  $Description" -ForegroundColor Green
+                Write-Host "  Original descriptor was $originalSddl" -ForegroundColor DarkGray
+                & $logRepair $false
+                return $true
+            }
+            Write-Host "  $Path still denies the account after the permission change; taking ownership and retrying." -ForegroundColor DarkGray
+        }
+        catch {
+            Write-Host "  $Path refused the permission change ($($_.Exception.Message)); taking ownership and retrying." -ForegroundColor DarkGray
+        }
+
+        # The capture is taken only so the owner can be handed back. The DACL is
+        # deliberately NOT restored from it - that is the deny this whole function exists
+        # to remove.
+        try { Grant-ProtectedRegistryKeyAccess -Path $Path -KeyOnly }
+        catch {
+            Write-Warning "Ownership of $Path could not be taken ($($_.Exception.Message)), so its permissions were left alone."
+            return $false
+        }
+
+        try {
+            & $write
+            if (-not (& $verify)) { throw 'the deny entry was still present after the write.' }
+        }
+        catch {
+            Restore-ProtectedRegistryKeyAccess -Path $Path -Sddl $originalSddl
+            Write-Warning "$Path could not be repaired ($($_.Exception.Message)); its original permissions were put back."
+            return $false
+        }
+
+        # Hand the key back. Only the owner is replayed; the DACL just written is what
+        # must survive.
+        $rawOriginal = [System.Security.AccessControl.RawSecurityDescriptor]::new($originalSddl)
+        if ($rawOriginal.Owner) {
+            $ownerKey = $null
+            try {
+                $subKey = ConvertTo-HklmSubKeyPath -Path $Path
+                $ownerKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+                    $subKey, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+                    [System.Security.AccessControl.RegistryRights]::TakeOwnership)
+                if ($ownerKey) {
+                    $ownerOnly = [System.Security.AccessControl.RegistrySecurity]::new()
+                    $ownerOnly.SetOwner($rawOriginal.Owner)
+                    $ownerKey.SetAccessControl($ownerOnly)
+                }
+            }
+            catch {
+                Write-Warning "Ownership of $Path could not be handed back to $($rawOriginal.Owner). Restore it by hand with: subinacl /keyreg `"$(ConvertTo-HklmSubKeyPath -Path $Path)`" /setowner=`"$($rawOriginal.Owner)`""
+            }
+            finally { if ($ownerKey) { $ownerKey.Close() } }
+        }
+
+        Write-Host "  $Description" -ForegroundColor Green
+        Write-Host "  Ownership was taken to do it. Original descriptor was $originalSddl" -ForegroundColor DarkGray
+        & $logRepair $true
+        return $true
     }
 
     function Test-RegistryAccessDenied {
@@ -14138,6 +14526,9 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
         $sevRdpKeyFileMissing = 1   # RDP private key file not found in MachineKeys
         $sevRdpKeyZeroLength = 1   # Zero-length files in MachineKeys
         $sevMachineKeysMissing = 1   # MachineKeys folder missing
+        $sevRdpCertStoreDenied = 2   # Remote Desktop cert store key explicitly denies SYSTEM
+        $sevRdpCertStoreDeniedInherited = 1   # ...denied, but the deny is inherited from a parent key
+        $sevRdpCertStoreUnreadable = 1   # Cert store key present but its descriptor could not be read
 
         # Security
         $sevCredentialGuard = 1   # Credential Guard is enabled
@@ -16374,6 +16765,41 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
         }
         else {
             & $emit 'RDP' (& $toSev $sevMachineKeysMissing) 'MachineKeys folder missing - RDP certificate operations will fail on boot' "-FixRDPPermissions"
+        }
+
+        # -- 7b. Remote Desktop certificate store (SOFTWARE hive) ------------------
+        # The second half of the certificate path. MachineKeys above holds the private
+        # key; this registry store is where the certificate itself is written, and a deny
+        # for SYSTEM here stops Windows creating one at all - the client reports "An
+        # internal error has occurred" and Schannel logs 36870, with the key permissions
+        # above perfectly healthy. Checking only the file system would call that VM clean.
+        Write-Host "--- RDP Certificate Store (registry)" -ForegroundColor DarkGray
+        Invoke-WithHive 'SOFTWARE' {
+            # Child scope: registry data dies here, releasing .NET RegistryKey handles
+            # before the finally block calls UnmountOffHive.
+            & {
+                foreach ($storeKey in (Get-RdpCertificateStoreDenyState)) {
+                    if (-not $storeKey.Exists) {
+                        # Not a fault. Windows recreates the store, the Certificates key
+                        # and the certificate in it on the next start.
+                        & $emit 'RDP' 'INFO' "Remote Desktop certificate store key '$($storeKey.Label)' is not present - Windows recreates it on the next start"
+                        continue
+                    }
+                    if (-not $storeKey.Sddl) {
+                        & $emit 'RDP' (& $toSev $sevRdpCertStoreUnreadable) "Remote Desktop certificate store key '$($storeKey.Label)' exists but its security descriptor could not be read, so whether Windows can create a listener certificate there is unknown"
+                        continue
+                    }
+                    if (-not $storeKey.Denied) {
+                        & $emit 'RDP' 'OK' "Remote Desktop certificate store key '$($storeKey.Label)': NT AUTHORITY\SYSTEM is not denied"
+                        continue
+                    }
+                    if (-not $storeKey.Explicit) {
+                        & $emit 'RDP' (& $toSev $sevRdpCertStoreDeniedInherited) "Remote Desktop certificate store key '$($storeKey.Label)': NT AUTHORITY\SYSTEM is denied write access, but the deny is INHERITED from a parent key (HKLM\SOFTWARE\Microsoft\SystemCertificates or higher) rather than written here - that key is shared by every machine certificate store on this VM, so remove it there by hand"
+                        continue
+                    }
+                    & $emit 'RDP' (& $toSev $sevRdpCertStoreDenied) "Remote Desktop certificate store key '$($storeKey.Label)': NT AUTHORITY\SYSTEM is explicitly DENIED write access - Windows cannot create the self-signed listener certificate, so RDP fails with 'An internal error has occurred' even when the private key permissions are correct" "-FixRDPPermissions"
+                }
+            } # end & { } child scope - registry handles die here
         }
 
         # -- Summary --------------------------------------------------------------
@@ -22509,7 +22935,7 @@ PARAMETERS:
   -FixRDP                Reset RDP settings, clear pinned listener cert, restore net services
   -FixRDPAuth            Set optimal RDP/NLA/NTLM auth policy for recovery
   -FixRDPCert            Recreate the self-signed RDP certificate
-  -FixRDPPermissions     Reset RDP private key and certificate service permissions
+  -FixRDPPermissions     Reset RDP private key, certificate store and certificate service permissions
 
 --- REGISTRY ------------------------------------------------------------------
   -CheckRegistryHealth         Read-only integrity check of SYSTEM/SOFTWARE hives using chkreg.exe

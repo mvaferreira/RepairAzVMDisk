@@ -228,7 +228,7 @@ unless `-Force` is supplied. Cold-boot the guest rather than resuming saved memo
 # Fix RDP certificate issues
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixRDPCert
 
-# Fix RDP private key permissions
+# Fix RDP private key and certificate store permissions
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixRDPPermissions
 
 # Fix RDP authentication settings
@@ -507,7 +507,7 @@ underlying fault may have more than one cause.
 | Random driver blue screens (0x7E, 0xD1, 0x50, 0x1E) or Driver Verifier crashes | Faulty third-party driver or active Driver Verifier | `-CollectMinidumps` → `-DisableDriverVerifier` → `-DisableThirdPartyDrivers` / `-DisableDriverOrService <name>` → `-TrySafeMode` | [Common blue screen][bsod] |
 | Boot blocked after enabling HVCI / Memory Integrity, or unsigned-driver block | Code-integrity / Secure Boot policy rejects a driver | `-DisableMemoryIntegrity` → `-FixSecureBootCodeIntegrity` → `-RepairSystemFile <driver>` | [Invalid image hash][cih], [Disabling Secure Boot][sb] |
 | Can't RDP — connection reaches the VM but authentication fails | NLA / certificate / auth-policy or RDP listener misconfig | `-FixRDP` → `-DisableNLA` → `-FixRDPAuth` → `-FixRDPCert` → `-FixRDPPermissions` | [Can't RDP][rdp], [RDP connection][rdpc], [Detailed RDP][rdpd] |
-| RDP "internal error" / "general error" | Broken RDP self-signed cert or key permissions | `-FixRDPCert` → `-FixRDPPermissions` → `-FixRDP` | [Internal error][rdpi], [General error][rdpg] |
+| RDP "internal error" / "general error" | Broken RDP self-signed cert, key permissions, or a SYSTEM **Deny** on the `Remote Desktop` certificate store | `-FixRDPCert` → `-FixRDPPermissions` → `-FixRDP` | [Internal error][rdpi], [General error][rdpg] |
 | No network after boot / NIC bindings broken | Orphaned network bindings, missing `netvsc`, or stuck stack | `-ScanNetBindings` → `-FixNetBindings` → `-EnsureSyntheticDriversEnabled` → `-ResetNetworkStack` → `-ResetInterfacesToDHCP` | [Boot errors][be] |
 | Locked out / forgot the local admin password | Lost credentials | `-ResetLocalAdminPassword` → `-AddTempUser` (or `-AddTempUser2` for domain-joined) | [Reset password offline][rpw], [Reset RDP][reset], [VMAccess][vma] |
 | Boot or logon blocked by policy | AppLocker, Credential Guard / LSA, or bad Group Policy | `-DisableAppLocker` → `-DisableCredentialGuard` → `-ResetGroupPolicy` → `-FixUserRights` | [Boot errors][be] |
