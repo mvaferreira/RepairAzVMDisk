@@ -179,20 +179,33 @@ unless `-Force` is supplied. Cold-boot the guest rather than resuming saved memo
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -RepairComponentStore -RepairSource "D:\sources\install.wim"
 
 # Repair a system file using architecture-validated WinSxS/DriverStore candidates.
+# A bare name is placed where Windows keeps it - System32\drivers, System32,
+# \Windows or System32\wbem, then the registry (SubSystems, KnownDLLs, service
+# ImagePath/ServiceDll) - so win32k.sys lands in System32, not drivers. Pass a
+# path relative to \Windows (System32\win32k.sys, SysWOW64\x.dll) when a name
+# is ambiguous.
 # Candidates also come from the Windows Resource Protection backup store
 # (WinSxS\Backup), which holds independent copies of inbox binaries; a candidate
 # that is a hard link to the damaged target, or whose content is not a real
-# binary, is rejected. If no candidate can be installed the script falls back to
-# offline "sfc /scanfile", first reverting pending servicing if SFC reports a
-# pending system repair, then retrying once.
+# binary, is rejected. Sources are tried in this order:
+#   1. a copy of the exact installed version
+#   2. offline "sfc /scanfile" (reverting pending servicing and retrying once if
+#      SFC reports a pending system repair)
+#   3. last resort: another revision of the SAME build (e.g. a superseded copy
+#      left in WinSxS), only if its static imports resolve against the installed
+#      modules and every installed module importing it still resolves. It is
+#      installed with a DOWNGRADE warning, a .replaced.bak and an undo hint; run
+#      DISM /RestoreHealth + sfc /scannow (or the latest CU) after boot.
+# If nothing passes, the repair is refused with a -RepairSystemFileSource hint.
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -RepairSystemFile "ntoskrnl.exe","ci.dll"
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -RepairSystemFile "win32k.sys"
 
-# Disable the offline SFC fallback and fail with a donor hint instead
+# Disable offline SFC and fail with a donor hint instead
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -RepairSystemFile "winload.efi" -SkipOfflineSfc
 
 # Supply your own known-good binaries instead of searching the guest.
-# An explicit source is authoritative: both the component-store scan and the
-# offline SFC fallback are skipped entirely.
+# An explicit source is authoritative: the component-store scan, offline SFC
+# and the version-change guard are all skipped.
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -RepairSystemFile "filecrypt.sys" -RepairSystemFileSource C:\Temp\KnownGood
 
 # Report on the guest's catalog store — use this before replacing any driver that
@@ -537,10 +550,10 @@ first.
 | **0x000000ED** | UNMOUNTABLE_BOOT_VOLUME | File-system corruption on boot volume | `-CheckDiskHealth` → `-FixFileSystem` | [Check-disk boot error][chk] |
 | **0x00000074** / **0xC000014C** | BAD_SYSTEM_CONFIG_INFO / STATUS_REGISTRY_CORRUPT | Corrupt SYSTEM/SOFTWARE hive | `-CheckRegistryHealth` → `-FixRegistryCorruption` → `-RestoreRegistryFromRegBack` | [Fix corrupted hive][hive] |
 | **0xC0000218** | STATUS_CANNOT_LOAD_REGISTRY_FILE | Registry hive missing, 0-byte, or unreadable | `-RestoreRegistryFromRegBack` → `-FixRegistryCorruption` | [0xC0000218][c218], [Fix corrupted hive][hive] |
-| **0xC000021A** | STATUS_SYSTEM_PROCESS_TERMINATED | winlogon/csrss/lsass crash after bad update or file/registry mismatch | `-FixWinlogon` → `-RestoreRegistryFromRegBack` → `-FixPendingUpdates` → `-RunSFC` → `-RepairComponentStore` | [0xC000021A][c21a] |
+| **0xC000021A** | STATUS_SYSTEM_PROCESS_TERMINATED | winlogon/csrss/lsass crash after bad update or file/registry mismatch — or smss failing to load `win32k.sys`/`win32kbase.sys`/`win32kfull.sys` (0xC000021A with 0xC0000428) | `-SysCheck` (flags a win32k image or SubSystems `Kmode` failing trust) → `-RepairSystemFile win32k.sys` → `-FixWinlogon` → `-RestoreRegistryFromRegBack` → `-FixPendingUpdates` → `-RunSFC` → `-RepairComponentStore` | [0xC000021A][c21a] |
 | **0x000000EF** | CRITICAL_PROCESS_DIED | Critical system process missing/corrupt | `-RepairSystemFile <proc>.exe` → `-FixWinlogon` → `-RunSFC` → `-RepairComponentStore` | [Critical service failed][csf] |
 | **0x00000067** | CONFIG_INITIALIZATION_FAILED | Stale IMC hive entries in BCD | `-FixBoot` | [Boot errors][be] |
-| **0xC0000428** | "Windows cannot verify the digital signature" / Invalid Image Hash | Unsigned/corrupt boot driver — **or a damaged catalog store**, which looks identical | `-GetCatalogStoreReport` **first** → if the store is `Unusable`, `-RepairCatalogStore <donor CatRoot>`; if the store is healthy, `-RepairSystemFile <driver>` → `-FixSecureBootCodeIntegrity` → `-DisableMemoryIntegrity` | [Invalid image hash][cih], [Disabling Secure Boot][sb] |
+| **0xC0000428** | "Windows cannot verify the digital signature" / Invalid Image Hash | Unsigned/corrupt boot driver — **or a damaged catalog store**, which looks identical | `-GetCatalogStoreReport` **first** → if the store is `Unusable`, `-RepairCatalogStore <donor CatRoot>`; if the store is healthy, `-RepairSystemFile <driver or System32 image, e.g. win32k.sys>` → `-FixSecureBootCodeIntegrity` → `-DisableMemoryIntegrity` | [Invalid image hash][cih], [Disabling Secure Boot][sb] |
 | **0x0000005A** | CRITICAL_SERVICE_FAILED (commonly with 0xC0000428) | A boot/system-start driver failed signature verification | Same as 0xC0000428. If disabling the named driver just moves the bugcheck to a different driver, the store is at fault, not the binaries | [Critical service failed][csf], [Invalid image hash][cih] |
 | **0xc0430001** | winload.efi Code Integrity error (Gen2) | Stale EFI boot manager / Code-Integrity policy payloads | `-FixSecureBootCodeIntegrity` (optionally `-CodeIntegrityPolicySourcePath`) | [Invalid image hash][cih] |
 | Directory Service init failure (DC) | "directory service initialization failure" | AD DS database (ntds.dit) / boot dependency | `-SysCheck` → `-RestoreRegistryFromRegBack` (DC database repair is out of scope) | [DS init failure][dsi] |

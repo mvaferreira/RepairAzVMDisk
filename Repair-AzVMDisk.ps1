@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.8.9
+        Version: 0.8.10
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -15275,34 +15275,48 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
             @{ Name = 'lsass.exe'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\lsass.exe'); Desc = 'Local Security Authority - auth/logon; missing = boot loop' }
             @{ Name = 'winlogon.exe'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\winlogon.exe'); Desc = 'Winlogon - interactive logon handler; missing = black screen' }
             @{ Name = 'logonui.exe'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\logonui.exe'); Desc = 'Logon UI - credential provider host; missing = black screen at logon' }
+            # Session-space kernel images. smss loads the SubSystems Kmode image (win32k.sys)
+            # into every session, and win32k.sys imports win32kbase.sys and win32kfull.sys
+            # on Windows 10 / Server 2016 and later. A damaged or unsigned copy of any of them
+            # stops the guest with 0xC000021A, Arg2 0xC0000428 STATUS_INVALID_IMAGE_HASH.
+            # They live in System32, not System32\drivers.
+            @{ Name = 'win32k.sys'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\win32k.sys'); Desc = 'Win32k session driver (SubSystems Kmode); damaged = STOP 0xC000021A / 0xC0000428' }
+            @{ Name = 'win32kbase.sys'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\win32kbase.sys'); Desc = 'Win32k base, imported by win32k.sys; damaged = STOP 0xC000021A / 0xC0000428'; MinBuild = 10240 }
+            @{ Name = 'win32kfull.sys'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\win32kfull.sys'); Desc = 'Win32k full, imported by win32k.sys; damaged = STOP 0xC000021A / 0xC0000428'; MinBuild = 10240 }
         )
+        $sessGuestBuild = 0
+        [void][int]::TryParse((Get-GuestCurrentVersion).CurrentBuildNumber, [ref]$sessGuestBuild)
         $sessIssues = 0
         $sessSigIssues = 0
         foreach ($sb in $sessionBinaries) {
+            # Build unknown (0): only check a build-specific image when it is actually present.
+            if ($sb.MinBuild -and (($sessGuestBuild -gt 0 -and $sessGuestBuild -lt $sb.MinBuild) -or
+                    ($sessGuestBuild -eq 0 -and -not (Test-Path -LiteralPath $sb.Path)))) { continue }
+            $sbFix = "-RepairSystemFile $(Get-RepairSystemFileArgument -Path $sb.Path)"
             $sbExists = Test-Path -LiteralPath $sb.Path
             $sbSize = if ($sbExists) { (Get-Item -LiteralPath $sb.Path -Force -ErrorAction SilentlyContinue).Length } else { 0 }
             if (-not $sbExists) {
-                & $emit 'Boot' (& $toSev $sevSessionInitMissing) "$($sb.Name) is MISSING - $($sb.Desc)" "-RepairSystemFile $($sb.Name)"
+                & $emit 'Boot' (& $toSev $sevSessionInitMissing) "$($sb.Name) is MISSING - $($sb.Desc)" $sbFix
                 $sessIssues++
             }
             elseif ($sbSize -eq 0) {
-                & $emit 'Boot' (& $toSev $sevSessionInitMissing) "$($sb.Name) is 0 bytes (corrupt) - $($sb.Desc)" "-RepairSystemFile $($sb.Name)"
+                & $emit 'Boot' (& $toSev $sevSessionInitMissing) "$($sb.Name) is 0 bytes (corrupt) - $($sb.Desc)" $sbFix
                 $sessIssues++
             }
             else {
                 $sigCheck = Test-MicrosoftSignature -FilePath $sb.Path
                 if (-not $sigCheck.IsAcceptableMicrosoft) {
                     $sbSev = if ($sigCheck.IsHardFailure) { 'CRIT' } else { & $toSev $sevBinarySignatureBad }
-                    & $emit 'Security' $sbSev "$($sb.Name) failed trust validation - $(Get-TrustStateDescription -Signature $sigCheck)" "-RepairSystemFile $($sb.Name)"
+                    & $emit 'Security' $sbSev "$($sb.Name) failed trust validation - $(Get-TrustStateDescription -Signature $sigCheck)" $sbFix
                     $sessSigIssues++
                 }
             }
         }
         if ($sessIssues -eq 0 -and $sessSigIssues -eq 0) {
-            & $emit 'Boot' 'OK' "All session init executables present, non-empty, and Microsoft-signed"
+            & $emit 'Boot' 'OK' "All session init executables and Win32k session images present, non-empty, and Microsoft-signed"
         }
         elseif ($sessIssues -eq 0) {
-            & $emit 'Boot' 'OK' "All session init executables present and non-empty"
+            & $emit 'Boot' 'OK' "All session init executables and Win32k session images present and non-empty"
         }
 
         # -- 4. SYSTEM hive -------------------------------------------------------
@@ -15503,7 +15517,7 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
                         elseif ($icBinExists) {
                             $icSig = Test-MicrosoftSignature -FilePath $icBinPath
                             if (-not $icSig.IsAcceptableMicrosoft) {
-                                & $emit 'Security' (& $toSev $sevBinarySignatureBad) "$($ic.Name) binary failed trust validation - $(Get-TrustStateDescription -Signature $icSig)" "-RepairSystemFile $(Split-Path $icBinPath -Leaf)"
+                                & $emit 'Security' (& $toSev $sevBinarySignatureBad) "$($ic.Name) binary failed trust validation - $(Get-TrustStateDescription -Signature $icSig)" "-RepairSystemFile $(Get-RepairSystemFileArgument -Path $icBinPath)"
                                 $intBad++
                             }
                         }
@@ -15843,7 +15857,7 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
                             'the driver will not load; dependent storage/network/security functionality will be unavailable'
                         }
                         $severity = if ($bad.ErrorControl -ge 3) { 'CRIT' } else { & $toSev $sevBinarySignatureBad }
-                        & $emit 'Security' $severity ("$($bad.Name) is a $startName-start $typeName with ErrorControl=$ecName; $($bad.FileName) $trustText - $impact") "-RepairSystemFile $($bad.FileName)"
+                        & $emit 'Security' $severity ("$($bad.Name) is a $startName-start $typeName with ErrorControl=$ecName; $($bad.FileName) $trustText - $impact") "-RepairSystemFile $(Get-RepairSystemFileArgument -Path $bad.ResolvedPath)"
                     }
                 }
                 if ($unverifiedDrivers.Count -gt 0) {
@@ -16240,6 +16254,7 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
                         $ssProps = Get-ItemProperty $subsysPath -ErrorAction SilentlyContinue
                         $ssDangling = @()
                         $ssUnsigned = @()
+                        $ssUnsignedFix = @()
                         $ssChecked = 0
                         foreach ($ssName in @('Windows', 'Kmode')) {
                             $ssValue = [string]$ssProps.$ssName
@@ -16254,14 +16269,19 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
                             }
                             else {
                                 $ssSig = Test-MicrosoftSignature -FilePath $ssRef.ResolvedPath
-                                if (-not $ssSig.IsAcceptableMicrosoft) { $ssUnsigned += "$ssName -> $($ssRef.Token) ($(Get-TrustStateDescription -Signature $ssSig))" }
+                                if (-not $ssSig.IsAcceptableMicrosoft) {
+                                    $ssUnsigned += "$ssName -> $($ssRef.Token) ($(Get-TrustStateDescription -Signature $ssSig))"
+                                    $ssUnsignedFix += Get-RepairSystemFileArgument -Path $ssRef.ResolvedPath
+                                }
                             }
                         }
                         if ($ssDangling.Count -gt 0) {
                             & $emit 'Boot' (& $toSev $sevSubsystemDangling) "Session Manager SubSystems names $($ssDangling.Count) image(s) that are missing or 0 bytes - smss.exe cannot start the subsystem and the guest bugchecks with STOP 0xC000021A: $($ssDangling -join '; ')" "-FixSessionManager"
                         }
                         elseif ($ssUnsigned.Count -gt 0) {
-                            & $emit 'Security' (& $toSev $sevBinarySignatureBad) "Session Manager SubSystems names $($ssUnsigned.Count) image(s) that failed trust validation (possible tampering): $($ssUnsigned -join '; ')" "-FixSessionManager"
+                            # The value resolves; the file it names is what is damaged, so
+                            # repointing the value (-FixSessionManager) cannot help.
+                            & $emit 'Security' (& $toSev $sevBinarySignatureBad) "Session Manager SubSystems names $($ssUnsigned.Count) image(s) that failed trust validation (corrupt, tampered or missing catalog - STOP 0xC000021A / 0xC0000428 when smss loads it): $($ssUnsigned -join '; ')" "-RepairSystemFile $(($ssUnsignedFix | Select-Object -Unique) -join ',')"
                         }
                         elseif ($ssChecked -gt 0) {
                             & $emit 'Boot' 'OK' "Session Manager SubSystems images resolve and are Microsoft-signed ($ssChecked checked)"
@@ -19195,6 +19215,640 @@ namespace RepairAzVMDisk
         return $index
     }
 
+    # Resolves a -RepairSystemFile argument to the file it has to replace on the offline disk.
+    #
+    # A bare name is looked up where Windows actually keeps it, not inferred from its
+    # extension alone: win32k.sys, win32kbase.sys and win32kfull.sys are session-space
+    # kernel images in System32 (a damaged one is the 0xC000021A / STATUS_INVALID_IMAGE_HASH
+    # smss failure), explorer.exe and regedit.exe live in \Windows, and some DLLs live in
+    # System32\drivers. A path - System32\win32k.sys, Windows\SysWOW64\x.dll,
+    # C:\Windows\..., %SystemRoot%\..., EFI\... - names the target exactly and is the only
+    # way to reach a file whose leaf name exists in more than one place.
+    function Resolve-SystemFileRepairTarget {
+        param(
+            [Parameter(Mandatory = $true)][string]$Name,
+            [Parameter(Mandatory = $true)][string]$WinRoot
+        )
+
+        $raw = $Name.Trim().Trim('"').Replace('/', '\')
+        $result = [PSCustomObject]@{
+            Requested   = $raw
+            FileName    = [System.IO.Path]::GetFileName($raw)
+            TargetPath  = ''
+            Resolution  = ''
+            OtherCopies = @()
+            Error       = ''
+        }
+        if ([string]::IsNullOrWhiteSpace($result.FileName)) {
+            $result.Error = "'$Name' does not name a file."
+            return $result
+        }
+
+        $drive = (Split-Path -Path $WinRoot -Parent).TrimEnd('\')
+        $ext = [System.IO.Path]::GetExtension($result.FileName).ToLowerInvariant()
+
+        if ($raw.Contains('\')) {
+            $rel = $raw -replace '^\\\?\?\\', ''
+            if ($rel -match '^(?i)(?:%SystemRoot%|\\SystemRoot)\\(.+)$') { $rel = "Windows\$($Matches[1])" }
+            elseif ($rel -match '^[A-Za-z]:\\(.*)$') { $rel = $Matches[1] }
+            $rel = $rel.TrimStart('\')
+            if (($rel -split '\\') -contains '..') {
+                $result.Error = "'$Name' must not contain '..' path segments."
+                return $result
+            }
+
+            if ($rel -match '^(?i)EFI\\') {
+                if ([string]::IsNullOrWhiteSpace($script:BootDriveLetter)) {
+                    $result.Error = "'$Name' names an EFI System Partition path, but no EFI System Partition is mounted for this disk."
+                    return $result
+                }
+                $result.TargetPath = Join-Path $script:BootDriveLetter $rel
+            }
+            elseif ($rel -match '^(?i)Windows\\') {
+                $result.TargetPath = Join-Path $drive $rel
+            }
+            else {
+                $result.TargetPath = Join-Path $WinRoot $rel
+            }
+            $result.Resolution = 'path supplied'
+            return $result
+        }
+
+        $leaf = $result.FileName
+        if ($ext -eq '.efi' -and ($leaf -ieq 'bootmgfw.efi' -or $leaf -ieq 'bootx64.efi') -and
+            [string]::IsNullOrWhiteSpace($script:BootDriveLetter)) {
+            $result.Error = "'$leaf' lives on the EFI System Partition, but no EFI System Partition is mounted for this disk."
+            return $result
+        }
+        if ($ext -eq '.efi' -and $leaf -ieq 'bootmgfw.efi') {
+            $result.TargetPath = Join-Path $script:BootDriveLetter "EFI\Microsoft\Boot\$leaf"
+            $result.Resolution = 'EFI System Partition'
+            return $result
+        }
+        if ($ext -eq '.efi' -and $leaf -ieq 'bootx64.efi') {
+            $result.TargetPath = Join-Path $script:BootDriveLetter "EFI\Boot\$leaf"
+            $result.Resolution = 'EFI System Partition'
+            return $result
+        }
+
+        # Resolution order for a bare name - the destination never depends on where a
+        # replacement source was found:
+        #   1. live copies in the native directories. Exactly one wins.
+        #   2. registry references (SubSystems, KnownDLLs, BootExecute, service
+        #      ImagePath/ServiceDll). Read only when step 1 is not conclusive, and used to
+        #      break a tie between several live copies.
+        #   3. a curated table of documented locations for boot/logon-critical files.
+        #   4. otherwise fail and ask for a path. Nothing is inferred from the extension.
+        # SysWOW64 holds a same-named x86 copy of most System32 files, so it is reached
+        # only when named explicitly - a bare name always means the native image.
+        $liveDirs = @('System32\drivers', 'System32', '', 'System32\wbem')
+        $live = @(foreach ($dir in $liveDirs) {
+                $candidate = if ($dir) { Join-Path (Join-Path $WinRoot $dir) $leaf } else { Join-Path $WinRoot $leaf }
+                if (Test-Path -LiteralPath $candidate) { [System.IO.Path]::GetFullPath($candidate) }
+            })
+        if ($live.Count -eq 1) {
+            $result.TargetPath = $live[0]
+            $result.Resolution = 'found on disk'
+            return $result
+        }
+
+        $refIndex = Get-SystemFileRegistryReferenceIndex -WinRoot $WinRoot
+        $refs = if ($refIndex.ContainsKey($leaf.ToLowerInvariant())) { @($refIndex[$leaf.ToLowerInvariant()]) } else { @() }
+        $formatRefs = { param($list) (@($list | ForEach-Object { "$($_.Path) [$($_.Via)]" }) -join '; ') }
+
+        if ($live.Count -gt 1) {
+            $referencedLive = @($refs | Where-Object { $live -icontains $_.Path })
+            $referencedPaths = @($referencedLive | Select-Object -ExpandProperty Path -Unique)
+            if ($referencedPaths.Count -eq 1) {
+                $result.TargetPath = $referencedPaths[0]
+                $result.Resolution = "found on disk; registry names this copy ($($referencedLive[0].Via))"
+                $result.OtherCopies = @($live | Where-Object { $_ -ine $referencedPaths[0] })
+                return $result
+            }
+            $result.Error = "'$leaf' exists in $($live.Count) places and the registry does not single one out: $($live -join '; '). Name the one to repair with a path relative to \Windows, e.g. -RepairSystemFile System32\$leaf"
+            return $result
+        }
+
+        $refPaths = @($refs | Select-Object -ExpandProperty Path -Unique)
+        if ($refPaths.Count -eq 1) {
+            $result.TargetPath = $refPaths[0]
+            $result.Resolution = "missing; registry reference ($($refs[0].Via))"
+            return $result
+        }
+        if ($refPaths.Count -gt 1) {
+            $result.Error = "'$leaf' is missing, and the registry references it at $($refPaths.Count) different paths: $(& $formatRefs $refs). Name the one to repair with a path relative to \Windows."
+            return $result
+        }
+
+        $knownDir = Get-SystemFileKnownLocation -FileName $leaf
+        if ($null -ne $knownDir) {
+            $result.TargetPath = if ($knownDir) { Join-Path (Join-Path $WinRoot $knownDir) $leaf } else { Join-Path $WinRoot $leaf }
+            $result.Resolution = 'missing; documented Windows location'
+            return $result
+        }
+
+        $result.Error = "'$leaf' was not found in System32\drivers, System32, \Windows or System32\wbem, no registry value references it, and it is not a file with a documented location. Name it with a path relative to \Windows, e.g. -RepairSystemFile System32\$leaf"
+        return $result
+    }
+
+    # Documented install locations for the boot/logon-critical files this script itself
+    # recommends repairing. Returns a directory relative to \Windows ('' = \Windows), or
+    # $null when the file is not listed. This is the fallback for a file that is gone
+    # from the disk and that no registry value names.
+    function Get-SystemFileKnownLocation {
+        param([Parameter(Mandatory = $true)][string]$FileName)
+
+        $name = $FileName.ToLowerInvariant()
+        if ($name -match '^win32k[a-z0-9_]*\.sys$') { return 'System32' }
+        $known = @{
+            'System32'         = @(
+                'ntoskrnl.exe', 'hal.dll', 'ci.dll', 'kdcom.dll', 'pshed.dll', 'bootvid.dll', 'cdd.dll',
+                'winload.exe', 'winload.efi', 'winresume.exe', 'winresume.efi',
+                'ntdll.dll', 'kernel32.dll', 'kernelbase.dll', 'smss.exe', 'csrss.exe', 'csrsrv.dll',
+                'basesrv.dll', 'winsrv.dll', 'sxssrv.dll', 'wininit.exe', 'services.exe', 'lsass.exe',
+                'lsasrv.dll', 'winlogon.exe', 'logonui.exe', 'userinit.exe', 'autochk.exe', 'svchost.exe',
+                'rpcss.dll', 'sechost.dll', 'rpcrt4.dll', 'advapi32.dll', 'user32.dll', 'gdi32.dll')
+            'System32\drivers' = @(
+                'ntfs.sys', 'refs.sys', 'disk.sys', 'partmgr.sys', 'volmgr.sys', 'volmgrx.sys', 'volsnap.sys',
+                'mountmgr.sys', 'acpi.sys', 'pci.sys', 'fltmgr.sys', 'ndis.sys', 'tcpip.sys', 'clfs.sys',
+                'cng.sys', 'ksecdd.sys', 'ksecpkg.sys', 'storport.sys', 'classpnp.sys', 'storvsc.sys',
+                'vmbus.sys', 'netvsc.sys', 'wdf01000.sys', 'msrpc.sys', 'filecrypt.sys', 'fvevol.sys',
+                'volume.sys', 'mup.sys', 'afd.sys', 'netio.sys', 'cldflt.sys')
+            ''                 = @('explorer.exe', 'regedit.exe', 'hh.exe', 'bfsvc.exe', 'splwow64.exe', 'winhlp32.exe', 'write.exe')
+        }
+        foreach ($dir in $known.Keys) {
+            if ($known[$dir] -contains $name) { return $dir }
+        }
+        return $null
+    }
+
+    # Every file the offline SYSTEM hive points at, keyed by lower-case leaf name, so a
+    # missing or ambiguous -RepairSystemFile name can be placed where Windows will
+    # actually load it from. Built once and cached: one hive mount and a single pass over
+    # the service keys, only when the live-location check is not conclusive.
+    # RepairBrokenSystemFile clears the cache so an earlier registry repair in the same
+    # run is seen.
+    function Get-SystemFileRegistryReferenceIndex {
+        param([Parameter(Mandatory = $true)][string]$WinRoot)
+
+        if ($script:SystemFileRegistryReferenceIndex -and $script:SystemFileRegistryReferenceIndex.WinRoot -ieq $WinRoot) {
+            return $script:SystemFileRegistryReferenceIndex.Index
+        }
+
+        $index = @{}
+        $add = {
+            param([string]$Path, [string]$Via)
+            if ([string]::IsNullOrWhiteSpace($Path)) { return }
+            try { $full = [System.IO.Path]::GetFullPath($Path.Trim().Trim('"')) } catch { return }
+            $key = [System.IO.Path]::GetFileName($full).ToLowerInvariant()
+            if ([string]::IsNullOrWhiteSpace($key)) { return }
+            if (-not $index.ContainsKey($key)) { $index[$key] = [System.Collections.Generic.List[PSCustomObject]]::new() }
+            $index[$key].Add([PSCustomObject]@{ Path = $full; Via = $Via })
+        }
+
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            Invoke-WithHive 'SYSTEM' {
+                $cs = Get-CurrentOfflineControlSetName
+                $lm = [Microsoft.Win32.Registry]::LocalMachine
+                $noExpand = [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
+
+                $sm = $lm.OpenSubKey("BROKENSYSTEM\$cs\Control\Session Manager")
+                if ($sm) {
+                    try {
+                        $ss = $sm.OpenSubKey('SubSystems')
+                        if ($ss) {
+                            try {
+                                foreach ($n in @('Kmode', 'Windows')) {
+                                    $v = $ss.GetValue($n, $null, $noExpand)
+                                    if ($v -is [string] -and $v.Trim()) { & $add (Get-SubsystemImageReference -Value $v).ResolvedPath "SubSystems\$n" }
+                                }
+                            }
+                            finally { $ss.Dispose() }
+                        }
+                        $kd = $sm.OpenSubKey('KnownDLLs')
+                        if ($kd) {
+                            try {
+                                foreach ($n in $kd.GetValueNames()) {
+                                    if ($n -like 'DllDirectory*') { continue }
+                                    $v = $kd.GetValue($n, $null)
+                                    if ($v -is [string] -and $v.Trim()) { & $add (Join-Path $WinRoot "System32\$($v.Trim())") "KnownDLLs\$n" }
+                                }
+                            }
+                            finally { $kd.Dispose() }
+                        }
+                        foreach ($entry in @($sm.GetValue('BootExecute', $null))) {
+                            if ($entry -isnot [string] -or -not $entry.Trim()) { continue }
+                            $tokens = @($entry.Trim() -split '\s+')
+                            $img = if ($tokens[0] -ieq 'autocheck' -and $tokens.Count -gt 1) { $tokens[1] } else { $tokens[0] }
+                            if ($img -notmatch '\.exe$') { $img += '.exe' }
+                            $img = if ($img.Contains('\')) { Resolve-GuestImagePath $img } else { Join-Path $WinRoot "System32\$img" }
+                            & $add $img 'BootExecute'
+                        }
+                    }
+                    finally { $sm.Dispose() }
+                }
+
+                $svcRoot = $lm.OpenSubKey("BROKENSYSTEM\$cs\Services")
+                if ($svcRoot) {
+                    try {
+                        foreach ($svcName in $svcRoot.GetSubKeyNames()) {
+                            $k = $svcRoot.OpenSubKey($svcName)
+                            if (-not $k) { continue }
+                            try {
+                                $img = $k.GetValue('ImagePath', $null, $noExpand)
+                                $type = $k.GetValue('Type', $null)
+                                if ($img -is [string] -and $img.Trim()) {
+                                    & $add (Resolve-GuestImagePath $img) "Services\$svcName ImagePath"
+                                }
+                                elseif ($type -is [int] -and ($type -band 0x3)) {
+                                    # Kernel/file-system driver with no ImagePath loads from the documented default.
+                                    & $add (Join-Path $WinRoot "System32\drivers\$svcName.sys") "Services\$svcName (default driver path)"
+                                }
+                                $p = $k.OpenSubKey('Parameters')
+                                if ($p) {
+                                    try {
+                                        $dll = $p.GetValue('ServiceDll', $null, $noExpand)
+                                        if ($dll -is [string] -and $dll.Trim()) { & $add (Resolve-GuestImagePath $dll) "Services\$svcName ServiceDll" }
+                                    }
+                                    finally { $p.Dispose() }
+                                }
+                            }
+                            finally { $k.Dispose() }
+                        }
+                    }
+                    finally { $svcRoot.Dispose() }
+                }
+            }
+        }
+        catch {
+            Write-Warning "  Could not read registry references from the offline SYSTEM hive: $($_.Exception.Message)"
+        }
+        $sw.Stop()
+        Write-Host ("  Registry references indexed: {0:N0} file name(s) in {1:N1}s" -f $index.Count, $sw.Elapsed.TotalSeconds) -ForegroundColor DarkGray
+
+        $script:SystemFileRegistryReferenceIndex = [PSCustomObject]@{ WinRoot = $WinRoot; Index = $index }
+        return $index
+    }
+
+    # The -RepairSystemFile argument that reaches a given file: its bare name when that
+    # already resolves to it, otherwise its path relative to \Windows (or the ESP).
+    function Get-RepairSystemFileArgument {
+        param([string]$Path)
+
+        if ([string]::IsNullOrWhiteSpace($Path)) { return '<name>' }
+        $leaf = [System.IO.Path]::GetFileName($Path)
+        $winRoot = Join-Path $script:WinDriveLetter 'Windows'
+        $full = try { [System.IO.Path]::GetFullPath($Path) } catch { $Path }
+        $bare = Resolve-SystemFileRepairTarget -Name $leaf -WinRoot $winRoot
+        if (-not $bare.Error -and $bare.TargetPath -and
+            ([System.IO.Path]::GetFullPath($bare.TargetPath) -ieq $full)) {
+            return $leaf
+        }
+
+        $arg = $full
+        $winPrefix = [System.IO.Path]::GetFullPath($winRoot).TrimEnd('\') + '\'
+        if ($full.StartsWith($winPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $arg = $full.Substring($winPrefix.Length)
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($script:BootDriveLetter)) {
+            $bootPrefix = [System.IO.Path]::GetFullPath((Join-Path $script:BootDriveLetter '.')).TrimEnd('\') + '\'
+            if ($full.StartsWith($bootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $arg = $full.Substring($bootPrefix.Length)
+            }
+        }
+        if ($arg -match '[\s,;]') { $arg = "'$arg'" }
+        return $arg
+    }
+
+    function Get-SystemFileVersionFromText {
+        # First dotted four-part version in a FileVersion string such as
+        # "10.0.14393.7973 (rs1_release_inmarket.250407-1204)".
+        param([string]$Text)
+        if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+        $m = [regex]::Match($Text, '(?<![\d.])\d{1,5}\.\d{1,5}\.\d{1,5}\.\d{1,5}(?![\d.])')
+        if (-not $m.Success) { return $null }
+        try { return [version]$m.Value } catch { return $null }
+    }
+
+    function Get-ComponentDirectoryVersion {
+        # Version in a WinSxS component identity, from either a component folder
+        #   \WinSxS\amd64_microsoft-windows-win32k_31bf3856ad364e35_10.0.14393.7973_none_...\win32k.sys
+        # or a WRP backup entry named after one
+        #   \WinSxS\Backup\amd64_microsoft-windows-win32kbase_31bf3856ad364e35_10.0.14393.7973_none_..._win32kbase.sys_cb97ed72
+        # The identity is what servicing installed, so it survives damage to the bytes.
+        param([string]$Path)
+        if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+        $segments = @($Path -split '[\\/]+')
+        for ($i = 0; $i -lt $segments.Count - 1; $i++) {
+            if ($segments[$i] -ine 'WinSxS') { continue }
+            $identity = $segments[$i + 1]
+            if ($identity -ieq 'Backup' -and ($i + 2) -lt $segments.Count) { $identity = $segments[$i + 2] }
+            $m = [regex]::Match($identity, '_[0-9a-f]{16}_(\d+\.\d+\.\d+\.\d+)_', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+            if (-not $m.Success) { return $null }
+            try { return [version]$m.Groups[1].Value } catch { return $null }
+        }
+        return $null
+    }
+
+    function Initialize-PeLinkageType {
+        if (([System.Management.Automation.PSTypeName]'RepairAzVMDisk.PeLinkage').Type) { return }
+        # Compiled rather than PowerShell because the dependents scan reads the import
+        # directory of every PE file in System32 and System32\drivers. Only headers,
+        # the export directory and import descriptors are read; nothing is loaded.
+        # C# 5 syntax only - Windows PowerShell 5.1 compiles with the in-box compiler.
+        Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+
+namespace RepairAzVMDisk
+{
+    public class PeLinkage
+    {
+        public string Path;
+        public string Error;
+        public HashSet<string> ExportNames = new HashSet<string>(StringComparer.Ordinal);
+        public HashSet<int> ExportOrdinals = new HashSet<int>();
+        // module -> imported entries ("Name" or "#ordinal"); null when not expanded
+        public Dictionary<string, List<string>> Imports = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        public static int LastScanned;
+
+        public static PeLinkage Read(string path, string onlyFrom, bool readExports)
+        {
+            PeLinkage r = new PeLinkage();
+            r.Path = path;
+            try
+            {
+                using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    BinaryReader br = new BinaryReader(fs);
+                    if (fs.Length < 64) throw new InvalidDataException("file too small for a PE header");
+                    if (br.ReadUInt16() != 0x5A4D) throw new InvalidDataException("DOS MZ signature missing");
+                    fs.Position = 0x3C;
+                    int pe = br.ReadInt32();
+                    if (pe <= 0 || (long)pe + 24 > fs.Length) throw new InvalidDataException("PE header offset outside the file");
+                    fs.Position = pe;
+                    if (br.ReadUInt32() != 0x4550) throw new InvalidDataException("PE signature missing");
+                    br.ReadUInt16();
+                    int nSec = br.ReadUInt16();
+                    fs.Position = pe + 20;
+                    int optSize = br.ReadUInt16();
+                    long opt = pe + 24;
+                    fs.Position = opt;
+                    int magic = br.ReadUInt16();
+                    bool is64 = magic == 0x20B;
+                    if (!is64 && magic != 0x10B) throw new InvalidDataException("unknown optional header magic");
+                    fs.Position = opt + (is64 ? 108 : 92);
+                    uint nDD = br.ReadUInt32();
+                    long ddBase = opt + (is64 ? 112 : 96);
+
+                    uint[] va = new uint[nSec];
+                    uint[] sz = new uint[nSec];
+                    uint[] raw = new uint[nSec];
+                    for (int i = 0; i < nSec; i++)
+                    {
+                        fs.Position = opt + optSize + 40L * i + 8;
+                        uint vs = br.ReadUInt32();
+                        va[i] = br.ReadUInt32();
+                        uint rs = br.ReadUInt32();
+                        raw[i] = br.ReadUInt32();
+                        sz[i] = Math.Max(vs, rs);
+                    }
+                    Func<uint, long> off = delegate(uint rva)
+                    {
+                        for (int i = 0; i < nSec; i++)
+                        {
+                            if (rva >= va[i] && rva < (long)va[i] + sz[i]) return (long)rva - va[i] + raw[i];
+                        }
+                        return -1;
+                    };
+                    Func<long, string> cstr = delegate(long o)
+                    {
+                        if (o < 0 || o >= fs.Length) return null;
+                        fs.Position = o;
+                        StringBuilder sb = new StringBuilder();
+                        int c;
+                        while ((c = fs.ReadByte()) > 0 && sb.Length < 512) sb.Append((char)c);
+                        return sb.ToString();
+                    };
+
+                    if (readExports && nDD > 0)
+                    {
+                        fs.Position = ddBase;
+                        uint eRva = br.ReadUInt32();
+                        long e = eRva != 0 ? off(eRva) : -1;
+                        if (e >= 0)
+                        {
+                            fs.Position = e + 16;
+                            uint baseOrd = br.ReadUInt32();
+                            uint nFun = br.ReadUInt32();
+                            uint nNames = br.ReadUInt32();
+                            uint aFun = br.ReadUInt32();
+                            uint aNames = br.ReadUInt32();
+                            long fo = off(aFun);
+                            if (fo >= 0)
+                            {
+                                for (uint k = 0; k < nFun && k < 65536; k++)
+                                {
+                                    fs.Position = fo + 4L * k;
+                                    if (br.ReadUInt32() != 0) r.ExportOrdinals.Add((int)(baseOrd + k));
+                                }
+                            }
+                            long no = off(aNames);
+                            if (no >= 0)
+                            {
+                                for (uint k = 0; k < nNames && k < 65536; k++)
+                                {
+                                    fs.Position = no + 4L * k;
+                                    string s = cstr(off(br.ReadUInt32()));
+                                    if (!string.IsNullOrEmpty(s)) r.ExportNames.Add(s);
+                                }
+                            }
+                        }
+                    }
+
+                    if (nDD > 1)
+                    {
+                        fs.Position = ddBase + 8;
+                        uint iRva = br.ReadUInt32();
+                        long d = iRva != 0 ? off(iRva) : -1;
+                        if (d >= 0)
+                        {
+                            for (int k = 0; k < 4096; k++)
+                            {
+                                fs.Position = d + 20L * k;
+                                uint oft = br.ReadUInt32();
+                                br.ReadUInt32();
+                                br.ReadUInt32();
+                                uint nameRva = br.ReadUInt32();
+                                uint ft = br.ReadUInt32();
+                                if (nameRva == 0 && oft == 0 && ft == 0) break;
+                                string mod = cstr(off(nameRva));
+                                if (string.IsNullOrEmpty(mod)) continue;
+                                if (!string.IsNullOrEmpty(onlyFrom) && !string.Equals(mod, onlyFrom, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    if (!r.Imports.ContainsKey(mod)) r.Imports[mod] = null;
+                                    continue;
+                                }
+                                List<string> list = new List<string>();
+                                long t = off(oft != 0 ? oft : ft);
+                                if (t >= 0)
+                                {
+                                    for (int j = 0; j < 65536; j++)
+                                    {
+                                        fs.Position = t + (is64 ? 8L : 4L) * j;
+                                        ulong v = is64 ? br.ReadUInt64() : br.ReadUInt32();
+                                        if (v == 0) break;
+                                        bool byOrdinal = is64 ? (v & 0x8000000000000000UL) != 0 : (v & 0x80000000UL) != 0;
+                                        if (byOrdinal) { list.Add("#" + (v & 0xFFFF)); continue; }
+                                        long h = off((uint)(v & 0x7FFFFFFF));
+                                        string n = h >= 0 ? cstr(h + 2) : null;
+                                        if (!string.IsNullOrEmpty(n)) list.Add(n);
+                                    }
+                                }
+                                List<string> existing;
+                                if (r.Imports.TryGetValue(mod, out existing) && existing != null) existing.AddRange(list);
+                                else r.Imports[mod] = list;
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                r.Error = ex.Message;
+            }
+            return r;
+        }
+
+        public static List<PeLinkage> FindImporters(string[] dirs, string moduleName, string excludePath)
+        {
+            List<string> files = new List<string>();
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            string exclude = string.IsNullOrEmpty(excludePath) ? null : System.IO.Path.GetFullPath(excludePath);
+            foreach (string dir in dirs)
+            {
+                if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) continue;
+                foreach (string f in Directory.GetFiles(dir))
+                {
+                    string ext = System.IO.Path.GetExtension(f).ToLowerInvariant();
+                    if (ext != ".sys" && ext != ".dll" && ext != ".exe") continue;
+                    string full = System.IO.Path.GetFullPath(f);
+                    if (!seen.Add(full)) continue;
+                    if (exclude != null && string.Equals(full, exclude, StringComparison.OrdinalIgnoreCase)) continue;
+                    files.Add(full);
+                }
+            }
+            LastScanned = files.Count;
+            // Each file costs a handful of small random reads, so a cold attached disk is
+            // latency-bound; overlapping the reads is what keeps this to seconds.
+            List<PeLinkage> found = new List<PeLinkage>();
+            object gate = new object();
+            System.Threading.Tasks.ParallelOptions po = new System.Threading.Tasks.ParallelOptions();
+            po.MaxDegreeOfParallelism = 8;
+            System.Threading.Tasks.Parallel.ForEach(files, po, delegate(string full)
+            {
+                PeLinkage r = Read(full, moduleName, false);
+                List<string> fns;
+                if (r.Error == null && r.Imports.TryGetValue(moduleName, out fns) && fns != null)
+                {
+                    lock (gate) { found.Add(r); }
+                }
+            });
+            found.Sort(delegate(PeLinkage a, PeLinkage b) { return string.Compare(a.Path, b.Path, StringComparison.OrdinalIgnoreCase); });
+            return found;
+        }
+    }
+}
+'@
+    }
+
+    function Test-SystemFileDowngradeCompatibility {
+        # Last-resort guard before installing a DIFFERENT revision of a system binary.
+        # Proves, as far as static linkage can, that the swap cannot leave an import
+        # unresolved in either direction:
+        #   1. every static import of the candidate resolves against the export table of
+        #      the module installed on the disk now
+        #   2. every installed module (target folder, System32, System32\drivers) that
+        #      imports the target resolves against the candidate's exports
+        # This rules out the hard failures a mismatched pair produces at load time
+        # (STATUS_ENTRYPOINT_NOT_FOUND 0xC0000139, STATUS_ORDINAL_NOT_FOUND 0xC0000138,
+        # STATUS_DRIVER_ENTRYPOINT_NOT_FOUND 0xC0000263). It cannot prove internal
+        # structures agree, and API-set imports (api-ms-*/ext-ms-*) are resolved by the
+        # loader's schema, not by file name, so they are counted but not checked.
+        # Fails closed: a module that cannot be found or parsed is a problem.
+        param(
+            [Parameter(Mandatory = $true)][string]$CandidatePath,
+            [Parameter(Mandatory = $true)][string]$TargetPath,
+            [Parameter(Mandatory = $true)][string]$WinRoot
+        )
+
+        Initialize-PeLinkageType
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $fileName = Split-Path -Path $TargetPath -Leaf
+        $dirs = @(
+            (Split-Path -Path $TargetPath -Parent),
+            (Join-Path $WinRoot 'System32'),
+            (Join-Path $WinRoot 'System32\drivers')
+        ) | Where-Object { Test-Path -LiteralPath $_ -PathType Container } | Select-Object -Unique
+
+        $problems = [System.Collections.Generic.List[string]]::new()
+        $importedFunctions = 0
+        $importedModules = 0
+        $apiSetModules = 0
+        $dependents = 0
+
+        $cand = [RepairAzVMDisk.PeLinkage]::Read($CandidatePath, $null, $true)
+        if ($cand.Error) {
+            $problems.Add("The candidate's PE tables cannot be read: $($cand.Error)")
+        }
+        else {
+            $exportCache = @{}
+            foreach ($mod in @($cand.Imports.Keys)) {
+                if ($mod -match '^(api|ext)-ms-') { $apiSetModules++; continue }
+                $importedModules++
+                $key = $mod.ToLowerInvariant()
+                if (-not $exportCache.ContainsKey($key)) {
+                    $exportCache[$key] = $null
+                    foreach ($dir in $dirs) {
+                        $p = Join-Path $dir $mod
+                        if (Test-Path -LiteralPath $p -PathType Leaf) { $exportCache[$key] = [RepairAzVMDisk.PeLinkage]::Read($p, $null, $true); break }
+                    }
+                }
+                $exp = $exportCache[$key]
+                if (-not $exp) { $problems.Add("The candidate imports $mod, which is not present in $($dirs -join ', ')."); continue }
+                if ($exp.Error) { $problems.Add("The candidate imports $mod, whose export table cannot be read: $($exp.Error)"); continue }
+                foreach ($fn in @($cand.Imports[$mod])) {
+                    $importedFunctions++
+                    $present = if ($fn.StartsWith('#')) { $exp.ExportOrdinals.Contains([int]$fn.Substring(1)) } else { $exp.ExportNames.Contains($fn) }
+                    if (-not $present) { $problems.Add("The candidate imports $mod!$fn, which the installed $mod does not export.") }
+                }
+            }
+
+            foreach ($imp in [RepairAzVMDisk.PeLinkage]::FindImporters([string[]]$dirs, $fileName, $TargetPath)) {
+                $dependents++
+                foreach ($fn in @($imp.Imports[$fileName])) {
+                    $present = if ($fn.StartsWith('#')) { $cand.ExportOrdinals.Contains([int]$fn.Substring(1)) } else { $cand.ExportNames.Contains($fn) }
+                    if (-not $present) { $problems.Add("$(Split-Path $imp.Path -Leaf) imports $fileName!$fn, which the candidate does not export.") }
+                }
+            }
+        }
+
+        $sw.Stop()
+        [pscustomobject]@{
+            Compatible        = ($problems.Count -eq 0)
+            Problems          = @($problems)
+            ImportedFunctions = $importedFunctions
+            ImportedModules   = $importedModules
+            ApiSetModules     = $apiSetModules
+            Dependents        = $dependents
+            Scanned           = [RepairAzVMDisk.PeLinkage]::LastScanned
+            Seconds           = $sw.Elapsed.TotalSeconds
+        }
+    }
+
     function RepairBrokenSystemFile {
         param(
             [Parameter(Mandatory = $true)]
@@ -19208,14 +19862,19 @@ namespace RepairAzVMDisk
         # Repair order:
         #   1. -RepairSystemFileSource, when supplied. An explicit donor is authoritative,
         #      so neither SFC nor the component-store scan runs.
-        #   2. Offline SFC (/scanfile). Windows Resource Protection restores from the
+        #   2. A candidate search across the component store, its backup store and the
+        #      driver store, ranked and verified before installation. A candidate of the
+        #      exact installed version is required at this stage.
+        #   3. Offline SFC (/scanfile). Windows Resource Protection restores from the
         #      \WinSxS\Backup store and the differential payloads that sit beside each
         #      component, and verifies what it writes against the image's own catalogs.
         #      Neither of those reconstructions can be done from this script.
-        #   3. A candidate search across the component store, its backup store and the
-        #      driver store, ranked and verified before installation.
+        #   4. Last resort: a same-build candidate of another revision (normally a
+        #      superseded component), only if its static imports and exports are
+        #      compatible with the installed modules in both directions
+        #      (Test-SystemFileDowngradeCompatibility). Otherwise the repair is refused.
         #
-        # Search sources for step 3:
+        # Search sources for step 2:
         #   \Windows\WinSxS\<component>\<filename>                        (component store)
         #   \Windows\WinSxS\Backup\<identity>_<filename>_<hash>           (WRP backup store)
         #   \Windows\System32\DriverStore\FileRepository\*\<filename>     (driver packages)
@@ -19244,30 +19903,41 @@ namespace RepairAzVMDisk
             Write-Host "Offline guest architecture: $guestArchitecture" -ForegroundColor DarkGray
         }
 
-        foreach ($fileName in $FileNames) {
-            $fileName = $fileName.Trim()
-            if ([string]::IsNullOrWhiteSpace($fileName)) { continue }
+        $winRoot = Join-Path $script:WinDriveLetter 'Windows'
+        $script:SystemFileRegistryReferenceIndex = $null
+        $requestedNames =  @($FileNames | ForEach-Object { if ($_) { $_.Trim() } } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        $indexFileNames = @($requestedNames | ForEach-Object { [System.IO.Path]::GetFileName($_.Trim('"').Replace('/', '\')) } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+        $nativeArchitecture = $guestArchitecture
 
-            Write-Host "`nProcessing: $fileName" -ForegroundColor Cyan
+        foreach ($requestedName in $requestedNames) {
+            Write-Host "`nProcessing: $requestedName" -ForegroundColor Cyan
 
             # -- 1. Determine the expected target path on the offline disk --------
-            $ext = [System.IO.Path]::GetExtension($fileName).ToLower()
-            $winRoot = Join-Path $script:WinDriveLetter 'Windows'
-
-            # Decide target directory based on extension/convention
-            $targetDir = switch -Wildcard ($ext) {
-                '.sys' { Join-Path $winRoot 'System32\drivers' }
-                '.dll' { Join-Path $winRoot 'System32' }
-                '.exe' { Join-Path $winRoot 'System32' }
-                '.efi' {
-                    # EFI binaries live on the boot partition
-                    if ($fileName -ieq 'bootmgfw.efi') { Join-Path $script:BootDriveLetter 'EFI\Microsoft\Boot' }
-                    elseif ($fileName -ieq 'bootx64.efi') { Join-Path $script:BootDriveLetter 'EFI\Boot' }
-                    else { Join-Path $winRoot 'System32' }
-                }
-                default { Join-Path $winRoot 'System32' }
+            $resolvedTarget = Resolve-SystemFileRepairTarget -Name $requestedName -WinRoot $winRoot
+            if ($resolvedTarget.Error) {
+                Write-Error "  $($resolvedTarget.Error)"
+                continue
             }
-            $targetPath = Join-Path $targetDir $fileName
+            $fileName = $resolvedTarget.FileName
+            $targetPath = $resolvedTarget.TargetPath
+            $ext = [System.IO.Path]::GetExtension($fileName).ToLower()
+            Write-Host "  Resolved target: $targetPath ($($resolvedTarget.Resolution))" -ForegroundColor DarkGray
+            if ($resolvedTarget.Resolution -like 'missing*') {
+                Write-Host "  If '$fileName' belongs somewhere else, name it with a path, e.g. -RepairSystemFile System32\$fileName" -ForegroundColor DarkGray
+            }
+            foreach ($other in $resolvedTarget.OtherCopies) {
+                Write-Warning "  '$fileName' also exists at $other. That copy is left alone; to repair it instead, pass its path relative to \Windows."
+            }
+
+            # SysWOW64 holds the x86 images of a 64-bit guest, so candidates for it must be
+            # x86, not the guest's native architecture.
+            $guestArchitecture = $nativeArchitecture
+            if ($nativeArchitecture -in @('AMD64', 'ARM64') -and
+                $targetPath.StartsWith((Join-Path $winRoot 'SysWOW64') + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+                $guestArchitecture = 'x86'
+                Write-Host "  Target is in SysWOW64: expecting an x86 image." -ForegroundColor DarkGray
+            }
 
             # Check current state
             $targetItem = Get-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue
@@ -19377,13 +20047,15 @@ apply a protected Windows system-file ACL/owner baseline.
             $targetIsUnderWindows = $targetPath.StartsWith($winRoot, [System.StringComparison]::OrdinalIgnoreCase)
 
             $invokeSfcFallback = {
-                param([string]$Reason)
+                # -Tentative: SFC is being tried BEFORE a version-changing candidate, so a
+                # failure is not the end of the road and must not print the give-up advice.
+                param([string]$Reason, [switch]$Tentative)
 
                 $giveUp = {
                     param([string]$Why)
                     Write-Error "  '$fileName' was not repaired: $Why"
                     Write-Warning "  Supply a known-good copy taken from a machine on the same OS build and patch level, or extracted from matching installation media:"
-                    Write-Warning "    -RepairSystemFile $fileName -RepairSystemFileSource <file-or-folder>"
+                    Write-Warning "    -RepairSystemFile $(Get-RepairSystemFileArgument -Path $targetPath) -RepairSystemFileSource <file-or-folder>"
                 }
 
                 if (-not [string]::IsNullOrWhiteSpace($SourcePath)) {
@@ -19391,18 +20063,25 @@ apply a protected Windows system-file ACL/owner baseline.
                     return $false
                 }
                 if ($SkipOfflineSfc) {
+                    if ($Tentative) { Write-Host "  Offline SFC skipped (-SkipOfflineSfc)." -ForegroundColor DarkGray; return $false }
                     & $giveUp 'no replacement was installed and the offline SFC fallback was disabled with -SkipOfflineSfc'
                     return $false
                 }
                 if (-not $targetIsUnderWindows) {
+                    if ($Tentative) { return $false }
                     & $giveUp 'no replacement was installed, and Windows Resource Protection only covers files under \Windows so it cannot repair this target'
                     return $false
                 }
 
                 Write-Host ""
-                Write-Host "  Falling back to offline SFC - $Reason" -ForegroundColor Yellow
+                $sfcVerb = if ($Tentative) { 'Trying' } else { 'Falling back to' }
+                Write-Host "  $sfcVerb offline SFC - $Reason" -ForegroundColor Yellow
                 $attempt = Repair-OfflineSystemFileWithSfc -TargetPath $targetPath -IsRepaired $testTargetHealthy
                 if (-not $attempt.Repaired) {
+                    if ($Tentative) {
+                        Write-Warning "  Offline SFC could not restore '$fileName' (outcome: $($attempt.Outcome))."
+                        return $false
+                    }
                     if ($attempt.Outcome -eq 'PendingServicing') {
                         & $giveUp 'the offline stores held no usable copy, and Windows Resource Protection is blocked until the pending servicing queue is cleared with -FixPendingUpdates'
                     }
@@ -19442,7 +20121,7 @@ apply a protected Windows system-file ACL/owner baseline.
             # Sources are indexed once for the whole batch (see
             # Get-SystemFileRepairSourceIndex) instead of re-walking WinSxS per file.
             $candidates = [System.Collections.Generic.List[PSCustomObject]]::new()
-            $sourceIndex = Get-SystemFileRepairSourceIndex -FileNames $FileNames -WinRoot $winRoot -SourcePath $SourcePath
+            $sourceIndex = Get-SystemFileRepairSourceIndex -FileNames $indexFileNames -WinRoot $winRoot -SourcePath $SourcePath
             $indexedSources = @()
             if ($sourceIndex.ContainsKey($fileName.ToLowerInvariant())) {
                 $indexedSources = @($sourceIndex[$fileName.ToLowerInvariant()])
@@ -19606,6 +20285,99 @@ apply a protected Windows system-file ACL/owner baseline.
                 $eligibleCandidates = $trustRanked
             }
 
+            # -- 3a. Keep the installed version whenever possible ----------------
+            # Order: a candidate of the exact installed version, then offline SFC (WRP
+            # restores the installed version, verified against the guest catalogs), and
+            # only then a same-build candidate of another revision - and only if its
+            # static linkage is compatible with the modules installed beside it. A
+            # version change is the last resort because tightly coupled modules
+            # (win32k/win32kbase/win32kfull, ntoskrnl/hal, ntdll/kernelbase) can
+            # disagree about exports and fail with a NEW stop code.
+            # An explicit -RepairSystemFileSource is authoritative and skips this.
+            $versionChange = $null
+            if ([string]::IsNullOrWhiteSpace($SourcePath) -and $portableExecutableExtensions -contains $ext) {
+                $expectedVersion = $null
+                $expectedVersionSource = $null
+                # The hard-linked twin's component folder names exactly the component
+                # Windows installed; that survives any damage to the bytes.
+                foreach ($hl in $hardLinkedCandidates) {
+                    $hv = Get-ComponentDirectoryVersion -Path $hl.Path
+                    if ($hv) { $expectedVersion = $hv; $expectedVersionSource = 'installed component ' + (Split-Path (Split-Path $hl.Path -Parent) -Leaf); break }
+                }
+                if (-not $expectedVersion -and $targetVersion) {
+                    $expectedVersion = Get-SystemFileVersionFromText -Text $targetVersion.FileVersion
+                    if ($expectedVersion) { $expectedVersionSource = 'version resource of the file being replaced' }
+                }
+
+                if ($expectedVersion) {
+                    foreach ($cand in $eligibleCandidates) {
+                        $cv = Get-ComponentDirectoryVersion -Path $cand.Path
+                        if (-not $cv) { $cv = Get-SystemFileVersionFromText -Text $cand.Version }
+                        $relation = if (-not $cv) { 'Unknown' } elseif ($cv -eq $expectedVersion) { 'Same' } elseif ($cv -lt $expectedVersion) { 'Older' } else { 'Newer' }
+                        Add-Member -InputObject $cand -NotePropertyName 'ComparableVersion' -NotePropertyValue $cv -Force
+                        Add-Member -InputObject $cand -NotePropertyName 'VersionRelation' -NotePropertyValue $relation -Force
+                    }
+                    $sameVersion = @($eligibleCandidates | Where-Object { $_.VersionRelation -eq 'Same' })
+                    if ($sameVersion.Count -gt 0) {
+                        Write-Host "  Installed version $expectedVersion ($expectedVersionSource): $($sameVersion.Count) same-version candidate(s)." -ForegroundColor DarkGray
+                        $eligibleCandidates = $sameVersion
+                    }
+                    else {
+                        Write-Warning "  No candidate matches the installed version $expectedVersion ($expectedVersionSource)."
+                        if (& $invokeSfcFallback "no on-disk candidate is version $expectedVersion; Windows Resource Protection is tried before any version change" -Tentative) {
+                            continue
+                        }
+
+                        $sameBuild = @($eligibleCandidates | Where-Object {
+                                $_.ComparableVersion -and
+                                $_.ComparableVersion.Major -eq $expectedVersion.Major -and
+                                $_.ComparableVersion.Minor -eq $expectedVersion.Minor -and
+                                $_.ComparableVersion.Build -eq $expectedVersion.Build
+                            } | Sort-Object @{ Expression = { [Math]::Abs([int64]$_.ComparableVersion.Revision - [int64]$expectedVersion.Revision) } },
+                                            @{ Expression = { if ($null -ne $_.TrustRank) { $_.TrustRank } else { 0 } } })
+                        $otherBuild = $eligibleCandidates.Count - $sameBuild.Count
+                        if ($otherBuild -gt 0) {
+                            Write-Warning "  Excluded $otherBuild candidate(s) from a different OS build or with no readable version - never installed in place of $expectedVersion."
+                        }
+
+                        $chosen = $null
+                        foreach ($cand in $sameBuild) {
+                            Write-Host "  Checking link compatibility of $($cand.ComparableVersion) ($($cand.VersionRelation.ToLowerInvariant())) with the installed modules..." -ForegroundColor Yellow
+                            $compat = Test-SystemFileDowngradeCompatibility -CandidatePath $cand.Path -TargetPath $targetPath -WinRoot $winRoot
+                            Write-Host ("    imports checked: {0} function(s) from {1} module(s); dependents checked: {2} module(s) importing {3}; API-set imports not checked: {4}; {5:N1}s" -f `
+                                    $compat.ImportedFunctions, $compat.ImportedModules, $compat.Dependents, $fileName, $compat.ApiSetModules, $compat.Seconds) -ForegroundColor DarkGray
+                            if ($compat.Compatible) { $chosen = $cand; break }
+                            foreach ($p in @($compat.Problems | Select-Object -First 8)) { Write-Warning "    $p" }
+                            if ($compat.Problems.Count -gt 8) { Write-Warning "    ... and $($compat.Problems.Count - 8) more" }
+                        }
+
+                        if (-not $chosen) {
+                            Write-Error "  '$fileName' was not repaired: the only on-disk copies are a different version ($(@($eligibleCandidates | ForEach-Object { $_.ComparableVersion } | Where-Object { $_ } | Select-Object -Unique) -join ', ')) and none is proven link-compatible with the installed $expectedVersion modules. Installing one could replace this failure with a new one."
+                            Write-Warning "  Supply a copy of version $expectedVersion from a machine on the same build and patch level, or from the matching cumulative update:"
+                            Write-Warning "    -RepairSystemFile $(Get-RepairSystemFileArgument -Path $targetPath) -RepairSystemFileSource <file-or-folder>"
+                            Write-ActionLog -Event 'SystemFileVersionChangeRefused' -Details @{
+                                FileName        = $fileName
+                                TargetPath      = $targetPath
+                                ExpectedVersion = "$expectedVersion"
+                                Candidates      = @($eligibleCandidates | ForEach-Object { $_.Path })
+                            }
+                            continue
+                        }
+
+                        $versionChange = [pscustomobject]@{
+                            From     = "$expectedVersion"
+                            To       = "$($chosen.ComparableVersion)"
+                            Relation = $chosen.VersionRelation
+                            Source   = $expectedVersionSource
+                        }
+                        $changeWord = if ($chosen.VersionRelation -eq 'Older') { 'DOWNGRADE' } else { 'VERSION CHANGE' }
+                        Write-Warning "  $changeWord (last resort): installing $($versionChange.To) in place of the installed $($versionChange.From)."
+                        Write-Warning "  No exact-version copy exists on this disk and offline SFC could not restore one. Static linkage checks passed in both directions, which rules out missing-export failures but cannot prove every internal interface matches."
+                        $eligibleCandidates = @($chosen)
+                    }
+                }
+            }
+
             $best = $eligibleCandidates |
                 Sort-Object @{Expression = {
                                 if ($ext -eq '.sys' -and $_.Source -eq 'DriverStore' -and $_.Path -match $infMatchPattern) { 0 } else { 1 } } },
@@ -19703,6 +20475,16 @@ apply a protected Windows system-file ACL/owner baseline.
             if ($install.BackupPath) {
                 Write-Host "  Backup: $($install.BackupPath)" -ForegroundColor DarkGray
             }
+            if ($versionChange -and $install.BackupPath) {
+                Write-Warning "  Version is now $($versionChange.To) (was $($versionChange.From)). To undo, delete $targetPath and rename $(Split-Path $install.BackupPath -Leaf) back to $fileName."
+            }
+            if ($hardLinkedCandidates.Count -gt 0) {
+                # The damaged record keeps its other names; only the live path was replaced.
+                Write-Warning "  The component store copy is still the damaged file (it is now linked to the backup, not to $fileName):"
+                foreach ($hl in $hardLinkedCandidates) { Write-Warning "    $($hl.Path)" }
+                $restoreNote = if ($versionChange) { " This also brings $fileName back to $($versionChange.From)." } else { '' }
+                Write-Warning "  After the VM boots, run 'DISM /Online /Cleanup-Image /RestoreHealth' then 'sfc /scannow' (or install the latest cumulative update) so servicing repairs the store.$restoreNote"
+            }
 
             Write-ActionLog -Event 'SystemFileReplaced' -Details @{
                 FileName              = $fileName
@@ -19719,6 +20501,8 @@ apply a protected Windows system-file ACL/owner baseline.
                 CandidateArchitecture = $best.Architecture
                 CandidateMachine      = $best.Machine
                 PreviousState         = $stateDesc
+                VersionChange         = $versionChange
+                StoreCopyStillDamaged = @($hardLinkedCandidates | ForEach-Object { $_.Path })
             }
         }
     }
@@ -20521,7 +21305,7 @@ Use this when stale proxy/PAC settings prevent WinRM/RDP reachability after migr
                 $totalChecks++
                 if ($health -eq 'FAIL') {
                     $bootDriverFail++
-                    $issues.Add([PSCustomObject]@{ Phase = 3; Severity = 'FAIL'; Message = "Boot driver '$($drv.Name)': $detail"; Fix = "-RepairSystemFile $(Split-Path -Leaf $drv.ImagePath)" })
+                    $issues.Add([PSCustomObject]@{ Phase = 3; Severity = 'FAIL'; Message = "Boot driver '$($drv.Name)': $detail"; Fix = "-RepairSystemFile $(Get-RepairSystemFileArgument -Path $imgResolved)" })
                 }
                 elseif ($health -eq 'WARN') {
                     $bootDriverWarn++
@@ -20712,7 +21496,7 @@ Use this when stale proxy/PAC settings prevent WinRM/RDP reachability after migr
                 $totalChecks++
                 if ($health -eq 'FAIL') {
                     $sysDriverFail++
-                    $issues.Add([PSCustomObject]@{ Phase = 4; Severity = 'FAIL'; Message = "System driver '$($drv.Name)': $detail"; Fix = "-RepairSystemFile $(Split-Path -Leaf $drv.ImagePath)" })
+                    $issues.Add([PSCustomObject]@{ Phase = 4; Severity = 'FAIL'; Message = "System driver '$($drv.Name)': $detail"; Fix = "-RepairSystemFile $(Get-RepairSystemFileArgument -Path $imgResolved)" })
                 }
                 elseif ($health -eq 'WARN') {
                     $sysDriverWarn++
@@ -22841,7 +23625,7 @@ PARAMETERS:
         -FixSecureBootCodeIntegrity  Refresh Gen2 EFI boot manager + SKUSiPolicy.p7b and repair CodeIntegrity Driver.stl/DriverSiPolicy.p7b for winload.efi / 0xc0430001
             -CodeIntegrityPolicySourcePath <path> Optional known-good CodeIntegrity folder/file source; otherwise uses offline WinSxS, then same-build rescue host fallback
             -RepairSystemFileSource <path> Optional known-good file or folder to repair from. Skips the component-store scan and the offline SFC fallback entirely
-            -SkipOfflineSfc        (sub-option) Do not fall back to offline SFC when no replacement can be installed from the offline stores
+            -SkipOfflineSfc        (sub-option) Never run offline SFC - neither before a same-build version change nor as the final fallback
   -FixBootSector         Inspect and repair the MBR bootstrap + NTFS volume boot record (Gen1/BIOS only).
                          Fixes what -FixBoot cannot: "Operating system not found", "Missing operating
                          system", "A disk read error occurred" and a stale BPB HiddenSectors after a
@@ -22877,7 +23661,15 @@ PARAMETERS:
     -DriveLetter <letter>    (sub-option) repair one volume instead of every NTFS volume on the disk
   -FixSanPolicy          Set SAN policy to OnlineAll (fix offline disks after migration)
   -RepairSystemFile <name[,name,...]>  Replace missing/0-byte/wrong-architecture binary from WinSxS or DriverStore
-  -RunSFC                Run SFC in offline mode
+                         A bare name is placed where Windows keeps it: the one live copy in System32\drivers,
+                         System32, \Windows or System32\wbem; else the registry (SubSystems, KnownDLLs,
+                         BootExecute, service ImagePath/ServiceDll); else a documented location. Ambiguous
+                         or unknown names fail - pass a path relative to \Windows: System32\win32k.sys, SysWOW64\x.dll
+                         Source order: an exact-version copy from WinSxS/DriverStore, then offline SFC, then
+                         (last resort) another revision of the SAME build whose imports/exports link both
+                         ways - installed with a DOWNGRADE warning, a .replaced.bak and an undo hint.
+                         Nothing compatible: refused; supply -RepairSystemFileSource from a same-build machine
+  -RunSFC                 Run SFC in offline mode
   -SetFullMemDump        Configure full memory dump + pagefile on C:
 
 --- DRIVERS & DEVICE FILTERS --------------------------------------------------
