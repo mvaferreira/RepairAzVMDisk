@@ -191,14 +191,46 @@ unless `-Force` is supplied. Cold-boot the guest rather than resuming saved memo
 #   1. a copy of the exact installed version
 #   2. offline "sfc /scanfile" (reverting pending servicing and retrying once if
 #      SFC reports a pending system repair)
-#   3. last resort: another revision of the SAME build (e.g. a superseded copy
-#      left in WinSxS), only if its static imports resolve against the installed
-#      modules and every installed module importing it still resolves. It is
-#      installed with a DOWNGRADE warning, a .replaced.bak and an undo hint; run
+#   3. outside sources, each checked for exact version, architecture and image
+#      trust against the guest's catalogs before use (a rebuilt file must carry
+#      a valid Microsoft signature):
+#      a. (1809+) the guest's own forward differential (WinSxS\...\f\) applied
+#         to an older copy of the same build still in its store
+#      b. a donor disk named with -RepairSystemFileDonorDisk
+#      c. the guest's cumulative update: -RepairSystemFileMsu, or downloaded from
+#         the Microsoft Update Catalog when it is reachable (-SkipMsuDownload to
+#         never try). The catalog is probed first (DNS, TCP 443, HTTPS, each
+#         with a short timeout, through the system proxy if set), so a VNet
+#         without internet costs seconds and falls through to donor disks.
+#         Packages that carry the file only as a differential (null or forward
+#         delta) are rebuilt, not rejected.
+#      d. other attached disks and the rescue VM's own Windows. On 1809+ a donor
+#         of the same build at ANY update level works (its file is rebuilt to the
+#         exact version with the forward differential). Donor disks whose disk
+#         signature/GUID collides with the guest (e.g. from the same Marketplace
+#         image) are detected and handled without touching the guest disk.
+#      If none has it, the KB link and the az commands to create and attach a
+#      Marketplace donor disk are printed; attach it and re-run.
+#   4. last resort, with consent only (Yes at the prompt, or
+#      -AllowSystemFileDowngrade; -Force alone never approves it): another
+#      revision of the SAME build (e.g. a superseded copy left in WinSxS), only if
+#      its static imports resolve against the installed modules and every
+#      installed module importing it still resolves. It is installed with a
+#      DOWNGRADE warning, a .replaced.bak and an undo hint; run
 #      DISM /RestoreHealth + sfc /scannow (or the latest CU) after boot.
 # If nothing passes, the repair is refused with a -RepairSystemFileSource hint.
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -RepairSystemFile "ntoskrnl.exe","ci.dll"
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -RepairSystemFile "win32k.sys"
+
+# Use a donor disk created from a Marketplace image of the same build and
+# attached to the rescue VM (disk 4), and never go to the internet
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -RepairSystemFile "win32k.sys" -RepairSystemFileDonorDisk 4 -SkipMsuDownload
+
+# Extract the file from a cumulative update you downloaded yourself
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -RepairSystemFile "win32k.sys" -RepairSystemFileMsu D:\Updates\windows10.0-kb5058383-x64.msu
+
+# Unattended run that may fall back to a same-build revision
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -RepairSystemFile "win32k.sys" -AllowSystemFileDowngrade -Force
 
 # Disable offline SFC and fail with a donor hint instead
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -RepairSystemFile "winload.efi" -SkipOfflineSfc

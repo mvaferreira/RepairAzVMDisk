@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.8.10
+        Version: 0.9.0
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -474,10 +474,15 @@ dynamicparam {
     if ($PSBoundParameters.ContainsKey('FixSecureBootCodeIntegrity')) {
         & $addParam 'CodeIntegrityPolicySourcePath' ([string]) 'Repair' ''
     }
-    # -RepairSystemFileSource, -SkipOfflineSfc: sub-options of -RepairSystemFile
+    # -RepairSystemFileSource, -SkipOfflineSfc, -RepairSystemFileDonorDisk, -RepairSystemFileMsu,
+    # -SkipMsuDownload, -AllowSystemFileDowngrade: sub-options of -RepairSystemFile
     if ($PSBoundParameters.ContainsKey('RepairSystemFile')) {
         & $addParam 'RepairSystemFileSource' ([string]) 'Repair' ''
         & $addParam 'SkipOfflineSfc' ([switch]) 'Repair' $null
+        & $addParam 'RepairSystemFileDonorDisk' ([int]) 'Repair' -1
+        & $addParam 'RepairSystemFileMsu' ([string[]]) 'Repair' @()
+        & $addParam 'SkipMsuDownload' ([switch]) 'Repair' $null
+        & $addParam 'AllowSystemFileDowngrade' ([switch]) 'Repair' $null
     }
     # -RepairSource: sub-option of -RepairComponentStore
     if ($PSBoundParameters.ContainsKey('RepairComponentStore')) {
@@ -19849,12 +19854,1402 @@ namespace RepairAzVMDisk
         }
     }
 
+    # -- Outside repair sources for -RepairSystemFile -----------------------------
+    # When the guest's own stores hold no copy of the installed version and offline SFC
+    # cannot restore one, the exact file can still come from outside the guest:
+    #   - a disk created from the Marketplace image of the guest's build and attached to
+    #     this rescue VM (or the rescue VM's own Windows, when it happens to match), or
+    #   - the cumulative update (MSU) the guest has installed, from the Microsoft Update
+    #     Catalog or from a file the operator supplies.
+    # Every file obtained this way must be the installed version exactly, and must pass
+    # image trust against the BROKEN guest's own catalogs, so no outside source can
+    # introduce a file the guest would not have accepted itself.
+
+    function Get-GuestOsIdentity {
+        # Build, UBR, edition and installation type of the offline guest.
+        $identity = [pscustomobject]@{ ProductName = ''; Build = ''; Ubr = ''; EditionID = ''; InstallationType = ''; DisplayVersion = '' }
+        try {
+            $cv = Invoke-WithHive 'SOFTWARE' {
+                Get-ItemProperty 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+            }
+            if ($cv) {
+                $identity.ProductName = [string]$cv.ProductName
+                $identity.Build = [string]$cv.CurrentBuildNumber
+                $identity.Ubr = if ($null -ne $cv.UBR) { [string]$cv.UBR } else { '' }
+                $identity.EditionID = [string]$cv.EditionID
+                $identity.InstallationType = [string]$cv.InstallationType
+                $identity.DisplayVersion = if ($cv.DisplayVersion) { [string]$cv.DisplayVersion } else { [string]$cv.ReleaseId }
+            }
+        }
+        catch { Write-Verbose "Guest OS identity unavailable: $($_.Exception.Message)" }
+        return $identity
+    }
+
+    function Get-MarketplaceImageCandidates {
+        # Marketplace publisher/offer/SKU that ship the guest's build, best match first.
+        # Standard and Datacenter share binaries, so Datacenter images serve both; a full
+        # (Desktop Experience) image is a superset of Server Core and is offered after it.
+        param([string]$Build, [string]$EditionID = '', [string]$InstallationType = '')
+
+        $isCore = $InstallationType -match 'Core'
+        $isMultiSession = $EditionID -eq 'ServerRdsh'
+        $isClient = $isMultiSession -or $InstallationType -eq 'Client'
+        # Datacenter: Azure Edition reports EditionID ServerTurbine (ServerTurbineCor for Core).
+        $isAzureEdition = $EditionID -match 'Azure|Turbine'
+        $skus = @()
+        if ($isClient) {
+            $publisher = 'MicrosoftWindowsDesktop'
+            $client = @{
+                '19044' = @('windows-10', 'win10-21h2')
+                '19045' = @('windows-10', 'win10-22h2')
+                '22621' = @('windows-11', 'win11-22h2')
+                '22631' = @('windows-11', 'win11-23h2')
+                '26100' = @('windows-11', 'win11-24h2')
+                '26200' = @('windows-11', 'win11-25h2')
+            }
+            if (-not $client.ContainsKey($Build)) { return @() }
+            $offer = $client[$Build][0]
+            $stem = $client[$Build][1]
+            $skus = if ($isMultiSession) { @("$stem-avd", "$stem-ent") } else { @("$stem-ent", "$stem-pro") }
+        }
+        else {
+            $publisher = 'MicrosoftWindowsServer'
+            $offer = 'WindowsServer'
+            $server = @{
+                '9200'  = @{ Full = '2012-Datacenter' }
+                '9600'  = @{ Full = '2012-R2-Datacenter' }
+                '14393' = @{ Full = '2016-Datacenter'; Core = '2016-Datacenter-Server-Core' }
+                '17763' = @{ Full = '2019-Datacenter'; Core = '2019-Datacenter-Core' }
+                '20348' = @{ Full = '2022-datacenter'; Core = '2022-datacenter-core'; Azure = '2022-datacenter-azure-edition'; AzureCore = '2022-datacenter-azure-edition-core' }
+                '26100' = @{ Full = '2025-datacenter'; Core = '2025-datacenter-core'; Azure = '2025-datacenter-azure-edition'; AzureCore = '2025-datacenter-azure-edition-core' }
+            }
+            if (-not $server.ContainsKey($Build)) { return @() }
+            $map = $server[$Build]
+            if ($isAzureEdition -and $map.Azure) {
+                if ($isCore) { $skus += $map.AzureCore }
+                $skus += $map.Azure
+            }
+            if ($isCore -and $map.Core) { $skus += $map.Core }
+            $skus += $map.Full
+        }
+        return @($skus | Where-Object { $_ } | Select-Object -Unique | ForEach-Object {
+                [pscustomobject]@{ Publisher = $publisher; Offer = $offer; Sku = $_ }
+            })
+    }
+
+    function Get-AzureInstanceMetadata {
+        # The rescue VM's own subscription, resource group, name, region and zone, so the
+        # printed az commands can be run as they are. $null when not on Azure.
+        param([int]$TimeoutMilliseconds = 3000)
+        try {
+            $request = [System.Net.HttpWebRequest]::Create('http://169.254.169.254/metadata/instance?api-version=2021-02-01')
+            $request.Headers.Add('Metadata', 'true')
+            $request.Proxy = $null
+            $request.Timeout = $TimeoutMilliseconds
+            $request.ReadWriteTimeout = $TimeoutMilliseconds
+            $response = $request.GetResponse()
+            try {
+                $reader = New-Object System.IO.StreamReader($response.GetResponseStream())
+                $json = $reader.ReadToEnd()
+            }
+            finally { $response.Close() }
+            $compute = ($json | ConvertFrom-Json).compute
+            if (-not $compute) { return $null }
+            return [pscustomobject]@{
+                SubscriptionId = [string]$compute.subscriptionId
+                ResourceGroup  = [string]$compute.resourceGroupName
+                VmName         = [string]$compute.name
+                Location       = [string]$compute.location
+                Zone           = [string]$compute.zone
+            }
+        }
+        catch { return $null }
+    }
+
+    function Get-DonorDiskName {
+        param([string]$VmName, [string]$Build, [string]$Ubr)
+        $stem = if ($VmName) { $VmName -replace '[^A-Za-z0-9_\-]', '' } else { 'rescue' }
+        $suffix = "-rsf-donor-$Build" + $(if ($Ubr) { "-$Ubr" } else { '' })
+        $max = 80 - $suffix.Length
+        if ($stem.Length -gt $max) { $stem = $stem.Substring(0, $max) }
+        return ($stem + $suffix).ToLowerInvariant()
+    }
+
+    function Format-DonorDiskCommands {
+        # az CLI steps that create a donor disk from the Marketplace image of the guest's
+        # build and attach it to this rescue VM. The text is identical in bash and
+        # PowerShell (no $, double quotes outside, single quotes inside the JMESPath), so it
+        # can be pasted into Cloud Shell or handed to whoever owns the subscription.
+        param(
+            [object[]]$Images,
+            [object]$Metadata,
+            [Parameter(Mandatory)][string]$Build,
+            [string]$Ubr,
+            [Parameter(Mandatory)][string]$DiskName
+        )
+        $sub = if ($Metadata -and $Metadata.SubscriptionId) { $Metadata.SubscriptionId } else { 'SUBSCRIPTION-ID' }
+        $rg = if ($Metadata -and $Metadata.ResourceGroup) { $Metadata.ResourceGroup } else { 'RESCUE-VM-RESOURCE-GROUP' }
+        $vm = if ($Metadata -and $Metadata.VmName) { $Metadata.VmName } else { 'RESCUE-VM-NAME' }
+        $loc = if ($Metadata -and $Metadata.Location) { $Metadata.Location } else { 'RESCUE-VM-REGION' }
+        $zoneArg = if ($Metadata -and $Metadata.Zone) { " --zone $($Metadata.Zone)" } else { '' }
+        $prefix = if ($Ubr) { "$Build.$Ubr." } else { "$Build." }
+
+        $lines = New-Object System.Collections.Generic.List[string]
+        if ($Ubr) {
+            $lines.Add("# 1. Find a Marketplace image of build $($prefix.TrimEnd('.')). Empty output means Azure no longer publishes it (only about the last ten monthly images are kept).")
+        }
+        else {
+            $lines.Add("# 1. List the Marketplace images of build $Build. Any update level works; pick the newest URN.")
+        }
+        foreach ($img in @($Images)) {
+            $lines.Add("az vm image list --subscription $sub --location $loc --publisher $($img.Publisher) --offer $($img.Offer) --sku $($img.Sku) --all --query ""[?starts_with(version,'$prefix')].urn"" -o tsv")
+        }
+        $lines.Add("# 2. Create the donor disk from one URN printed by step 1.")
+        $lines.Add("az disk create --subscription $sub -g $rg -n $DiskName --location $loc$zoneArg --sku StandardSSD_LRS --image-reference URN-FROM-STEP-1")
+        $lines.Add("# 3. Attach it to this rescue VM (the Azure VM running this script, not a nested Hyper-V guest).")
+        $lines.Add("az vm disk attach --subscription $sub -g $rg --vm-name $vm --name $DiskName")
+        $lines.Add("# 4. Re-run the same Repair-AzVMDisk command. The donor disk is found, read and released automatically.")
+        $lines.Add("# 5. Afterwards, remove the donor disk.")
+        $lines.Add("az vm disk detach --subscription $sub -g $rg --vm-name $vm --name $DiskName")
+        $lines.Add("az disk delete --subscription $sub -g $rg -n $DiskName --yes")
+        return $lines.ToArray()
+    }
+
+    function Enable-CatalogTls {
+        try {
+            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+        }
+        catch { Write-Verbose "TLS 1.2 could not be enabled: $($_.Exception.Message)" }
+    }
+
+    function Get-InnermostExceptionMessage {
+        param($Exception)
+        $e = $Exception
+        while ($e -and $e.InnerException) { $e = $e.InnerException }
+        if ($e) { return $e.Message }
+        return ''
+    }
+
+    function Get-CatalogWebProxy {
+        $proxy = [System.Net.WebRequest]::GetSystemWebProxy()
+        $proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+        return $proxy
+    }
+
+    function Test-UpdateCatalogConnectivity {
+        # Most rescue VMs cannot reach the internet, so the catalog is probed before a
+        # download is attempted: DNS, TCP 443, then an HTTPS request, each with a short
+        # timeout and through the system proxy when one is configured. Any HTTP answer,
+        # even an error status, proves the path is open.
+        param(
+            [string[]]$Uri = @('https://www.catalog.update.microsoft.com/Home.aspx', 'https://catalog.s.download.windowsupdate.com/'),
+            [int]$TimeoutMilliseconds = 8000
+        )
+        Enable-CatalogTls
+        $failures = New-Object System.Collections.Generic.List[string]
+        $proxy = Get-CatalogWebProxy
+        foreach ($u in $Uri) {
+            $target = [uri]$u
+            $viaProxy = $null
+            try {
+                if (-not $proxy.IsBypassed($target)) {
+                    $p = $proxy.GetProxy($target)
+                    if ($p -and $p.Host -ne $target.Host) { $viaProxy = $p }
+                }
+            }
+            catch { $viaProxy = $null }
+            $connectHost = if ($viaProxy) { $viaProxy.Host } else { $target.Host }
+            $connectPort = if ($viaProxy) { $viaProxy.Port } else { $target.Port }
+            $label = if ($viaProxy) { "$($target.Host) via proxy ${connectHost}:$connectPort" } else { "$($target.Host)" }
+
+            try {
+                $ar = [System.Net.Dns]::BeginGetHostAddresses($connectHost, $null, $null)
+                if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMilliseconds)) { $failures.Add("${label}: DNS lookup timed out"); continue }
+                $addresses = [System.Net.Dns]::EndGetHostAddresses($ar)
+                if (-not $addresses -or $addresses.Count -eq 0) { $failures.Add("${label}: DNS returned no address"); continue }
+            }
+            catch { $failures.Add("${label}: DNS lookup failed ($(Get-InnermostExceptionMessage $_.Exception))"); continue }
+
+            $tcp = New-Object System.Net.Sockets.TcpClient
+            $tcpOk = $false
+            try {
+                $ar = $tcp.BeginConnect($connectHost, $connectPort, $null, $null)
+                if ($ar.AsyncWaitHandle.WaitOne($TimeoutMilliseconds)) { $tcp.EndConnect($ar); $tcpOk = $true }
+                else { $failures.Add("${label}: TCP connect to port $connectPort timed out ($(if ($viaProxy) { 'the proxy did not answer' } else { 'outbound traffic is probably blocked' }))") }
+            }
+            catch { $failures.Add("${label}: TCP connect to port $connectPort failed ($(Get-InnermostExceptionMessage $_.Exception))") }
+            finally { $tcp.Close() }
+            if (-not $tcpOk) { continue }
+
+            try {
+                $request = [System.Net.HttpWebRequest]::Create($target)
+                $request.Method = 'HEAD'
+                $request.Timeout = $TimeoutMilliseconds
+                $request.ReadWriteTimeout = $TimeoutMilliseconds
+                $request.AllowAutoRedirect = $false
+                $request.Proxy = $proxy
+                $request.GetResponse().Close()
+            }
+            catch {
+                $webEx = $_.Exception
+                while ($webEx -and $webEx -isnot [System.Net.WebException] -and $webEx.InnerException) { $webEx = $webEx.InnerException }
+                if ($webEx -is [System.Net.WebException] -and $webEx.Response) { $webEx.Response.Close() }
+                else { $failures.Add("${label}: HTTPS request failed ($(Get-InnermostExceptionMessage $_.Exception))") }
+            }
+        }
+        return [pscustomobject]@{ Reachable = ($failures.Count -eq 0); Failures = $failures.ToArray() }
+    }
+
+    function Get-GuestRollupPackages {
+        # Latest cumulative updates (LCUs) recorded in the guest's servicing store, with
+        # their KB number and CBS install state. LCUs are cumulative, so the installed one
+        # carries the current version of every file it services.
+        param([Parameter(Mandatory)][string]$WinRoot)
+        $mums = @(Get-ChildItem -LiteralPath (Join-Path $WinRoot 'servicing\Packages') -Filter 'Package_for_RollupFix~*.mum' -File -ErrorAction SilentlyContinue)
+        if ($mums.Count -eq 0) { return @() }
+
+        $states = @{}
+        try {
+            Invoke-WithHive 'SOFTWARE' {
+                $pkRoot = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\Packages\'
+                foreach ($m in $mums) {
+                    $v = (Get-ItemProperty -LiteralPath ($pkRoot + [System.IO.Path]::GetFileNameWithoutExtension($m.Name)) -Name CurrentState -ErrorAction SilentlyContinue).CurrentState
+                    if ($null -ne $v) { $states[$m.Name] = [int]$v }
+                }
+            }
+        }
+        catch { Write-Verbose "CBS package state unavailable: $($_.Exception.Message)" }
+
+        foreach ($m in $mums) {
+            $kb = ''; $version = $null; $arch = ''
+            try {
+                $settings = New-Object System.Xml.XmlReaderSettings
+                $settings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
+                $settings.XmlResolver = $null
+                $reader = [System.Xml.XmlReader]::Create($m.FullName, $settings)
+                try {
+                    $doc = New-Object System.Xml.XmlDocument
+                    $doc.Load($reader)
+                }
+                finally { $reader.Close() }
+                $idNode = $doc.SelectSingleNode("/*[local-name()='assembly']/*[local-name()='assemblyIdentity']")
+                $pkgNode = $doc.SelectSingleNode("/*[local-name()='assembly']/*[local-name()='package']")
+                if ($pkgNode) { $kb = [string]$pkgNode.GetAttribute('identifier') }
+                if ($idNode) {
+                    $arch = [string]$idNode.GetAttribute('processorArchitecture')
+                    $version = [version][string]$idNode.GetAttribute('version')
+                }
+            }
+            catch { Write-Verbose "Could not parse $($m.Name): $($_.Exception.Message)" }
+            if (-not $version -and $m.Name -match '~~(\d+\.\d+\.\d+\.\d+)\.mum$') { $version = [version]$Matches[1] }
+            if (-not $arch -and $m.Name -match '~[0-9a-f]{16}~([^~]+)~') { $arch = $Matches[1] }
+            if ($kb -notmatch '^KB\d+$') { $kb = '' }
+            $state = if ($states.ContainsKey($m.Name)) { $states[$m.Name] } else { $null }
+            [pscustomobject]@{
+                Name         = [System.IO.Path]::GetFileNameWithoutExtension($m.Name)
+                Kb           = $kb
+                Version      = $version
+                Ubr          = if ($version) { [string]$version.Minor } else { '' }
+                Architecture = $arch
+                CurrentState = $state
+                Installed    = ($state -eq 0x70)
+            }
+        }
+    }
+
+    function Select-GuestRollupPackage {
+        # The installed LCU whose version matches the guest UBR, else the newest installed
+        # one, else (no CBS state readable) the newest recorded.
+        param([object[]]$Packages, [string]$Ubr)
+        $withKb = @($Packages | Where-Object { $_ -and $_.Kb })
+        if ($withKb.Count -eq 0) { return $null }
+        $installed = @($withKb | Where-Object { $_.Installed })
+        $pool = if ($installed.Count -gt 0) { $installed } else { $withKb }
+        if ($Ubr) {
+            $exact = @($pool | Where-Object { $_.Ubr -eq $Ubr } | Sort-Object Version -Descending)
+            if ($exact.Count -gt 0) { return $exact[0] }
+        }
+        return ($pool | Sort-Object Version -Descending | Select-Object -First 1)
+    }
+
+    function Get-UpdateCatalogProductPattern {
+        # Regex matching the product name the Update Catalog uses in LCU titles.
+        param([string]$Build, [string]$InstallationType = '')
+        $client = $InstallationType -eq 'Client'
+        switch ($Build) {
+            '9200'  { if ($client) { return 'Windows 8(?!\.1)' } else { return 'Windows Server 2012(?! R2)' } }
+            '9600'  { if ($client) { return 'Windows 8\.1' } else { return 'Windows Server 2012 R2' } }
+            '14393' { if ($client) { return 'Windows 10 Version 1607' } else { return 'Windows Server 2016' } }
+            '17763' { if ($client) { return 'Windows 10 Version 1809' } else { return 'Windows Server 2019' } }
+            '19044' { return 'Windows 10 Version 21H2' }
+            '19045' { return 'Windows 10 Version 22H2' }
+            '20348' { return 'Microsoft server operating system,? version 21H2' }
+            '22621' { return 'Windows 11 Version 22H2' }
+            '22631' { return 'Windows 11 Version 23H2' }
+            '26100' { if ($client) { return 'Windows 11 Version 24H2' } else { return 'Microsoft server operating system,? version 24H2' } }
+            '26200' { return 'Windows 11 Version 25H2' }
+        }
+        return $null
+    }
+
+    function Get-UpdateCatalogArchitectureLabel {
+        param([string]$Architecture)
+        switch -Regex ($Architecture) {
+            '^(AMD64|x64)$' { return 'x64' }
+            '^ARM64$' { return 'ARM64' }
+            '^(x86|i386)$' { return 'x86' }
+        }
+        return 'x64'
+    }
+
+    function Invoke-CatalogHttpRequest {
+        param(
+            [Parameter(Mandatory)][string]$Uri,
+            [string]$Method = 'GET',
+            [string]$Body = '',
+            [int]$TimeoutSec = 60
+        )
+        Enable-CatalogTls
+        $request = [System.Net.HttpWebRequest]::Create($Uri)
+        $request.Method = $Method
+        $request.Timeout = $TimeoutSec * 1000
+        $request.ReadWriteTimeout = $TimeoutSec * 1000
+        $request.Proxy = Get-CatalogWebProxy
+        $request.UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Repair-AzVMDisk'
+        if ($Method -eq 'POST') {
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
+            $request.ContentType = 'application/x-www-form-urlencoded'
+            $request.ContentLength = $bytes.Length
+            $stream = $request.GetRequestStream()
+            try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Close() }
+        }
+        $response = $request.GetResponse()
+        try {
+            $reader = New-Object System.IO.StreamReader($response.GetResponseStream())
+            return $reader.ReadToEnd()
+        }
+        finally { $response.Close() }
+    }
+
+    function Select-UpdateCatalogRow {
+        # Picks the catalog row for the guest's product and architecture from search HTML.
+        param([string]$Html, [string]$Kb, [string]$ProductPattern, [string]$ArchitectureLabel = 'x64')
+        $rows = @([regex]::Matches($Html, "<a id=['""]?(?<id>[0-9a-fA-F\-]{36})_link['""]?[^>]*>\s*(?<t>[^<]+?)\s*</a>") | ForEach-Object {
+                [pscustomobject]@{ UpdateId = $_.Groups['id'].Value; Title = [System.Net.WebUtility]::HtmlDecode($_.Groups['t'].Value.Trim()) }
+            })
+        $matching = @($rows | Where-Object {
+                $_.Title -match ('\b' + [regex]::Escape($ArchitectureLabel) + '-based') -and
+                $_.Title -notmatch 'Dynamic' -and
+                ([string]::IsNullOrEmpty($Kb) -or $_.Title -match [regex]::Escape($Kb)) -and
+                ([string]::IsNullOrEmpty($ProductPattern) -or $_.Title -match $ProductPattern)
+            })
+        return [pscustomobject]@{ All = $rows; Selected = ($matching | Select-Object -First 1) }
+    }
+
+    function Get-UpdateCatalogDownloadUrls {
+        param([Parameter(Mandatory)][string]$UpdateId)
+        $payload = '[{"size":0,"languages":"","uidInfo":"' + $UpdateId + '","updateID":"' + $UpdateId + '"}]'
+        $body = 'updateIDs=' + [uri]::EscapeDataString($payload) + '&updateIDsBlockedForImport=&wsusApiPresent=&contentImport=&sku=&serverName=&ssl=&portNumber=&version='
+        $html = Invoke-CatalogHttpRequest -Uri 'https://www.catalog.update.microsoft.com/DownloadDialog.aspx' -Method POST -Body $body
+        return @([regex]::Matches($html, "downloadInformation\[\d+\]\.files\[\d+\]\.url\s*=\s*'(?<u>[^']+)'") | ForEach-Object { $_.Groups['u'].Value })
+    }
+
+    function Test-MicrosoftDownloadUrl {
+        # Only Microsoft download hosts are accepted. The transport may be plain HTTP; the
+        # package's Authenticode signature is what proves its content.
+        param([string]$Url)
+        try { $u = [uri]$Url } catch { return $false }
+        if ($u.Scheme -notin @('http', 'https')) { return $false }
+        return ($u.Host -match '(^|\.)(windowsupdate\.com|microsoft\.com)$')
+    }
+
+    function Get-RemoteContentLength {
+        param([Parameter(Mandatory)][string]$Url, [int]$TimeoutSec = 30)
+        try {
+            $request = [System.Net.HttpWebRequest]::Create($Url)
+            $request.Method = 'HEAD'
+            $request.Timeout = $TimeoutSec * 1000
+            $request.Proxy = Get-CatalogWebProxy
+            $response = $request.GetResponse()
+            try { return [int64]$response.ContentLength } finally { $response.Close() }
+        }
+        catch { return [int64]-1 }
+    }
+
+    function Get-SystemFileScratchRoot {
+        # A writable local volume for downloads and extraction: never the target disk, a
+        # read-only disk, or another attached Windows installation (a donor, or some other
+        # VM's OS disk). The volume with the most free space wins.
+        param([int64]$RequiredBytes = 0, [int[]]$ExcludeDiskNumbers = @())
+        $hostRoot = $env:SystemDrive.TrimEnd('\').ToUpperInvariant()
+        $candidates = New-Object System.Collections.Generic.List[object]
+        foreach ($vol in @(Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveType -eq 'Fixed' -and $_.DriveLetter -and $_.FileSystem -eq 'NTFS' })) {
+            $part = Get-Partition -DriveLetter $vol.DriveLetter -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $part) { continue }
+            if ($ExcludeDiskNumbers -contains [int]$part.DiskNumber) { continue }
+            $root = "$($vol.DriveLetter):"
+            if ($root.ToUpperInvariant() -ne $hostRoot -and (Test-Path -LiteralPath "$root\Windows\System32\config\SYSTEM" -PathType Leaf)) { continue }
+            $disk = Get-Disk -Number $part.DiskNumber -ErrorAction SilentlyContinue
+            if (-not $disk -or $disk.IsReadOnly -or $disk.IsOffline) { continue }
+            $candidates.Add([pscustomobject]@{ Root = "$($vol.DriveLetter):\"; Free = [int64]$vol.SizeRemaining })
+        }
+        $best = $candidates | Sort-Object Free -Descending | Select-Object -First 1
+        if (-not $best) { return $null }
+        return [pscustomobject]@{ Root = $best.Root; Free = $best.Free; Sufficient = ($best.Free -ge $RequiredBytes) }
+    }
+
+    function Get-ComponentIdentityVersion {
+        # Version in a bare WinSxS component folder name.
+        param([string]$Name)
+        if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+        $m = [regex]::Match($Name, '_[0-9a-f]{16}_(\d+\.\d+\.\d+\.\d+)_', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if (-not $m.Success) { return $null }
+        try { return [version]$m.Groups[1].Value } catch { return $null }
+    }
+
+    function Get-SystemFileNumericVersion {
+        # The binary version from the fixed version resource. The FileVersion string is not
+        # always updated by servicing, the numeric fields are.
+        param([Parameter(Mandatory)][string]$Path)
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        if (-not $item -or $item.PSIsContainer) { return $null }
+        $vi = $item.VersionInfo
+        if ($vi -and ($vi.FileMajorPart -or $vi.FileMinorPart -or $vi.FileBuildPart -or $vi.FilePrivatePart)) {
+            return [version]('{0}.{1}.{2}.{3}' -f $vi.FileMajorPart, $vi.FileMinorPart, $vi.FileBuildPart, $vi.FilePrivatePart)
+        }
+        if ($vi) { return Get-SystemFileVersionFromText -Text $vi.FileVersion }
+        return $null
+    }
+
+    function Test-MicrosoftPackageSignature {
+        param([Parameter(Mandatory)][string]$Path)
+        $sig = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction SilentlyContinue
+        $subject = if ($sig -and $sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '' }
+        return [pscustomobject]@{
+            Valid   = ($sig -and "$($sig.Status)" -eq 'Valid' -and $subject -match 'O=Microsoft Corporation')
+            Status  = if ($sig) { "$($sig.Status)" } else { 'Unknown' }
+            Subject = $subject
+        }
+    }
+
+    function Get-CabinetEntries {
+        param([Parameter(Mandatory)][string]$CabPath)
+        if ($null -eq $script:CabinetListingCache) { $script:CabinetListingCache = @{} }
+        if ($script:CabinetListingCache.ContainsKey($CabPath)) { return $script:CabinetListingCache[$CabPath] }
+        $expandExe = Join-Path $env:SystemRoot 'System32\expand.exe'
+        $prefix = '^' + [regex]::Escape($CabPath) + ':\s+(?<e>.+?)\s*$'
+        $entries = @(& $expandExe -D $CabPath 2>&1 | ForEach-Object {
+                $m = [regex]::Match([string]$_, $prefix, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+                if ($m.Success) { $m.Groups['e'].Value }
+            })
+        $script:CabinetListingCache[$CabPath] = $entries
+        return $entries
+    }
+
+    function Split-ComponentIdentity {
+        # The parts of a WinSxS component folder name:
+        # <arch>_<name>_<publicKeyToken>_<version>_<culture>_<hash>. Long names are
+        # shortened with '..' the same way for every version, so arch + name + token +
+        # culture identify one component across its versions.
+        param([string]$Name)
+        if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+        $m = [regex]::Match($Name, '^(?<arch>[^_]+)_(?<name>.+)_(?<token>[0-9a-f]{16})_(?<ver>\d+\.\d+\.\d+\.\d+)_(?<culture>[^_]+)_(?<hash>[0-9a-f]{16})$', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if (-not $m.Success) { return $null }
+        try { $ver = [version]$m.Groups['ver'].Value } catch { return $null }
+        return [pscustomobject]@{
+            Architecture = $m.Groups['arch'].Value; Name = $m.Groups['name'].Value; Token = $m.Groups['token'].Value
+            Version = $ver; Culture = $m.Groups['culture'].Value; Hash = $m.Groups['hash'].Value
+        }
+    }
+
+    function Invoke-MsDeltaApply {
+        # Applies a PA30 differential to Source (empty for a null differential) with
+        # msdelta.dll. Servicing stores differentials behind a 4-byte CRC prefix, so the
+        # PA30 signature is looked for at 0 and 4. Servicing differentials carry a hash of
+        # the file they produce, so a damaged or different base fails, never mis-patches.
+        param([byte[]]$Source = @(), [Parameter(Mandatory)][byte[]]$Delta)
+        if (-not ('RepairAzVMDisk.MsDelta' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace RepairAzVMDisk {
+    public static class MsDelta {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct DELTA_INPUT { public IntPtr lpStart; public UIntPtr uSize; [MarshalAs(UnmanagedType.Bool)] public bool Editable; }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct DELTA_OUTPUT { public IntPtr lpStart; public UIntPtr uSize; }
+        [DllImport("msdelta.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool ApplyDeltaB(long applyFlags, DELTA_INPUT source, DELTA_INPUT delta, out DELTA_OUTPUT target);
+        [DllImport("msdelta.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool DeltaFree(IntPtr memory);
+        public static byte[] Apply(byte[] source, byte[] delta, int offset) {
+            GCHandle pin = GCHandle.Alloc(delta, GCHandleType.Pinned);
+            bool hasSource = source != null && source.Length > 0;
+            GCHandle srcPin = hasSource ? GCHandle.Alloc(source, GCHandleType.Pinned) : new GCHandle();
+            try {
+                DELTA_INPUT src = new DELTA_INPUT();
+                if (hasSource) {
+                    src.lpStart = srcPin.AddrOfPinnedObject();
+                    src.uSize = new UIntPtr((ulong)source.Length);
+                }
+                DELTA_INPUT input = new DELTA_INPUT();
+                input.lpStart = new IntPtr(pin.AddrOfPinnedObject().ToInt64() + offset);
+                input.uSize = new UIntPtr((ulong)(delta.Length - offset));
+                DELTA_OUTPUT output;
+                if (!ApplyDeltaB(0, src, input, out output)) { throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()); }
+                try {
+                    byte[] result = new byte[(long)output.uSize.ToUInt64()];
+                    Marshal.Copy(output.lpStart, result, 0, result.Length);
+                    return result;
+                }
+                finally { DeltaFree(output.lpStart); }
+            }
+            finally {
+                pin.Free();
+                if (hasSource) { srcPin.Free(); }
+            }
+        }
+    }
+}
+'@
+        }
+        $isPa30 = { param([int]$at) $Delta.Length -ge ($at + 4) -and $Delta[$at] -eq 0x50 -and $Delta[$at + 1] -eq 0x41 -and $Delta[$at + 2] -eq 0x33 -and $Delta[$at + 3] -eq 0x30 }
+        $offset = if (& $isPa30 0) { 0 } elseif (& $isPa30 4) { 4 } else { throw 'not a PA30 differential' }
+        return , ([RepairAzVMDisk.MsDelta]::Apply($Source, $Delta, $offset))
+    }
+
+    function ConvertFrom-NullDifferential {
+        # Applies a null differential (the n\ copies in 1809+ cumulative updates): a PA30
+        # delta against an empty source, which yields the complete file.
+        param([Parameter(Mandatory)][byte[]]$Delta)
+        return , (Invoke-MsDeltaApply -Delta $Delta)
+    }
+
+    function New-SystemFileFromForwardDelta {
+        # Rebuilds the exact version of a file from 1809+ component-store differentials.
+        # Each component folder of those builds keeps the full file, r\<file> (reverse
+        # differential: this version -> the build's original, RTM) and f\<file> (forward
+        # differential: RTM -> this version). The guest's own f\ is intact even when its
+        # full file is damaged, so any intact copy of the same component and build - on
+        # a donor disk of any later update, or on the rescue VM - gives RTM (full + its
+        # r\, or a folder that is RTM itself), and RTM + the guest's f\ is the exact file.
+        # The result must still pass the caller's version and signature checks.
+        param(
+            [Parameter(Mandatory)][string[]]$ForwardDeltaPath,
+            [Parameter(Mandatory)][string]$Root,
+            [Parameter(Mandatory)][string]$ComponentName,
+            [Parameter(Mandatory)][string]$FileName,
+            [Parameter(Mandatory)][version]$ExpectedVersion,
+            [Parameter(Mandatory)][string]$OutputPath
+        )
+        $report = New-Object System.Collections.Generic.List[string]
+        $result = [pscustomobject]@{ Path = $null; BaseComponent = ''; Report = $null }
+        $id = Split-ComponentIdentity -Name $ComponentName
+        $winsxs = Join-Path $Root 'WinSxS'
+        if (-not $id) { $report.Add("component name '$ComponentName' is not recognized"); $result.Report = $report.ToArray(); return $result }
+        if (-not (Test-Path -LiteralPath $winsxs -PathType Container)) { $result.Report = $report.ToArray(); return $result }
+
+        $deltas = @(foreach ($p in $ForwardDeltaPath) {
+                try { [pscustomobject]@{ Path = $p; Bytes = [System.IO.File]::ReadAllBytes($p) } } catch { $report.Add("forward differential $p could not be read: $($_.Exception.Message)") }
+            })
+        if ($deltas.Count -eq 0) { $result.Report = $report.ToArray(); return $result }
+
+        $dirs = @()
+        try { $dirs = @([System.IO.Directory]::GetDirectories($winsxs, "$($id.Architecture)_$($id.Name)_$($id.Token)_*")) }
+        catch { $report.Add("WinSxS could not be listed: $($_.Exception.Message)") }
+        $family = @(foreach ($d in $dirs) {
+                $i = Split-ComponentIdentity -Name ([System.IO.Path]::GetFileName($d))
+                if ($i -and $i.Name -ieq $id.Name -and $i.Culture -ieq $id.Culture -and
+                    $i.Version.Major -eq $id.Version.Major -and $i.Version.Minor -eq $id.Version.Minor -and $i.Version.Build -eq $id.Version.Build) {
+                    [pscustomobject]@{ Dir = $d; Identity = $i }
+                }
+            }) | Sort-Object { $_.Identity.Version } -Descending
+        if (@($family).Count -eq 0) {
+            $report.Add("no $($id.Name) component of build $($id.Version.Build) to rebuild $FileName from")
+            $result.Report = $report.ToArray(); return $result
+        }
+
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $tried = New-Object 'System.Collections.Generic.HashSet[string]'
+            foreach ($f in $family) {
+                $leaf = [System.IO.Path]::GetFileName($f.Dir)
+                $full = Join-Path $f.Dir $FileName
+                $item = Get-Item -LiteralPath $full -Force -ErrorAction SilentlyContinue
+                if (-not $item -or $item.PSIsContainer -or $item.Length -lt 2) { continue }
+                try { $fullBytes = [System.IO.File]::ReadAllBytes($full) } catch { $report.Add("$leaf\$FileName could not be read"); continue }
+                if ($fullBytes[0] -ne 0x4D -or $fullBytes[1] -ne 0x5A) { continue }
+                $reverse = Join-Path $f.Dir "r\$FileName"
+                $base = $null
+                if (Test-Path -LiteralPath $reverse -PathType Leaf) {
+                    try { $base = Invoke-MsDeltaApply -Source $fullBytes -Delta ([System.IO.File]::ReadAllBytes($reverse)) }
+                    catch { $report.Add("$leaf : its r\ differential does not apply to its $FileName (damaged or mismatched copy)"); continue }
+                }
+                else { $base = $fullBytes }
+                if (-not $tried.Add([System.BitConverter]::ToString($sha.ComputeHash($base)))) { continue }
+                foreach ($delta in $deltas) {
+                    try { $out = Invoke-MsDeltaApply -Source $base -Delta $delta.Bytes }
+                    catch { continue }
+                    $null = New-Item -ItemType Directory -Path (Split-Path $OutputPath -Parent) -Force
+                    [System.IO.File]::WriteAllBytes($OutputPath, $out)
+                    $v = Get-SystemFileNumericVersion -Path $OutputPath
+                    if ($v -ne $ExpectedVersion) {
+                        $report.Add("$leaf : the rebuilt file is version $v, not $ExpectedVersion")
+                        Remove-Item -LiteralPath $OutputPath -Force -ErrorAction SilentlyContinue
+                        continue
+                    }
+                    $result.Path = $OutputPath
+                    $result.BaseComponent = $leaf
+                    $report.Add("rebuilt $FileName $v from $leaf$(if (Test-Path -LiteralPath $reverse -PathType Leaf) { ' (full file + r\)' } else { '' }) + the forward differential $($delta.Path)")
+                    $result.Report = $report.ToArray()
+                    return $result
+                }
+                $report.Add("$leaf : the forward differential does not apply to the original file it yields")
+            }
+        }
+        finally { $sha.Dispose() }
+        $result.Report = $report.ToArray()
+        return $result
+    }
+
+    function Expand-MsuSystemFile {
+        # Extracts every copy of one file from a cumulative update (.msu, or the .cab inside
+        # it) together with the component folder it belongs to. The package signature must
+        # be a valid Microsoft signature; the cabinets nested inside a signed cabinet are
+        # covered by it. Extraction is cached under WorkDir for the rest of the run.
+        param(
+            [Parameter(Mandatory)][string]$PackagePath,
+            [Parameter(Mandatory)][string]$FileName,
+            [Parameter(Mandatory)][string]$WorkDir
+        )
+        $result = [pscustomobject]@{ Outcome = 'NotInPackage'; Detail = ''; Files = @() }
+        $expandExe = Join-Path $env:SystemRoot 'System32\expand.exe'
+
+        $sig = Test-MicrosoftPackageSignature -Path $PackagePath
+        if (-not $sig.Valid) {
+            $result.Outcome = 'SignatureInvalid'
+            $result.Detail = "$PackagePath is not validly signed by Microsoft (status $($sig.Status), signer '$($sig.Subject)')."
+            return $result
+        }
+
+        $key = ([System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($PackagePath.ToLowerInvariant())))).Replace('-', '').Substring(0, 12)
+        $pkgDir = Join-Path $WorkDir "pkg-$key"
+        $null = New-Item -ItemType Directory -Path $pkgDir -Force
+
+        $topCabs = @()
+        if ($PackagePath -match '\.msu$') {
+            $msuDir = Join-Path $pkgDir 'msu'
+            if (-not (Test-Path -LiteralPath (Join-Path $msuDir '.complete'))) {
+                Remove-Item -LiteralPath $msuDir -Recurse -Force -ErrorAction SilentlyContinue
+                $null = New-Item -ItemType Directory -Path $msuDir -Force
+                $null = & $expandExe -R "-F:*" $PackagePath $msuDir 2>&1
+                if ($LASTEXITCODE -ne 0) { $result.Outcome = 'ExpandFailed'; $result.Detail = "expand.exe could not unpack $PackagePath (exit $LASTEXITCODE)."; return $result }
+                $null = New-Item -ItemType File -Path (Join-Path $msuDir '.complete') -Force
+            }
+            $topCabs = @(Get-ChildItem -LiteralPath $msuDir -Filter '*.cab' -File | Where-Object { $_.Name -notmatch '^WSUSSCAN' } | Sort-Object Length -Descending)
+            foreach ($c in $topCabs) {
+                $cs = Test-MicrosoftPackageSignature -Path $c.FullName
+                if (-not $cs.Valid) {
+                    $result.Outcome = 'SignatureInvalid'
+                    $result.Detail = "$($c.Name) inside $([System.IO.Path]::GetFileName($PackagePath)) is not validly signed by Microsoft (status $($cs.Status))."
+                    return $result
+                }
+            }
+            $express = @(Get-ChildItem -LiteralPath $msuDir -File | Where-Object { $_.Extension -in @('.psf', '.wim') })
+            if ($topCabs.Count -eq 0) {
+                $result.Outcome = if ($express.Count -gt 0) { 'Unsupported' } else { 'NotInPackage' }
+                $result.Detail = if ($express.Count -gt 0) { "the package stores its payload in $(@($express | ForEach-Object Name) -join ', '), a format this script cannot unpack" } else { 'the package contains no cabinet' }
+                return $result
+            }
+        }
+        else {
+            $topCabs = @(Get-Item -LiteralPath $PackagePath)
+        }
+
+        # Cumulative updates nest cabinets several levels deep, and an inner cabinet can
+        # carry the same name as its parent (1809+: msu > KB.cab > KB.cab > Cab_N_for_KB.cab),
+        # so each cabinet's folders are keyed by a hash of its full path, not its name.
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $cabKey = { param([string]$p) ([System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($p.ToLowerInvariant())))).Replace('-', '').Substring(0, 12) }
+        $visited = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        $found = New-Object System.Collections.Generic.List[string]
+        $queue = New-Object System.Collections.Generic.Queue[object]
+        foreach ($c in $topCabs) { $queue.Enqueue([pscustomobject]@{ Path = $c.FullName; Depth = 0 }) }
+        while ($queue.Count -gt 0) {
+            $item = $queue.Dequeue()
+            if (-not $visited.Add($item.Path)) { continue }
+            $entries = @(Get-CabinetEntries -CabPath $item.Path)
+            $leafKey = & $cabKey $item.Path
+            if (@($entries | Where-Object { [System.IO.Path]::GetFileName($_) -ieq $FileName }).Count -gt 0) {
+                $dest = Join-Path $pkgDir ("f-$leafKey-" + ($FileName -replace '[^A-Za-z0-9_\-\.]', '_'))
+                if (-not (Test-Path -LiteralPath (Join-Path $dest '.complete'))) {
+                    Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue
+                    $null = New-Item -ItemType Directory -Path $dest -Force
+                    $null = & $expandExe -R "-F:$FileName" $item.Path $dest 2>&1
+                    $null = New-Item -ItemType File -Path (Join-Path $dest '.complete') -Force
+                }
+                Get-ChildItem -LiteralPath $dest -Recurse -File -Filter $FileName | ForEach-Object { $found.Add($_.FullName) }
+            }
+            $nested = @($entries | Where-Object { $_ -match '\.cab$' })
+            if ($nested.Count -gt 0 -and $item.Depth -lt 4) {
+                $nestedDir = Join-Path $pkgDir "n-$leafKey"
+                if (-not (Test-Path -LiteralPath (Join-Path $nestedDir '.complete'))) {
+                    Remove-Item -LiteralPath $nestedDir -Recurse -Force -ErrorAction SilentlyContinue
+                    $null = New-Item -ItemType Directory -Path $nestedDir -Force
+                    $null = & $expandExe -R "-F:*.cab" $item.Path $nestedDir 2>&1
+                    $null = New-Item -ItemType File -Path (Join-Path $nestedDir '.complete') -Force
+                }
+                Get-ChildItem -LiteralPath $nestedDir -Recurse -File -Filter '*.cab' | ForEach-Object {
+                    $queue.Enqueue([pscustomobject]@{ Path = $_.FullName; Depth = $item.Depth + 1 })
+                }
+            }
+        }
+
+        $files = foreach ($path in ($found | Select-Object -Unique)) {
+            $parent = Split-Path $path -Parent
+            $parentLeaf = Split-Path $parent -Leaf
+            $differential = $parentLeaf -in @('f', 'r', 'n')
+            $component = if ($differential) { Split-Path (Split-Path $parent -Parent) -Leaf } else { $parentLeaf }
+            $kind = if ($parentLeaf -eq 'f') { 'ForwardDelta' } elseif ($parentLeaf -eq 'r') { 'ReverseDelta' } elseif ($parentLeaf -eq 'n') { 'NullDelta' } else { 'Unknown' }
+            $filePath = $path
+            if ($kind -eq 'NullDelta') {
+                # A null differential is a delta against an empty file: it rebuilds the
+                # whole file without the damaged copy as its base.
+                $rebuilt = Join-Path (Join-Path (Join-Path $pkgDir ('nd-' + (& $cabKey $path))) $component) $FileName
+                if (-not (Test-Path -LiteralPath $rebuilt)) {
+                    try {
+                        $bytes = ConvertFrom-NullDifferential -Delta ([System.IO.File]::ReadAllBytes($path))
+                        $null = New-Item -ItemType Directory -Path (Split-Path $rebuilt -Parent) -Force
+                        [System.IO.File]::WriteAllBytes($rebuilt, $bytes)
+                    }
+                    catch { Write-Verbose "Null differential $path could not be applied: $($_.Exception.Message)"; $rebuilt = $null }
+                }
+                if ($rebuilt) { $filePath = $rebuilt }
+            }
+            $isFull = $false
+            try {
+                $fs = [System.IO.File]::OpenRead($filePath)
+                try { $isFull = ($fs.ReadByte() -eq 0x4D -and $fs.ReadByte() -eq 0x5A) } finally { $fs.Close() }
+            }
+            catch { $isFull = $false }
+            if ($kind -eq 'Unknown' -and $isFull) { $kind = 'Full' }
+            [pscustomobject]@{
+                Path       = $filePath
+                Component  = $component
+                Version    = Get-ComponentIdentityVersion -Name $component
+                IsFullFile = $isFull -and $kind -in @('Full', 'NullDelta')
+                Kind       = $kind
+            }
+        }
+        $sha.Dispose()
+        $result.Files = @($files)
+        if ($result.Files.Count -gt 0) { $result.Outcome = 'Found' }
+        return $result
+    }
+
+    function Select-MsuSystemFileCopy {
+        # The package copy that IS the installed component: same component folder name when
+        # it is known, else same version and architecture prefix. Differentials are never
+        # usable on their own - they need the damaged file as their base.
+        param([object[]]$Files, [string]$ExpectedComponent = '', [version]$ExpectedVersion, [string]$ArchitecturePrefix = '')
+        $all = @($Files | Where-Object { $_ })
+        $pool = @()
+        if ($ExpectedComponent) { $pool = @($all | Where-Object { $_.Component -ieq $ExpectedComponent }) }
+        if ($pool.Count -eq 0 -and $ExpectedVersion) {
+            $pool = @($all | Where-Object { $_.Version -eq $ExpectedVersion -and (-not $ArchitecturePrefix -or $_.Component -like "$ArchitecturePrefix*") })
+        }
+        $full = @($pool | Where-Object { $_.IsFullFile })
+        return [pscustomobject]@{
+            Selected    = ($full | Select-Object -First 1)
+            DeltaOnly   = ($full.Count -eq 0 -and $pool.Count -gt 0)
+            Matching    = $pool
+        }
+    }
+
+    function Get-HyperVPassthroughDiskNumbers {
+        $numbers = @()
+        if (Get-Command Get-VM -ErrorAction SilentlyContinue) {
+            try {
+                $numbers = @(Get-VM -ErrorAction Stop | Get-VMHardDiskDrive -ErrorAction SilentlyContinue |
+                    Where-Object { $null -ne $_.DiskNumber } | ForEach-Object { [int]$_.DiskNumber })
+            }
+            catch { $numbers = @() }
+        }
+        return $numbers
+    }
+
+    function Test-DonorDiskIdCollision {
+        # True when an offline disk would collide with an online one if brought online.
+        # Azure attaches data disks offline by SAN policy, so OfflineReason says 'Policy',
+        # not 'Collision', even when the disk shares its MBR signature or GPT GUID with the
+        # disk being repaired (both created from the same image). Onlining such a disk
+        # read-only fails ("The disk is read only") because Windows tries to write a new
+        # ID, and leaves the disk online with its partitions hidden.
+        param([Parameter(Mandatory)]$Disk, $OtherDisks)
+        if ("$($Disk.OfflineReason)" -match 'Collision') { return $true }
+        if ($null -eq $OtherDisks) { $OtherDisks = @(Get-Disk -ErrorAction SilentlyContinue) }
+        $online = @($OtherDisks | Where-Object { $_.Number -ne $Disk.Number -and -not $_.IsOffline })
+        switch ("$($Disk.PartitionStyle)") {
+            'MBR' {
+                if (-not $Disk.Signature) { return $false }
+                return (@($online | Where-Object { "$($_.PartitionStyle)" -eq 'MBR' -and [uint32]$_.Signature -eq [uint32]$Disk.Signature }).Count -gt 0)
+            }
+            'GPT' {
+                if (-not $Disk.Guid) { return $false }
+                return (@($online | Where-Object { "$($_.PartitionStyle)" -eq 'GPT' -and "$($_.Guid)" -eq "$($Disk.Guid)" }).Count -gt 0)
+            }
+        }
+        return $false
+    }
+
+    function Open-DonorDisk {
+        # Makes a donor disk's Windows volumes readable WITHOUT writing to it: an offline disk
+        # is marked read-only before it is brought online, and letters are only added where a
+        # volume has none. The one exception is a signature collision (two disks created from
+        # the same image), which needs a new disk ID before Windows will mount the disk (for
+        # GPT also new partition GUIDs, which Windows writes when the disk is brought online
+        # writable once); that
+        # is only done when the operator named the disk with -RepairSystemFileDonorDisk.
+        param([Parameter(Mandatory)][int]$DiskNumber, [switch]$AllowSignatureChange)
+        $state = [pscustomobject]@{
+            DiskNumber = $DiskNumber; WasOffline = $false; WasReadOnly = $false; MadeOnline = $false
+            AddedAccessPaths = @(); WindowsRoots = @(); Detail = ''; SignatureChanged = $false
+        }
+        $disk = Get-Disk -Number $DiskNumber -ErrorAction SilentlyContinue
+        if (-not $disk) { $state.Detail = 'disk not found'; return $state }
+        $state.WasOffline = [bool]$disk.IsOffline
+        $state.WasReadOnly = [bool]$disk.IsReadOnly
+
+        if ($disk.IsOffline) {
+            if (Test-DonorDiskIdCollision -Disk $disk) {
+                if (-not $AllowSignatureChange) {
+                    $state.Detail = 'offline because its disk ID collides with another disk (created from the same image); name it with -RepairSystemFileDonorDisk to let the script give it a new ID'
+                    return $state
+                }
+                try {
+                    if ("$($disk.PartitionStyle)" -eq 'GPT') { Set-Disk -Number $DiskNumber -Guid ([guid]::NewGuid().ToString('B')) -ErrorAction Stop }
+                    else { Set-Disk -Number $DiskNumber -Signature ([uint32](Get-Random -Minimum 0x10000000 -Maximum 0x7FFFFFFF)) -ErrorAction Stop }
+                    $state.SignatureChanged = $true
+                    if ("$($disk.PartitionStyle)" -eq 'GPT') {
+                        # Same-image GPT disks also share their partition GUIDs, which Set-Disk
+                        # cannot change; Windows only replaces them when it brings the disk
+                        # online writable. A read-only online fails ("The disk is read only")
+                        # and leaves the disk offline with a collision. So online it writable
+                        # once (a first attempt may only surface the collision), then make it
+                        # read-only and cycle it so the volumes remount read-only.
+                        for ($try = 1; $try -le 2; $try++) {
+                            try { Set-Disk -Number $DiskNumber -IsOffline $false -ErrorAction Stop } catch { if ($try -eq 2) { throw } }
+                            Start-Sleep -Seconds 2
+                            $now = Get-Disk -Number $DiskNumber -ErrorAction SilentlyContinue
+                            if ($now -and -not $now.IsOffline) { break }
+                            if ($try -eq 2) { throw "the disk stayed offline ($($now.OfflineReason))" }
+                        }
+                        Set-Disk -Number $DiskNumber -IsReadOnly $true -ErrorAction Stop
+                        Set-Disk -Number $DiskNumber -IsOffline $true -ErrorAction Stop
+                    }
+                }
+                catch { $state.Detail = "could not give the donor disk a new disk ID: $($_.Exception.Message)"; Close-DonorDisk -State $state; return $state }
+            }
+            try {
+                if (-not $disk.IsReadOnly) { Set-Disk -Number $DiskNumber -IsReadOnly $true -ErrorAction Stop }
+                Set-Disk -Number $DiskNumber -IsOffline $false -ErrorAction Stop
+                $state.MadeOnline = $true
+                Start-Sleep -Seconds 3
+            }
+            catch {
+                $state.Detail = "could not bring the disk online read-only: $($_.Exception.Message)"
+                Close-DonorDisk -State $state
+                return $state
+            }
+        }
+
+        foreach ($p in @(Get-Partition -DiskNumber $DiskNumber -ErrorAction SilentlyContinue | Where-Object { $_.Type -in @('Basic', 'IFS') })) {
+            $root = @($p.AccessPaths | Where-Object { $_ -match '^[A-Za-z]:\\$' }) | Select-Object -First 1
+            if (-not $root) {
+                try {
+                    Add-PartitionAccessPath -DiskNumber $DiskNumber -PartitionNumber $p.PartitionNumber -AssignDriveLetter -ErrorAction Stop
+                    $p2 = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $p.PartitionNumber -ErrorAction SilentlyContinue
+                    $root = @($p2.AccessPaths | Where-Object { $_ -match '^[A-Za-z]:\\$' }) | Select-Object -First 1
+                    if ($root) { $state.AddedAccessPaths += [pscustomobject]@{ PartitionNumber = $p.PartitionNumber; AccessPath = $root } }
+                }
+                catch { Write-Verbose "No drive letter for disk $DiskNumber partition $($p.PartitionNumber): $($_.Exception.Message)" }
+            }
+            if ($root -and (Test-Path -LiteralPath (Join-Path $root 'Windows\System32\config\SOFTWARE'))) {
+                $state.WindowsRoots += (Join-Path $root 'Windows')
+            }
+        }
+        if ($state.WindowsRoots.Count -eq 0 -and -not $state.Detail) { $state.Detail = 'no Windows installation found on the disk' }
+        return $state
+    }
+
+    function Close-DonorDisk {
+        # Puts a donor disk back the way Open-DonorDisk found it (a new disk ID stays).
+        param([Parameter(Mandatory)]$State)
+        foreach ($ap in @($State.AddedAccessPaths)) {
+            try { Remove-PartitionAccessPath -DiskNumber $State.DiskNumber -PartitionNumber $ap.PartitionNumber -AccessPath $ap.AccessPath -ErrorAction Stop }
+            catch { Write-Verbose "Could not remove $($ap.AccessPath): $($_.Exception.Message)" }
+        }
+        if ($State.MadeOnline -or $State.WasOffline) {
+            # Re-read the disk rather than trust MadeOnline: a failed Set-Disk -IsOffline
+            # can still leave the disk online.
+            $now = Get-Disk -Number $State.DiskNumber -ErrorAction SilentlyContinue
+            if ($State.MadeOnline -or ($now -and -not $now.IsOffline)) {
+                try { Set-Disk -Number $State.DiskNumber -IsOffline $true -ErrorAction Stop }
+                catch { Write-Warning "  Could not take donor disk $($State.DiskNumber) offline again: $($_.Exception.Message)" }
+            }
+        }
+        if ($State.WasOffline -and -not $State.WasReadOnly) {
+            try { Set-Disk -Number $State.DiskNumber -IsReadOnly $false -ErrorAction Stop }
+            catch { Write-Verbose "Could not clear the read-only flag on disk $($State.DiskNumber): $($_.Exception.Message)" }
+        }
+    }
+
+    function Find-SystemFileDonorCopies {
+        # Looks for an exact-version copy of a system file on other Windows installations
+        # this VM can see: attached donor disks and the rescue VM's own Windows. When none
+        # has it and the guest keeps the file as a forward differential (1809+), the exact
+        # version is rebuilt from any intact copy of the same component and build instead.
+        # Matching copies are staged under StageDir, then every disk is put back as it was
+        # found.
+        param(
+            [Parameter(Mandatory)][string]$FileName,
+            [Parameter(Mandatory)][string]$RelativePath,
+            [string]$ComponentName = '',
+            [Parameter(Mandatory)][version]$ExpectedVersion,
+            [Parameter(Mandatory)][string]$StageDir,
+            [int]$DonorDisk = -1,
+            [int]$TargetDiskNumber = -1,
+            [switch]$IncludeRescueHost,
+            [string]$RescueHostRoot = $env:SystemRoot,
+            [string[]]$ForwardDeltaPath = @()
+        )
+        $report = New-Object System.Collections.Generic.List[string]
+        $copies = New-Object System.Collections.Generic.List[object]
+        $rebuilt = New-Object System.Collections.Generic.List[object]
+
+        $inspectRoot = {
+            param([string]$Root, [string]$Label)
+            $paths = @()
+            if ($ComponentName) { $paths += (Join-Path $Root "WinSxS\$ComponentName\$FileName") }
+            $paths += (Join-Path $Root $RelativePath)
+            $seen = @()
+            foreach ($p in $paths) {
+                $item = Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+                if (-not $item -or $item.PSIsContainer -or $item.Length -eq 0) { continue }
+                $v = Get-SystemFileNumericVersion -Path $p
+                if ($v -ne $ExpectedVersion) { $report.Add("${Label}: $p is version $v"); continue }
+                $hash = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash
+                if ($seen -contains $hash) { continue }
+                $seen += $hash
+                $dir = Join-Path $StageDir ("donor-" + $copies.Count)
+                $null = New-Item -ItemType Directory -Path $dir -Force
+                $staged = Join-Path $dir $FileName
+                Copy-Item -LiteralPath $p -Destination $staged -Force
+                if ((Get-FileHash -LiteralPath $staged -Algorithm SHA256).Hash -ne $hash) { $report.Add("${Label}: copy of $p did not verify"); continue }
+                $report.Add("${Label}: $p is version $v - staged")
+                $copies.Add([pscustomobject]@{ Path = $staged; OriginalPath = $p; Label = $Label; Sha256 = $hash; Rebuilt = $false })
+            }
+            # One rebuilt copy is enough, and none is needed once an exact copy exists.
+            if ($ForwardDeltaPath.Count -gt 0 -and $ComponentName -and $copies.Count -eq 0 -and $rebuilt.Count -eq 0) {
+                $out = Join-Path (Join-Path $StageDir ("rebuilt-" + $rebuilt.Count)) $FileName
+                $rb = New-SystemFileFromForwardDelta -ForwardDeltaPath $ForwardDeltaPath -Root $Root -ComponentName $ComponentName `
+                    -FileName $FileName -ExpectedVersion $ExpectedVersion -OutputPath $out
+                foreach ($line in @($rb.Report)) { $report.Add("${Label}: $line") }
+                if ($rb.Path) {
+                    $rebuilt.Add([pscustomobject]@{
+                            Path = $rb.Path; OriginalPath = "$Root\WinSxS\$($rb.BaseComponent) + forward differential"
+                            Label = "$Label (rebuilt)"; Sha256 = (Get-FileHash -LiteralPath $rb.Path -Algorithm SHA256).Hash; Rebuilt = $true
+                        })
+                }
+            }
+        }
+
+        $disks = @()
+        if ($DonorDisk -ge 0) {
+            if ($DonorDisk -eq $TargetDiskNumber) { $report.Add("disk ${DonorDisk}: that is the disk being repaired") }
+            else { $disks = @(Get-Disk -Number $DonorDisk -ErrorAction SilentlyContinue) }
+            if ($disks.Count -eq 0 -and $DonorDisk -ne $TargetDiskNumber) { $report.Add("disk ${DonorDisk}: not found") }
+        }
+        else {
+            $busy = @(Get-HyperVPassthroughDiskNumbers)
+            $disks = @(Get-Disk -ErrorAction SilentlyContinue | Where-Object {
+                    $_.Number -ne $TargetDiskNumber -and -not $_.IsBoot -and -not $_.IsSystem -and $busy -notcontains [int]$_.Number
+                })
+        }
+        $unreadable = New-Object System.Collections.Generic.List[int]
+        foreach ($d in $disks) {
+            $opened = Open-DonorDisk -DiskNumber $d.Number -AllowSignatureChange:($DonorDisk -ge 0)
+            try {
+                if ($opened.SignatureChanged) { $report.Add("disk $($d.Number): given a new disk ID (it collided with another disk)") }
+                if ($opened.WindowsRoots.Count -eq 0) {
+                    $report.Add("disk $($d.Number): $($opened.Detail)")
+                    if ($opened.Detail -ne 'no Windows installation found on the disk') { $unreadable.Add([int]$d.Number) }
+                    continue
+                }
+                foreach ($root in $opened.WindowsRoots) { & $inspectRoot $root "disk $($d.Number)" }
+            }
+            finally { Close-DonorDisk -State $opened }
+        }
+        if ($IncludeRescueHost -and $RescueHostRoot) { & $inspectRoot $RescueHostRoot 'rescue VM' }
+        $all = @($copies.ToArray()) + @($rebuilt.ToArray())
+        return [pscustomobject]@{ Copies = $all; Report = $report.ToArray(); Unreadable = $unreadable.ToArray() }
+    }
+
+    function Test-InteractiveSession {
+        try {
+            if (-not [Environment]::UserInteractive) { return $false }
+            if ([Console]::IsInputRedirected) { return $false }
+        }
+        catch { return $false }
+        foreach ($arg in [Environment]::GetCommandLineArgs()) { if ($arg -match '^-NonI') { return $false } }
+        return $true
+    }
+
+    function Confirm-SystemFileVersionChange {
+        # A version change needs the operator's explicit consent: an interactive Yes, or
+        # -AllowSystemFileDowngrade for unattended runs. -Force alone never gives it.
+        param([string]$FileName, [string]$From, [string]$To, [string]$Relation, [switch]$Allowed, [string]$RepairArgument)
+        $word = if ($Relation -eq 'Older') { 'downgrade' } else { 'version change' }
+        if ($Allowed) {
+            Write-Host "  -AllowSystemFileDowngrade: the $word of $FileName from $From to $To is approved." -ForegroundColor Yellow
+            return $true
+        }
+        if (-not (Test-InteractiveSession)) {
+            Write-Error "  '$FileName' was not repaired: the only compatible copy is $To, not the installed $From, and a $word needs explicit consent (-Force does not give it)."
+            Write-Warning "  To accept it, re-run with: -RepairSystemFile $RepairArgument -AllowSystemFileDowngrade"
+            return $false
+        }
+        Write-Host ""
+        Write-Host "  CONSENT NEEDED: $($word.ToUpperInvariant()) of $FileName" -ForegroundColor Yellow
+        Write-Host "    Installed version : $From" -ForegroundColor DarkGray
+        Write-Host "    Replacement       : $To (same build, static linkage checks passed)" -ForegroundColor DarkGray
+        Write-Host "    The original is kept as a .replaced.bak and can be restored." -ForegroundColor DarkGray
+        $answer = Read-Host "  Install $To in place of $From? [Y] Yes  [N] No (default: No)"
+        if ($answer -notmatch '^(y|yes)$') {
+            Write-Host "  Declined. $FileName was left unchanged." -ForegroundColor DarkGray
+            return $false
+        }
+        return $true
+    }
+
+    function Get-SystemFileExternalCandidate {
+        # Tries the outside sources in order - the guest's cumulative update (supplied with
+        # -RepairSystemFileMsu, or downloaded when the Update Catalog is reachable), then
+        # donor disks already attached and the rescue VM's own Windows - and returns one
+        # exact-version, trusted, architecture-matching candidate shaped like an on-disk
+        # candidate, or $null after printing how to obtain one. A disk named with
+        # -RepairSystemFileDonorDisk is tried before the update. When the guest keeps a
+        # forward differential for the file (1809+), its own older component versions are
+        # tried first, and donors of the same build at any update level qualify.
+        param(
+            [Parameter(Mandatory)][string]$FileName,
+            [Parameter(Mandatory)][string]$TargetPath,
+            [Parameter(Mandatory)][string]$WinRoot,
+            [Parameter(Mandatory)][version]$ExpectedVersion,
+            [string]$ExpectedComponent = '',
+            [Parameter(Mandatory)][string]$GuestArchitecture,
+            [int]$DonorDisk = -1,
+            [string[]]$MsuPath = @(),
+            [switch]$SkipMsuDownload
+        )
+        $run = $script:RepairSystemFileRun
+        $relativePath = $TargetPath.Substring($WinRoot.TrimEnd('\').Length).TrimStart('\')
+        $archPrefix = if ($ExpectedComponent -match '^([a-z0-9]+)_') { $Matches[1] + '_' } else {
+            switch ($GuestArchitecture) { 'AMD64' { 'amd64_' } 'ARM64' { 'arm64_' } 'x86' { if ($relativePath -match '^SysWOW64\\') { 'wow64_' } else { 'x86_' } } default { '' } }
+        }
+
+        $accept = {
+            param([string]$Path, [string]$Source, [string]$Origin)
+            $pe = Get-PortableExecutableInfo -FilePath $Path
+            if ($pe.IsPortableExecutable -and $pe.Architecture -ne 'Unknown' -and
+                -not (Test-PortableExecutableArchitectureCompatible -ExpectedArchitecture $GuestArchitecture -ActualArchitecture $pe.Architecture)) {
+                Write-Warning "    $Origin is $($pe.Architecture), not $GuestArchitecture - rejected."
+                return $null
+            }
+            $v = Get-SystemFileNumericVersion -Path $Path
+            if ($v -ne $ExpectedVersion) { Write-Warning "    $Origin is version $v, not $ExpectedVersion - rejected."; return $null }
+            $sig = Test-MicrosoftSignature -FilePath $Path
+            if ($sig.IsHardFailure) { Write-Warning "    $Origin fails image trust against the guest catalogs [$($sig.TrustState)] - rejected."; return $null }
+            # A rebuilt file has no provenance of its own: only a signature that covers its
+            # image hash (embedded, or a catalog of the guest) proves it is the real file.
+            if ($Source -eq 'Rebuilt' -and $sig.TrustState -ne 'ValidMicrosoft') { Write-Warning "    $Origin could not be verified against a Microsoft signature [$($sig.TrustState)] - rejected."; return $null }
+            $item = Get-Item -LiteralPath $Path -Force
+            $rank = switch ($sig.TrustState) { 'ValidMicrosoft' { 0 } 'CatalogUnverified' { 1 } 'NotVerifiable' { 2 } 'ValidOtherPublisher' { 3 } default { 9 } }
+            Write-Host "    [OK] $Origin : version $v, $($pe.Architecture), trust $($sig.TrustState)." -ForegroundColor Green
+            return [pscustomobject]@{
+                Path = $Path; Size = $item.Length; Version = $item.VersionInfo.FileVersion; ProductVer = $item.VersionInfo.ProductVersion
+                Company = $item.VersionInfo.CompanyName; LastWrite = $item.LastWriteTime; Source = $Source; Origin = $Origin
+                IsPortableExecutable = $pe.IsPortableExecutable; Architecture = $pe.Architecture; Machine = $pe.Machine
+                TrustState = $sig.TrustState; TrustBad = $false; TrustRank = [int]$rank
+                ComparableVersion = $v; VersionRelation = 'Same'
+            }
+        }
+
+        # The guest's forward differential for the installed component (1809+): RTM ->
+        # this version. It lets any intact copy of the same component and build stand in
+        # for an exact-version copy (see New-SystemFileFromForwardDelta).
+        $forward = New-Object System.Collections.Generic.List[string]
+        if ($ExpectedComponent) {
+            $guestForward = Join-Path $WinRoot "WinSxS\$ExpectedComponent\f\$FileName"
+            $gf = Get-Item -LiteralPath $guestForward -Force -ErrorAction SilentlyContinue
+            if ($gf -and -not $gf.PSIsContainer -and $gf.Length -gt 0) { $forward.Add($gf.FullName) }
+        }
+
+        # Donor disks and the rescue VM's own Windows. Normally tried after the cumulative
+        # update, because the update can be fetched without the operator creating
+        # anything. A disk named with -RepairSystemFileDonorDisk goes first: the operator
+        # has already created it, and it saves a multi-GB download.
+        $tryDonors = {
+            Write-Host ""
+            Write-Host "  Looking for $FileName $ExpectedVersion on attached donor disks and the rescue VM..." -ForegroundColor Yellow
+            if ($forward.Count -gt 0) { Write-Host "    (or any copy of build $($ExpectedVersion.Build) to apply the forward differential to)" -ForegroundColor DarkGray }
+            $donor = Find-SystemFileDonorCopies -FileName $FileName -RelativePath $relativePath -ComponentName $ExpectedComponent `
+                -ExpectedVersion $ExpectedVersion -StageDir (Join-Path $run.StageDir 'donor') -DonorDisk $DonorDisk `
+                -TargetDiskNumber $script:DiskNumber -IncludeRescueHost:($DonorDisk -lt 0) -ForwardDeltaPath $forward.ToArray()
+            foreach ($line in $donor.Report) { Write-Host "    $line" -ForegroundColor DarkGray }
+            foreach ($copy in $donor.Copies) {
+                $c = & $accept $copy.Path $(if ($copy.Rebuilt) { 'Rebuilt' } else { 'DonorDisk' }) "$($copy.Label) $($copy.OriginalPath)"
+                if ($c) { return $c }
+            }
+            if ($DonorDisk -ge 0 -and $donor.Copies.Count -eq 0) {
+                if (@($donor.Unreadable) -contains $DonorDisk) { Write-Warning "  Donor disk $DonorDisk could not be read (see above)." }
+                else { Write-Warning "  Donor disk $DonorDisk holds no copy of $FileName $ExpectedVersion." }
+            }
+            return $null
+        }
+
+        # -- 0. Other versions in the guest's own component store ------------------
+        # Superseded versions that component cleanup has not removed yet still hold the
+        # build's original file (full + r\). Nothing has to be downloaded or attached.
+        if ($forward.Count -gt 0) {
+            Write-Host ""
+            Write-Host "  The guest keeps $FileName $ExpectedVersion as a forward differential; looking in its component store for the build's original file..." -ForegroundColor Yellow
+            $rb = New-SystemFileFromForwardDelta -ForwardDeltaPath $forward.ToArray() -Root $WinRoot -ComponentName $ExpectedComponent `
+                -FileName $FileName -ExpectedVersion $ExpectedVersion -OutputPath (Join-Path (Join-Path $run.StageDir 'guest-rebuilt') $FileName)
+            foreach ($line in @($rb.Report)) { Write-Host "    guest: $line" -ForegroundColor DarkGray }
+            if ($rb.Path) {
+                $cand = & $accept $rb.Path 'Rebuilt' "guest $WinRoot\WinSxS\$($rb.BaseComponent) + forward differential"
+                if ($cand) { return $cand }
+            }
+        }
+
+        # -- a. An explicitly named donor disk --------------------------------------
+        if ($DonorDisk -ge 0) {
+            $cand = & $tryDonors
+            if ($cand) { return $cand }
+        }
+
+        # -- b. The guest's cumulative update (supplied, or downloaded) -------------
+        Write-Host ""
+        Write-Host "  Looking for $FileName $ExpectedVersion in the guest's cumulative update..." -ForegroundColor Yellow
+        $msuUnusable = $false
+        if ($null -eq $run.Identity) { $run.Identity = Get-GuestOsIdentity }
+        $identity = $run.Identity
+        if ($null -eq $run.Lcu) { $run.Lcu = Select-GuestRollupPackage -Packages @(Get-GuestRollupPackages -WinRoot $WinRoot) -Ubr $identity.Ubr }
+        $lcu = $run.Lcu
+        $archLabel = Get-UpdateCatalogArchitectureLabel -Architecture $(if ($lcu -and $lcu.Architecture) { $lcu.Architecture } else { $GuestArchitecture })
+        $productPattern = Get-UpdateCatalogProductPattern -Build $identity.Build -InstallationType $identity.InstallationType
+
+        $packages = New-Object System.Collections.Generic.List[string]
+        foreach ($p in @($MsuPath | Where-Object { $_ })) {
+            if (Test-Path -LiteralPath $p -PathType Leaf) { $packages.Add((Resolve-Path -LiteralPath $p).ProviderPath) }
+            elseif (Test-Path -LiteralPath $p -PathType Container) {
+                Get-ChildItem -LiteralPath $p -File | Where-Object { $_.Extension -in @('.msu', '.cab') } | ForEach-Object { $packages.Add($_.FullName) }
+            }
+            else { Write-Warning "  -RepairSystemFileMsu path not found: $p" }
+        }
+        if ($lcu) { Write-Host "  Installed cumulative update: $($lcu.Kb) ($($lcu.Name))" -ForegroundColor DarkGray }
+
+        if ($packages.Count -eq 0 -and $lcu -and -not $SkipMsuDownload) {
+            if ($run.DownloadedMsu.ContainsKey($lcu.Kb)) { $packages.Add($run.DownloadedMsu[$lcu.Kb]) }
+            elseif ($run.CatalogFailure.ContainsKey($lcu.Kb)) { Write-Host "  $($run.CatalogFailure[$lcu.Kb])" -ForegroundColor DarkGray }
+            else {
+                Write-Host "  Checking access to the Microsoft Update Catalog..." -ForegroundColor Yellow
+                if ($null -eq $run.Connectivity) { $run.Connectivity = Test-UpdateCatalogConnectivity }
+                if (-not $run.Connectivity.Reachable) {
+                    Write-Warning "  The Microsoft Update Catalog is not reachable from this VM, so $($lcu.Kb) cannot be downloaded here:"
+                    foreach ($f in $run.Connectivity.Failures) { Write-Warning "    $f" }
+                    $run.CatalogFailure[$lcu.Kb] = 'Catalog unreachable (see above).'
+                }
+                else {
+                    try {
+                        $html = Invoke-CatalogHttpRequest -Uri ('https://www.catalog.update.microsoft.com/Search.aspx?q=' + [uri]::EscapeDataString($lcu.Kb))
+                        $row = (Select-UpdateCatalogRow -Html $html -Kb $lcu.Kb -ProductPattern $productPattern -ArchitectureLabel $archLabel).Selected
+                        if (-not $row) { throw "no catalog entry for $($lcu.Kb) matches this product and $archLabel" }
+                        Write-Host "  Catalog entry: $($row.Title)" -ForegroundColor DarkGray
+                        $url = @(Get-UpdateCatalogDownloadUrls -UpdateId $row.UpdateId | Where-Object { $_ -match '\.msu$' -or $_ -match '\.cab$' }) | Select-Object -First 1
+                        if (-not $url) { throw 'the catalog returned no package URL' }
+                        if (-not (Test-MicrosoftDownloadUrl -Url $url)) { throw "refusing a download from a non-Microsoft host: $url" }
+                        $size = Get-RemoteContentLength -Url $url
+                        $need = if ($size -gt 0) { [int64]($size * 3.5) } else { [int64]6GB }
+                        $scratch = Get-SystemFileScratchRoot -RequiredBytes $need -ExcludeDiskNumbers @($script:DiskNumber)
+                        if (-not $scratch -or -not $scratch.Sufficient) {
+                            throw ("not enough free space to download and unpack the update (needs about {0:N1} GB; best volume {1} has {2:N1} GB)" -f ($need / 1GB), $(if ($scratch) { $scratch.Root } else { 'none' }), $(if ($scratch) { $scratch.Free / 1GB } else { 0 }))
+                        }
+                        if (-not $run.WorkDir) {
+                            $run.WorkDir = Join-Path $scratch.Root ('RepairAzVMDisk-rsf-' + (Get-Date -Format 'yyyyMMddHHmmss'))
+                            $null = New-Item -ItemType Directory -Path $run.WorkDir -Force
+                        }
+                        $dest = Join-Path $run.WorkDir ([System.IO.Path]::GetFileName(([uri]$url).AbsolutePath))
+                        Write-Host ("  Downloading {0} ({1}) to {2}..." -f $lcu.Kb, $(if ($size -gt 0) { '{0:N0} MB' -f ($size / 1MB) } else { 'size unknown' }), $dest) -ForegroundColor Yellow
+                        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                        $wc = New-Object System.Net.WebClient
+                        try { $wc.Proxy = Get-CatalogWebProxy; $wc.DownloadFile($url, $dest) } finally { $wc.Dispose() }
+                        Write-Host ("    downloaded in {0:N0}s" -f $sw.Elapsed.TotalSeconds) -ForegroundColor DarkGray
+                        $run.DownloadedMsu[$lcu.Kb] = $dest
+                        $packages.Add($dest)
+                    }
+                    catch {
+                        Write-Warning "  Could not download $($lcu.Kb): $(Get-InnermostExceptionMessage $_.Exception)"
+                        $run.CatalogFailure[$lcu.Kb] = "Download of $($lcu.Kb) already failed in this run."
+                    }
+                }
+            }
+        }
+
+        foreach ($pkg in $packages) {
+            if (-not $run.WorkDir) {
+                $pkgSize = (Get-Item -LiteralPath $pkg).Length
+                $scratch = Get-SystemFileScratchRoot -RequiredBytes ([int64]($pkgSize * 2.5)) -ExcludeDiskNumbers @($script:DiskNumber)
+                if (-not $scratch -or -not $scratch.Sufficient) { Write-Warning "  Not enough free space to unpack $pkg."; continue }
+                $run.WorkDir = Join-Path $scratch.Root ('RepairAzVMDisk-rsf-' + (Get-Date -Format 'yyyyMMddHHmmss'))
+                $null = New-Item -ItemType Directory -Path $run.WorkDir -Force
+            }
+            Write-Host "  Unpacking $FileName from $([System.IO.Path]::GetFileName($pkg))..." -ForegroundColor Yellow
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $x = Expand-MsuSystemFile -PackagePath $pkg -FileName $FileName -WorkDir $run.WorkDir
+            Write-Host ("    {0} in {1:N0}s: {2} cop(ies) of {3}" -f $x.Outcome, $sw.Elapsed.TotalSeconds, @($x.Files).Count, $FileName) -ForegroundColor DarkGray
+            if ($x.Outcome -ne 'Found') {
+                if ($x.Outcome -eq 'Unsupported') { $msuUnusable = $true }
+                if ($x.Detail) { Write-Warning "    $($x.Detail)" }
+                continue
+            }
+            $pick = Select-MsuSystemFileCopy -Files $x.Files -ExpectedComponent $ExpectedComponent -ExpectedVersion $ExpectedVersion -ArchitecturePrefix $archPrefix
+            if ($pick.Selected) {
+                $cand = & $accept $pick.Selected.Path 'MSU' "$([System.IO.Path]::GetFileName($pkg)) $($pick.Selected.Component)"
+                if ($cand) { return $cand }
+            }
+            elseif ($pick.DeltaOnly) {
+                $msuUnusable = $true
+                $pkgForward = @($pick.Matching | Where-Object { $_.Kind -eq 'ForwardDelta' } | ForEach-Object Path)
+                foreach ($p in $pkgForward) { if (-not $forward.Contains($p)) { $forward.Add($p) } }
+                if ($forward.Count -gt 0) {
+                    Write-Warning "    The package carries $FileName $ExpectedVersion only as a differential ($(@($pick.Matching | ForEach-Object Kind | Select-Object -Unique) -join ', ')). A forward differential rebuilds it from the build's original file, which any intact Windows of build $($ExpectedVersion.Build) has - trying donor disks and the rescue VM next."
+                }
+                else {
+                    Write-Warning "    The package carries $FileName $ExpectedVersion only as a differential ($(@($pick.Matching | ForEach-Object Kind | Select-Object -Unique) -join ', ')). A differential is applied to the file already on the disk, which is the damaged one, so it cannot rebuild it. Use a donor disk instead."
+                }
+            }
+            else {
+                Write-Warning "    The package has no copy of $FileName $ExpectedVersion$(if ($ExpectedComponent) { " ($ExpectedComponent)" }). Versions in it: $(@($x.Files | ForEach-Object { $_.Version } | Where-Object { $_ } | Select-Object -Unique) -join ', ')"
+            }
+        }
+        if ($packages.Count -eq 0) { Write-Host "    No cumulative update package was available to search." -ForegroundColor DarkGray }
+
+        # -- c. Donor disks already attached, and the rescue VM's own Windows ------
+        if ($DonorDisk -lt 0) {
+            $cand = & $tryDonors
+            if ($cand) { return $cand }
+        }
+
+        # -- d. Nothing reachable: say exactly how to get the file -----------------
+        if (-not $run.HintsPrinted) {
+            $run.HintsPrinted = $true
+            $images = @(Get-MarketplaceImageCandidates -Build $identity.Build -EditionID $identity.EditionID -InstallationType $identity.InstallationType)
+            Write-Host ""
+            Write-Host "  An exact copy of $FileName $ExpectedVersion can still be obtained outside this VM:" -ForegroundColor Yellow
+            $letter = 'A'
+            if ($lcu -and -not $msuUnusable) {
+                Write-Host "  $letter) The cumulative update $($lcu.Kb), downloaded on any machine with internet access, then re-run with -RepairSystemFileMsu <path-to-.msu>:" -ForegroundColor Cyan
+                Write-Host "       https://www.catalog.update.microsoft.com/Search.aspx?q=$($lcu.Kb)" -ForegroundColor White
+                $productLabel = if ($productPattern) { $productPattern -replace '\\', '' -replace '\(\?[^)]*\)', '' -replace ',\?', '' } else { 'this product' }
+                Write-Host "       Pick the entry for $productLabel for $archLabel-based Systems." -ForegroundColor DarkGray
+                $letter = 'B'
+            }
+            elseif ($msuUnusable) {
+                Write-Host "  The cumulative update $($lcu.Kb) cannot rebuild $FileName (see above), so a donor disk is the way to get it." -ForegroundColor DarkGray
+            }
+            else {
+                Write-Host "  No installed cumulative update was found in \Windows\servicing\Packages, so no MSU can be named." -ForegroundColor DarkGray
+            }
+            # With a forward differential any update level of the same build will do, so
+            # the donor can come from the newest image Azure still publishes.
+            $donorUbr = if ($forward.Count -gt 0) { '' } else { $identity.Ubr }
+            if ($images.Count -gt 0) {
+                $meta = Get-AzureInstanceMetadata
+                $diskName = Get-DonorDiskName -VmName $(if ($meta) { $meta.VmName } else { '' }) -Build $identity.Build -Ubr $donorUbr
+                if ($forward.Count -gt 0) {
+                    Write-Host "  $letter) A donor disk from any Marketplace image of build $($identity.Build) (the newest is fine: the guest's forward differential rebuilds $ExpectedVersion from it) - run from Cloud Shell or any az CLI:" -ForegroundColor Cyan
+                }
+                else {
+                    Write-Host "  $letter) A donor disk from the Marketplace image of build $($identity.Build).$($identity.Ubr) - run from Cloud Shell or any az CLI:" -ForegroundColor Cyan
+                }
+                foreach ($line in (Format-DonorDiskCommands -Images $images -Metadata $meta -Build $identity.Build -Ubr $donorUbr -DiskName $diskName)) {
+                    Write-Host "       $line" -ForegroundColor $(if ($line.StartsWith('#')) { 'DarkGray' } else { 'White' })
+                }
+            }
+            elseif ($forward.Count -gt 0) {
+                Write-Host "  $letter) A donor disk: no Marketplace image is known for build $($identity.Build) ($($identity.EditionID), $($identity.InstallationType)). Any VM disk of build $($identity.Build), at any update level, attached to this VM works." -ForegroundColor Cyan
+            }
+            else {
+                Write-Host "  $letter) A donor disk: no Marketplace image is known for build $($identity.Build) ($($identity.EditionID), $($identity.InstallationType)). Any VM disk of build $($identity.Build).$($identity.Ubr) attached to this VM works." -ForegroundColor Cyan
+            }
+        }
+        return $null
+    }
+
     function RepairBrokenSystemFile {
         param(
             [Parameter(Mandatory = $true)]
             [string[]]$FileNames,
             [string]$SourcePath = '',
-            [switch]$SkipOfflineSfc
+            [switch]$SkipOfflineSfc,
+            [int]$DonorDisk = -1,
+            [string[]]$MsuPath = @(),
+            [switch]$SkipMsuDownload,
+            [switch]$AllowDowngrade
+        )
+        # Per-run state for outside sources: staged donor copies, downloaded and unpacked
+        # updates. All of it is scratch and is removed however the repair ends.
+        $script:RepairSystemFileRun = @{
+            StageDir       = Join-Path ([System.IO.Path]::GetTempPath()) ('RepairAzVMDisk-rsf-stage-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            WorkDir        = $null
+            Identity       = $null
+            Lcu            = $null
+            Connectivity   = $null
+            DownloadedMsu  = @{}
+            CatalogFailure = @{}
+            HintsPrinted   = $false
+        }
+        $script:CabinetListingCache = @{}
+        try {
+            Invoke-RepairBrokenSystemFileCore @PSBoundParameters
+        }
+        finally {
+            $run = $script:RepairSystemFileRun
+            foreach ($dir in @($run.StageDir, $run.WorkDir)) {
+                if ($dir -and (Test-Path -LiteralPath $dir)) {
+                    Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+                    if (Test-Path -LiteralPath $dir) { Write-Warning "Scratch folder could not be fully removed: $dir" }
+                }
+            }
+            $script:RepairSystemFileRun = $null
+            $script:CabinetListingCache = @{}
+        }
+    }
+
+    function Invoke-RepairBrokenSystemFileCore {
+        param(
+            [Parameter(Mandatory = $true)]
+            [string[]]$FileNames,
+            [string]$SourcePath = '',
+            [switch]$SkipOfflineSfc,
+            [int]$DonorDisk = -1,
+            [string[]]$MsuPath = @(),
+            [switch]$SkipMsuDownload,
+            [switch]$AllowDowngrade
         )
         # Repairs a missing, 0-byte, wrong-architecture or untrusted Windows system binary
         # on the offline disk.
@@ -19869,8 +21264,21 @@ namespace RepairAzVMDisk
         #      \WinSxS\Backup store and the differential payloads that sit beside each
         #      component, and verifies what it writes against the image's own catalogs.
         #      Neither of those reconstructions can be done from this script.
-        #   4. Last resort: a same-build candidate of another revision (normally a
-        #      superseded component), only if its static imports and exports are
+        #   4. Outside sources (Get-SystemFileExternalCandidate): on 1809+ guests, older
+        #      versions in the guest's own component store (see below); the guest's
+        #      cumulative update (-RepairSystemFileMsu, or downloaded from the Update
+        #      Catalog when it is reachable), then an exact-version copy on an attached
+        #      donor disk or the rescue VM's own Windows. A disk named with
+        #      -RepairSystemFileDonorDisk goes first. On 1809+ the component store keeps
+        #      the installed version as a forward differential from the build's original
+        #      file (f\), so a donor of the same build at any update level is enough: its
+        #      copy is taken back to the original (r\) and the guest's f\ is applied to
+        #      it, and msdelta refuses any base that is not the exact original. When none
+        #      is available, the KB to download and the az commands that create a donor
+        #      disk are printed.
+        #   5. Last resort, with consent only (interactive Yes or -AllowSystemFileDowngrade;
+        #      -Force is not enough): a same-build candidate of another revision (normally
+        #      a superseded component), only if its static imports and exports are
         #      compatible with the installed modules in both directions
         #      (Test-SystemFileDowngradeCompatibility). Otherwise the repair is refused.
         #
@@ -20046,6 +21454,14 @@ apply a protected Windows system-file ACL/owner baseline.
 
             $targetIsUnderWindows = $targetPath.StartsWith($winRoot, [System.StringComparison]::OrdinalIgnoreCase)
 
+            # Per-file state: SFC and the outside sources are each tried at most once,
+            # whichever path through the search reaches them first.
+            $rsfState = @{ SfcOutcome = $null; ExternalTried = $false; External = $null }
+            $expectedVersion = $null
+            $expectedVersionSource = $null
+            $expectedComponent = ''
+            $hardLinkedCandidates = @()
+
             $invokeSfcFallback = {
                 # -Tentative: SFC is being tried BEFORE a version-changing candidate, so a
                 # failure is not the end of the road and must not print the give-up advice.
@@ -20072,11 +21488,23 @@ apply a protected Windows system-file ACL/owner baseline.
                     & $giveUp 'no replacement was installed, and Windows Resource Protection only covers files under \Windows so it cannot repair this target'
                     return $false
                 }
+                if ($rsfState.SfcOutcome) {
+                    # SFC already ran for this file; a second run cannot give a different answer.
+                    if ($Tentative) { return $false }
+                    if ($rsfState.SfcOutcome -eq 'PendingServicing') {
+                        & $giveUp 'no usable copy was found on the disk or outside it, and Windows Resource Protection is blocked until the pending servicing queue is cleared with -FixPendingUpdates'
+                    }
+                    else {
+                        & $giveUp 'no usable copy was found on the disk or outside it, and Windows Resource Protection could not restore one'
+                    }
+                    return $false
+                }
 
                 Write-Host ""
                 $sfcVerb = if ($Tentative) { 'Trying' } else { 'Falling back to' }
                 Write-Host "  $sfcVerb offline SFC - $Reason" -ForegroundColor Yellow
                 $attempt = Repair-OfflineSystemFileWithSfc -TargetPath $targetPath -IsRepaired $testTargetHealthy
+                $rsfState.SfcOutcome = if ($attempt.Repaired) { 'Repaired' } elseif ($attempt.Outcome) { "$($attempt.Outcome)" } else { 'Failed' }
                 if (-not $attempt.Repaired) {
                     if ($Tentative) {
                         Write-Warning "  Offline SFC could not restore '$fileName' (outcome: $($attempt.Outcome))."
@@ -20111,6 +21539,166 @@ apply a protected Windows system-file ACL/owner baseline.
                     BackupSkipReason  = 'Windows Resource Protection writes the file in place; the overwritten copy had already failed validation.'
                 }
                 return $true
+            }
+
+            # -- Install one candidate --------------------------------------------
+            # Shared by the on-disk candidates and the outside sources. It is a scriptblock
+            # invoked with &, so it sees this iteration's variables but must return, never
+            # continue.
+            $installCandidate = {
+                param($best, $versionChange)
+                $driverBaseName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
+                $infMatchPattern = '\' + [regex]::Escape($driverBaseName) + '\.inf_'
+                if ($ext -eq '.sys' -and $best.Source -eq 'DriverStore' -and $best.Path -match $infMatchPattern) {
+                    Write-Host "  Preferring DriverStore INF-matched driver package copy ($driverBaseName.inf_*)." -ForegroundColor DarkGray
+                }
+
+                Write-Host "  Selected: $($best.Path)" -ForegroundColor Cyan
+                if ($best.Origin) { Write-Host "    Origin: $($best.Origin)" -ForegroundColor White }
+                Write-Host "    Architecture: $($best.Architecture) $($best.Machine)  |  Version: $($best.Version)  |  Size: $("{0:N0}" -f $best.Size) bytes" -ForegroundColor White
+                Write-Host "    Date: $($best.LastWrite.ToString('yyyy-MM-dd HH:mm'))  |  Company: $($best.Company)" -ForegroundColor White
+
+                # Verify it's a Microsoft binary (safety check)
+                if ($best.Company -and $best.Company -notmatch 'Microsoft') {
+                    Write-Warning "  Selected binary is not from Microsoft (Company: '$($best.Company)')."
+                    Write-Warning "  Proceeding anyway - verify the replacement is correct."
+                }
+
+                # -- 4/5. Install the replacement -------------------------------------
+                # Everything that makes writing to an offline guest disk hard - the
+                # TrustedInstaller ownership, the backup, the hard-link guard, the hash
+                # check, replaying the file's original descriptor and rolling back a bad
+                # copy - lives in Install-ProtectedSystemFile, so every caller in this
+                # script behaves identically. Only the checks specific to a Windows system
+                # binary are supplied here, as a validation block that rejects the copy by
+                # throwing.
+                $backupSuffix = if ($targetExists -and $targetSize -eq 0 -and -not $targetIsDirectory) { '.broken.bak' } else { '.replaced.bak' }
+
+                $validateReplacement = {
+                    param($installedPath)
+
+                    if ($portableExecutableExtensions -notcontains $ext) { return }
+
+                    $replacementPeInfo = Get-PortableExecutableInfo -FilePath $installedPath
+                    if ($replacementPeInfo.IsPortableExecutable -and $replacementPeInfo.Architecture -ne 'Unknown') {
+                        if ($guestArchitecture -ne 'Unknown' -and
+                            -not (Test-PortableExecutableArchitectureCompatible `
+                                    -ExpectedArchitecture $guestArchitecture `
+                                    -ActualArchitecture $replacementPeInfo.Architecture)) {
+                            throw "Replacement PE architecture $($replacementPeInfo.Architecture) ($($replacementPeInfo.Machine)) does not match guest architecture $guestArchitecture."
+                        }
+                        Write-Host "  [OK] Replacement PE architecture: $($replacementPeInfo.Architecture) ($($replacementPeInfo.Machine))." -ForegroundColor Green
+                    }
+                    else {
+                        Write-Warning "  The copied file's PE architecture could not be verified: $($replacementPeInfo.Error)"
+                    }
+
+                    # Re-verify trust at the destination. This is the check that proves the
+                    # repair actually cleared STATUS_INVALID_IMAGE_HASH rather than moving it.
+                    $postSig = Test-MicrosoftSignature -FilePath $installedPath
+                    if ($postSig.IsHardFailure) {
+                        throw "Replacement still fails image trust validation at the destination - $(Get-TrustStateDescription -Signature $postSig)."
+                    }
+                    switch ($postSig.TrustState) {
+                        'ValidMicrosoft' { Write-Host "  [OK] Image trust verified: $(Get-TrustStateDescription -Signature $postSig)." -ForegroundColor Green }
+                        'CatalogUnverified' { Write-Host "  [i] Image trust could not be proven offline (no usable guest catalog store); PE and hash checks passed." -ForegroundColor DarkGray }
+                        default { Write-Host "  [i] Image trust after replacement: $(Get-TrustStateDescription -Signature $postSig)." -ForegroundColor DarkGray }
+                    }
+                }
+
+                $install = Install-ProtectedSystemFile `
+                    -Source $best.Path `
+                    -Destination $targetPath `
+                    -BackupSuffix $backupSuffix `
+                    -PostCopyValidation $validateReplacement `
+                    -Description "system file '$fileName'"
+
+                if (-not $install.Installed) {
+                    Write-Warning "  '$fileName' was not replaced: $($install.Reason)"
+                    Write-ActionLog -Event 'SystemFileReplacementFailed' -Details @{
+                        FileName   = $fileName
+                        TargetPath = $targetPath
+                        SourcePath = $best.Path
+                        RolledBack = $install.RolledBack
+                        Reason     = $install.Reason
+                    }
+                    $null = & $invokeSfcFallback "the selected candidate could not be installed ($($install.Reason))"
+                    return
+                }
+
+                Write-ActionLog -Event 'SystemFileAclRestored' -Details @{
+                    FileName   = $fileName
+                    TargetPath = $targetPath
+                    SourcePath = $best.Path
+                    AclSource  = $install.AclSource
+                }
+
+                $newSize = (Get-Item -LiteralPath $targetPath).Length
+                Write-Host "  [OK] Replaced: $targetPath ($("{0:N0}" -f $newSize) bytes)" -ForegroundColor Green
+                if ($install.BackupPath) {
+                    Write-Host "  Backup: $($install.BackupPath)" -ForegroundColor DarkGray
+                }
+                if ($versionChange -and $install.BackupPath) {
+                    Write-Warning "  Version is now $($versionChange.To) (was $($versionChange.From)). To undo, delete $targetPath and rename $(Split-Path $install.BackupPath -Leaf) back to $fileName."
+                }
+                if ($hardLinkedCandidates.Count -gt 0) {
+                    # The damaged record keeps its other names; only the live path was replaced.
+                    Write-Warning "  The component store copy is still the damaged file (it is now linked to the backup, not to $fileName):"
+                    foreach ($hl in $hardLinkedCandidates) { Write-Warning "    $($hl.Path)" }
+                    $restoreNote = if ($versionChange) { " This also brings $fileName back to $($versionChange.From)." } else { '' }
+                    Write-Warning "  After the VM boots, run 'DISM /Online /Cleanup-Image /RestoreHealth' then 'sfc /scannow' (or install the latest cumulative update) so servicing repairs the store.$restoreNote"
+                }
+
+                Write-ActionLog -Event 'SystemFileReplaced' -Details @{
+                    FileName              = $fileName
+                    TargetPath            = $targetPath
+                    SourcePath            = $best.Path
+                    Source                = $best.Source
+                    Origin                = $best.Origin
+                    Version               = $best.Version
+                    Size                  = $best.Size
+                    Company               = $best.Company
+                    Sha256                = $install.Hash
+                    BackupPath            = $install.BackupPath
+                    AclSource             = $install.AclSource
+                    GuestArchitecture     = $guestArchitecture
+                    CandidateArchitecture = $best.Architecture
+                    CandidateMachine      = $best.Machine
+                    PreviousState         = $stateDesc
+                    VersionChange         = $versionChange
+                    StoreCopyStillDamaged = @($hardLinkedCandidates | ForEach-Object { $_.Path })
+                }
+            }
+
+            # -- Outside sources ---------------------------------------------------
+            # Reached only when the disk has no exact-version copy. SFC is tried first (it
+            # restores the installed version from sources on this disk), then an attached
+            # donor disk and the guest's cumulative update. Returns 'Repaired' when SFC
+            # fixed the file, an exact-version candidate, or $null.
+            $acquireExternalCandidate = {
+                param([string]$Reason)
+                if (-not [string]::IsNullOrWhiteSpace($SourcePath)) { return $null }
+                if (& $invokeSfcFallback $Reason -Tentative) { return 'Repaired' }
+                if ($rsfState.ExternalTried) { return $rsfState.External }
+                $rsfState.ExternalTried = $true
+                if ($portableExecutableExtensions -notcontains $ext -or -not $targetIsUnderWindows) { return $null }
+                if (-not $expectedVersion) {
+                    Write-Warning "  The installed version of '$fileName' could not be determined, so no outside copy can be matched to it."
+                    return $null
+                }
+                $rsfState.External = Get-SystemFileExternalCandidate -FileName $fileName -TargetPath $targetPath -WinRoot $winRoot `
+                    -ExpectedVersion $expectedVersion -ExpectedComponent $expectedComponent -GuestArchitecture $guestArchitecture `
+                    -DonorDisk $DonorDisk -MsuPath $MsuPath -SkipMsuDownload:$SkipMsuDownload
+                return $rsfState.External
+            }
+
+            # For the paths that have no usable on-disk candidate at all.
+            $finishFromOutside = {
+                param([string]$Reason)
+                $outside = & $acquireExternalCandidate $Reason
+                if ($outside -is [string]) { return }
+                if ($outside) { $null = & $installCandidate $outside $null; return }
+                $null = & $invokeSfcFallback $Reason
             }
 
             if (-not [string]::IsNullOrWhiteSpace($SourcePath)) {
@@ -20179,16 +21767,43 @@ apply a protected Windows system-file ACL/owner baseline.
                 }
             }
 
+            # -- 2b. The version Windows installed --------------------------------
+            # A WinSxS name that shares the target's file ID names exactly the component
+            # Windows installed, and that survives any damage to the bytes - including
+            # truncation to 0 bytes, where the twin is not a candidate and is found here
+            # from the index instead.
+            if ($portableExecutableExtensions -contains $ext) {
+                if ($targetIdentity) {
+                    foreach ($src in $indexedSources) {
+                        $srcId = Get-FileIdentity -Path $src.Path
+                        if (-not $srcId -or $srcId.Id -ne $targetIdentity.Id) { continue }
+                        $hv = Get-ComponentDirectoryVersion -Path $src.Path
+                        if (-not $hv) { continue }
+                        $componentDir = Split-Path $src.Path -Parent
+                        $expectedVersion = $hv
+                        $expectedVersionSource = 'installed component ' + (Split-Path $componentDir -Leaf)
+                        if ((Split-Path (Split-Path $componentDir -Parent) -Leaf) -ieq 'WinSxS') {
+                            $expectedComponent = Split-Path $componentDir -Leaf
+                        }
+                        break
+                    }
+                }
+                if (-not $expectedVersion -and $targetVersion) {
+                    $expectedVersion = Get-SystemFileVersionFromText -Text $targetVersion.FileVersion
+                    if ($expectedVersion) { $expectedVersionSource = 'version resource of the file being replaced' }
+                }
+            }
+
             if ($candidates.Count -eq 0) {
                 if ($hardLinkedCandidates.Count -gt 0) {
                     Write-Warning "  No independent replacement source exists on this disk for '$fileName'."
                     Write-Warning "  Every copy found is a hard link to the damaged file, which is what Windows does for inbox files: the component store holds one instance and links it into place. A file damaged where it lies is therefore damaged in the store too."
                     Write-Warning "  \Windows\WinSxS\Backup was searched as well and holds no usable copy of this file. It stores complete binaries for some components and reverse delta patches for others, and only a complete binary can be installed."
-                    $null = & $invokeSfcFallback 'every copy on the disk is a hard link to the damaged file'
+                    & $finishFromOutside 'every copy on the disk is a hard link to the damaged file'
                 }
                 else {
                     Write-Warning "  No replacement candidates found for '$fileName' in WinSxS, its backup store or the DriverStore."
-                    $null = & $invokeSfcFallback 'no replacement candidate was found in the offline stores'
+                    & $finishFromOutside 'no replacement candidate was found in the offline stores'
                 }
                 continue
             }
@@ -20221,7 +21836,7 @@ apply a protected Windows system-file ACL/owner baseline.
             if ($eligibleCandidates.Count -eq 0) {
                 Write-Warning "  No candidate matches the offline guest architecture ($guestArchitecture)."
                 Write-Warning "  Do not use a binary from a different architecture. Use matching installation media or a same-build VM if the local stores are incomplete."
-                $null = & $invokeSfcFallback "no candidate matched the guest architecture ($guestArchitecture)"
+                $null = & $finishFromOutside "no candidate matched the guest architecture ($guestArchitecture)"
                 continue
             }
             if ($candidateSelection.UsedUnverifiedFallback) {
@@ -20279,7 +21894,7 @@ apply a protected Windows system-file ACL/owner baseline.
                 if ($trustRanked.Count -eq 0) {
                     Write-Warning "  Every replacement candidate for '$fileName' failed image trust validation. Refusing to install a known-bad binary."
                     Write-Warning "  The component store itself may be damaged."
-                    $null = & $invokeSfcFallback 'every candidate failed image trust validation'
+                    $null = & $finishFromOutside 'every candidate failed image trust validation'
                     continue
                 }
                 $eligibleCandidates = $trustRanked
@@ -20287,28 +21902,16 @@ apply a protected Windows system-file ACL/owner baseline.
 
             # -- 3a. Keep the installed version whenever possible ----------------
             # Order: a candidate of the exact installed version, then offline SFC (WRP
-            # restores the installed version, verified against the guest catalogs), and
-            # only then a same-build candidate of another revision - and only if its
-            # static linkage is compatible with the modules installed beside it. A
-            # version change is the last resort because tightly coupled modules
-            # (win32k/win32kbase/win32kfull, ntoskrnl/hal, ntdll/kernelbase) can
-            # disagree about exports and fail with a NEW stop code.
+            # restores the installed version, verified against the guest catalogs), then
+            # an exact-version copy from outside the disk (donor disk, cumulative update),
+            # and only then - with the operator's consent - a same-build candidate of
+            # another revision, and only if its static linkage is compatible with the
+            # modules installed beside it. A version change is the last resort because
+            # tightly coupled modules (win32k/win32kbase/win32kfull, ntoskrnl/hal,
+            # ntdll/kernelbase) can disagree about exports and fail with a NEW stop code.
             # An explicit -RepairSystemFileSource is authoritative and skips this.
             $versionChange = $null
             if ([string]::IsNullOrWhiteSpace($SourcePath) -and $portableExecutableExtensions -contains $ext) {
-                $expectedVersion = $null
-                $expectedVersionSource = $null
-                # The hard-linked twin's component folder names exactly the component
-                # Windows installed; that survives any damage to the bytes.
-                foreach ($hl in $hardLinkedCandidates) {
-                    $hv = Get-ComponentDirectoryVersion -Path $hl.Path
-                    if ($hv) { $expectedVersion = $hv; $expectedVersionSource = 'installed component ' + (Split-Path (Split-Path $hl.Path -Parent) -Leaf); break }
-                }
-                if (-not $expectedVersion -and $targetVersion) {
-                    $expectedVersion = Get-SystemFileVersionFromText -Text $targetVersion.FileVersion
-                    if ($expectedVersion) { $expectedVersionSource = 'version resource of the file being replaced' }
-                }
-
                 if ($expectedVersion) {
                     foreach ($cand in $eligibleCandidates) {
                         $cv = Get-ComponentDirectoryVersion -Path $cand.Path
@@ -20324,9 +21927,13 @@ apply a protected Windows system-file ACL/owner baseline.
                     }
                     else {
                         Write-Warning "  No candidate matches the installed version $expectedVersion ($expectedVersionSource)."
-                        if (& $invokeSfcFallback "no on-disk candidate is version $expectedVersion; Windows Resource Protection is tried before any version change" -Tentative) {
-                            continue
-                        }
+                        $outside = & $acquireExternalCandidate "no on-disk candidate is version $expectedVersion; Windows Resource Protection is tried before any outside source or version change"
+                        if ($outside -is [string]) { continue }
+                    }
+                    if ($sameVersion.Count -eq 0 -and $outside) {
+                        $eligibleCandidates = @($outside)
+                    }
+                    elseif ($sameVersion.Count -eq 0) {
 
                         $sameBuild = @($eligibleCandidates | Where-Object {
                                 $_.ComparableVersion -and
@@ -20364,6 +21971,18 @@ apply a protected Windows system-file ACL/owner baseline.
                             continue
                         }
 
+                        if (-not (Confirm-SystemFileVersionChange -FileName $fileName -From "$expectedVersion" -To "$($chosen.ComparableVersion)" `
+                                    -Relation $chosen.VersionRelation -Allowed:$AllowDowngrade -RepairArgument (Get-RepairSystemFileArgument -Path $targetPath))) {
+                            Write-ActionLog -Event 'SystemFileVersionChangeRefused' -Details @{
+                                FileName        = $fileName
+                                TargetPath      = $targetPath
+                                ExpectedVersion = "$expectedVersion"
+                                Candidates      = @($chosen.Path)
+                                Reason          = 'NoConsent'
+                            }
+                            continue
+                        }
+
                         $versionChange = [pscustomobject]@{
                             From     = "$expectedVersion"
                             To       = "$($chosen.ComparableVersion)"
@@ -20372,7 +21991,7 @@ apply a protected Windows system-file ACL/owner baseline.
                         }
                         $changeWord = if ($chosen.VersionRelation -eq 'Older') { 'DOWNGRADE' } else { 'VERSION CHANGE' }
                         Write-Warning "  $changeWord (last resort): installing $($versionChange.To) in place of the installed $($versionChange.From)."
-                        Write-Warning "  No exact-version copy exists on this disk and offline SFC could not restore one. Static linkage checks passed in both directions, which rules out missing-export failures but cannot prove every internal interface matches."
+                        Write-Warning "  No exact-version copy exists on this disk, offline SFC could not restore one and no outside source provided one. Static linkage checks passed in both directions, which rules out missing-export failures but cannot prove every internal interface matches."
                         $eligibleCandidates = @($chosen)
                     }
                 }
@@ -20387,123 +22006,7 @@ apply a protected Windows system-file ACL/owner baseline.
                             @{Expression = 'LastWrite'; Descending = $true } |
                 Select-Object -First 1
 
-            if ($ext -eq '.sys' -and $best.Source -eq 'DriverStore' -and $best.Path -match $infMatchPattern) {
-                Write-Host "  Preferring DriverStore INF-matched driver package copy ($driverBaseName.inf_*)." -ForegroundColor DarkGray
-            }
-
-            Write-Host "  Selected: $($best.Path)" -ForegroundColor Cyan
-            Write-Host "    Architecture: $($best.Architecture) $($best.Machine)  |  Version: $($best.Version)  |  Size: $("{0:N0}" -f $best.Size) bytes" -ForegroundColor White
-            Write-Host "    Date: $($best.LastWrite.ToString('yyyy-MM-dd HH:mm'))  |  Company: $($best.Company)" -ForegroundColor White
-
-            # Verify it's a Microsoft binary (safety check)
-            if ($best.Company -and $best.Company -notmatch 'Microsoft') {
-                Write-Warning "  Selected binary is not from Microsoft (Company: '$($best.Company)')."
-                Write-Warning "  Proceeding anyway - verify the replacement is correct."
-            }
-
-            # -- 4/5. Install the replacement -------------------------------------
-            # Everything that makes writing to an offline guest disk hard - the
-            # TrustedInstaller ownership, the backup, the hard-link guard, the hash
-            # check, replaying the file's original descriptor and rolling back a bad
-            # copy - lives in Install-ProtectedSystemFile, so every caller in this
-            # script behaves identically. Only the checks specific to a Windows system
-            # binary are supplied here, as a validation block that rejects the copy by
-            # throwing.
-            $backupSuffix = if ($targetExists -and $targetSize -eq 0 -and -not $targetIsDirectory) { '.broken.bak' } else { '.replaced.bak' }
-
-            $validateReplacement = {
-                param($installedPath)
-
-                if ($portableExecutableExtensions -notcontains $ext) { return }
-
-                $replacementPeInfo = Get-PortableExecutableInfo -FilePath $installedPath
-                if ($replacementPeInfo.IsPortableExecutable -and $replacementPeInfo.Architecture -ne 'Unknown') {
-                    if ($guestArchitecture -ne 'Unknown' -and
-                        -not (Test-PortableExecutableArchitectureCompatible `
-                                -ExpectedArchitecture $guestArchitecture `
-                                -ActualArchitecture $replacementPeInfo.Architecture)) {
-                        throw "Replacement PE architecture $($replacementPeInfo.Architecture) ($($replacementPeInfo.Machine)) does not match guest architecture $guestArchitecture."
-                    }
-                    Write-Host "  [OK] Replacement PE architecture: $($replacementPeInfo.Architecture) ($($replacementPeInfo.Machine))." -ForegroundColor Green
-                }
-                else {
-                    Write-Warning "  The copied file's PE architecture could not be verified: $($replacementPeInfo.Error)"
-                }
-
-                # Re-verify trust at the destination. This is the check that proves the
-                # repair actually cleared STATUS_INVALID_IMAGE_HASH rather than moving it.
-                $postSig = Test-MicrosoftSignature -FilePath $installedPath
-                if ($postSig.IsHardFailure) {
-                    throw "Replacement still fails image trust validation at the destination - $(Get-TrustStateDescription -Signature $postSig)."
-                }
-                switch ($postSig.TrustState) {
-                    'ValidMicrosoft' { Write-Host "  [OK] Image trust verified: $(Get-TrustStateDescription -Signature $postSig)." -ForegroundColor Green }
-                    'CatalogUnverified' { Write-Host "  [i] Image trust could not be proven offline (no usable guest catalog store); PE and hash checks passed." -ForegroundColor DarkGray }
-                    default { Write-Host "  [i] Image trust after replacement: $(Get-TrustStateDescription -Signature $postSig)." -ForegroundColor DarkGray }
-                }
-            }
-
-            $install = Install-ProtectedSystemFile `
-                -Source $best.Path `
-                -Destination $targetPath `
-                -BackupSuffix $backupSuffix `
-                -PostCopyValidation $validateReplacement `
-                -Description "system file '$fileName'"
-
-            if (-not $install.Installed) {
-                Write-Warning "  '$fileName' was not replaced: $($install.Reason)"
-                Write-ActionLog -Event 'SystemFileReplacementFailed' -Details @{
-                    FileName   = $fileName
-                    TargetPath = $targetPath
-                    SourcePath = $best.Path
-                    RolledBack = $install.RolledBack
-                    Reason     = $install.Reason
-                }
-                $null = & $invokeSfcFallback "the selected candidate could not be installed ($($install.Reason))"
-                continue
-            }
-
-            Write-ActionLog -Event 'SystemFileAclRestored' -Details @{
-                FileName   = $fileName
-                TargetPath = $targetPath
-                SourcePath = $best.Path
-                AclSource  = $install.AclSource
-            }
-
-            $newSize = (Get-Item -LiteralPath $targetPath).Length
-            Write-Host "  [OK] Replaced: $targetPath ($("{0:N0}" -f $newSize) bytes)" -ForegroundColor Green
-            if ($install.BackupPath) {
-                Write-Host "  Backup: $($install.BackupPath)" -ForegroundColor DarkGray
-            }
-            if ($versionChange -and $install.BackupPath) {
-                Write-Warning "  Version is now $($versionChange.To) (was $($versionChange.From)). To undo, delete $targetPath and rename $(Split-Path $install.BackupPath -Leaf) back to $fileName."
-            }
-            if ($hardLinkedCandidates.Count -gt 0) {
-                # The damaged record keeps its other names; only the live path was replaced.
-                Write-Warning "  The component store copy is still the damaged file (it is now linked to the backup, not to $fileName):"
-                foreach ($hl in $hardLinkedCandidates) { Write-Warning "    $($hl.Path)" }
-                $restoreNote = if ($versionChange) { " This also brings $fileName back to $($versionChange.From)." } else { '' }
-                Write-Warning "  After the VM boots, run 'DISM /Online /Cleanup-Image /RestoreHealth' then 'sfc /scannow' (or install the latest cumulative update) so servicing repairs the store.$restoreNote"
-            }
-
-            Write-ActionLog -Event 'SystemFileReplaced' -Details @{
-                FileName              = $fileName
-                TargetPath            = $targetPath
-                SourcePath            = $best.Path
-                Source                = $best.Source
-                Version               = $best.Version
-                Size                  = $best.Size
-                Company               = $best.Company
-                Sha256                = $install.Hash
-                BackupPath            = $install.BackupPath
-                AclSource             = $install.AclSource
-                GuestArchitecture     = $guestArchitecture
-                CandidateArchitecture = $best.Architecture
-                CandidateMachine      = $best.Machine
-                PreviousState         = $stateDesc
-                VersionChange         = $versionChange
-                StoreCopyStillDamaged = @($hardLinkedCandidates | ForEach-Object { $_.Path })
-            }
+            $null = & $installCandidate $best $versionChange
         }
     }
 
@@ -23449,6 +24952,10 @@ No destructive file or registry cleanup is performed.
             [string]$RepairSource = '',
             [string]$RepairSystemFileSource = '',
             [switch]$SkipOfflineSfc,
+            [int]$RepairSystemFileDonorDisk = -1,
+            [string[]]$RepairSystemFileMsu = @(),
+            [switch]$SkipMsuDownload,
+            [switch]$AllowSystemFileDowngrade,
             [switch]$AnalyzeComponentStore,
             [Alias('TryLGKC')][switch]$TryLKGC,
             [switch]$TryOtherBootConfig,        
@@ -23626,6 +25133,10 @@ PARAMETERS:
             -CodeIntegrityPolicySourcePath <path> Optional known-good CodeIntegrity folder/file source; otherwise uses offline WinSxS, then same-build rescue host fallback
             -RepairSystemFileSource <path> Optional known-good file or folder to repair from. Skips the component-store scan and the offline SFC fallback entirely
             -SkipOfflineSfc        (sub-option) Never run offline SFC - neither before a same-build version change nor as the final fallback
+            -RepairSystemFileMsu <path[,path]>  (sub-option) The guest's cumulative update (.msu/.cab, or a folder of them) to extract the file from
+            -SkipMsuDownload       (sub-option) Never download the cumulative update from the Microsoft Update Catalog
+            -RepairSystemFileDonorDisk <n>  (sub-option) Disk number of an attached donor disk of the same build (tried first; 1809+ guests accept any update level of the build)
+            -AllowSystemFileDowngrade  (sub-option) Approve the last-resort same-build version change unattended (-Force does not)
   -FixBootSector         Inspect and repair the MBR bootstrap + NTFS volume boot record (Gen1/BIOS only).
                          Fixes what -FixBoot cannot: "Operating system not found", "Missing operating
                          system", "A disk read error occurred" and a stale BPB HiddenSectors after a
@@ -23666,8 +25177,13 @@ PARAMETERS:
                          BootExecute, service ImagePath/ServiceDll); else a documented location. Ambiguous
                          or unknown names fail - pass a path relative to \Windows: System32\win32k.sys, SysWOW64\x.dll
                          Source order: an exact-version copy from WinSxS/DriverStore, then offline SFC, then
-                         (last resort) another revision of the SAME build whose imports/exports link both
-                         ways - installed with a DOWNGRADE warning, a .replaced.bak and an undo hint.
+                         (1809+) a rebuild from the guest's own forward differential, then a disk named with
+                         -RepairSystemFileDonorDisk, then the guest's cumulative update (-RepairSystemFileMsu,
+                         or downloaded when the Update Catalog is reachable), then other attached donor disks
+                         and the rescue VM; if none has it, the KB link and the az commands for a Marketplace
+                         donor disk are printed. Last resort, with consent only
+                         (Yes at the prompt or -AllowSystemFileDowngrade): another revision of the SAME build
+                         whose imports/exports link both ways, with a .replaced.bak and an undo hint.
                          Nothing compatible: refused; supply -RepairSystemFileSource from a same-build machine
   -RunSFC                 Run SFC in offline mode
   -SetFullMemDump        Configure full memory dump + pagefile on C:
@@ -23826,7 +25342,7 @@ AVAILABLE DISKS:
         # Initialize logging and target (resolve VM/disk, bring disk online, detect partitions)
         # Determine if any write/repair action was requested (exclude pure read-only switches)
         $readOnlySwitches = @('SysCheck', 'CheckDiskHealth', 'ScanNetBindings', 'CheckRDPPolicies', 'CollectEventLogs', 'CollectCrashDumps', 'ShowLastSession', 'GetServicesReport', 'GetCatalogStoreReport', 'GetAppLockerReport', 'ListInstalledUpdates', 'ListStartupPrograms', 'AnalyzeCriticalBootFiles', 'AnalyzeSyntheticDrivers', 'AnalyzeProxyState', 'GetBootPathReport', 'AnalyzeBcdConsistency', 'AnalyzeComponentStore', 'AnalyzeServicingState', 'AnalyzeRecentChanges', 'AnalyzeDomainTrustState')
-        $hasRepairAction = $PSBoundParameters.Keys | Where-Object { $readOnlySwitches -notcontains $_ -and $_ -notin @('VMName', 'DiskNumber', 'Force', 'LeaveDiskOnline', 'DriveLetter', 'RepairSource', 'CodeIntegrityPolicySourcePath', 'RepairSystemFileSource', 'SkipOfflineSfc', 'IncludeServices', 'IssuesOnly', 'KeepDefaultFilters', 'DriverStartType', 'RecentChangeDays', 'LoadHive', 'UnloadHive', 'TransactionLogScope') }
+        $hasRepairAction = $PSBoundParameters.Keys | Where-Object { $readOnlySwitches -notcontains $_ -and $_ -notin @('VMName', 'DiskNumber', 'Force', 'LeaveDiskOnline', 'DriveLetter', 'RepairSource', 'CodeIntegrityPolicySourcePath', 'RepairSystemFileSource', 'SkipOfflineSfc', 'RepairSystemFileDonorDisk', 'RepairSystemFileMsu', 'SkipMsuDownload', 'AllowSystemFileDowngrade', 'IncludeServices', 'IssuesOnly', 'KeepDefaultFilters', 'DriverStartType', 'RecentChangeDays', 'LoadHive', 'UnloadHive', 'TransactionLogScope') }
         if ($hasRepairAction) {
             Write-Host "  Tip: if you haven't already, a VM snapshot or disk backup before making changes is always a safe starting point." -ForegroundColor DarkGray
             Write-Host ""
@@ -23921,7 +25437,11 @@ AVAILABLE DISKS:
             if ($CheckDiskHealth) { CheckDiskHealth }
             if ($CollectEventLogs) { CollectEventLogs }
             if ($AnalyzeCriticalBootFiles) { AnalyzeCriticalBootFiles }
-            if ($RepairSystemFile.Count -gt 0) { RepairBrokenSystemFile -FileNames $RepairSystemFile -SourcePath $RepairSystemFileSource -SkipOfflineSfc:$SkipOfflineSfc }
+            if ($RepairSystemFile.Count -gt 0) {
+                RepairBrokenSystemFile -FileNames $RepairSystemFile -SourcePath $RepairSystemFileSource -SkipOfflineSfc:$SkipOfflineSfc `
+                    -DonorDisk $RepairSystemFileDonorDisk -MsuPath $RepairSystemFileMsu -SkipMsuDownload:$SkipMsuDownload `
+                    -AllowDowngrade:$AllowSystemFileDowngrade
+            }
             if ($AnalyzeSyntheticDrivers) { AnalyzeSyntheticDrivers }
             if ($EnsureSyntheticDriversEnabled) { EnsureSyntheticDriversEnabled }
             if ($ResetInterfacesToDHCP) { ResetInterfacesToDHCP }
@@ -24009,6 +25529,10 @@ AVAILABLE DISKS:
     $RepairSource = if ($PSBoundParameters.ContainsKey('RepairSource')) { $PSBoundParameters['RepairSource'] }     else { '' }
     $RepairSystemFileSource = if ($PSBoundParameters.ContainsKey('RepairSystemFileSource')) { $PSBoundParameters['RepairSystemFileSource'] } else { '' }
     $SkipOfflineSfc = if ($PSBoundParameters.ContainsKey('SkipOfflineSfc')) { [switch]$PSBoundParameters['SkipOfflineSfc'] } else { [switch]$false }
+    $RepairSystemFileDonorDisk = if ($PSBoundParameters.ContainsKey('RepairSystemFileDonorDisk')) { [int]$PSBoundParameters['RepairSystemFileDonorDisk'] } else { -1 }
+    $RepairSystemFileMsu = if ($PSBoundParameters.ContainsKey('RepairSystemFileMsu')) { @($PSBoundParameters['RepairSystemFileMsu']) } else { @() }
+    $SkipMsuDownload = if ($PSBoundParameters.ContainsKey('SkipMsuDownload')) { [switch]$PSBoundParameters['SkipMsuDownload'] } else { [switch]$false }
+    $AllowSystemFileDowngrade = if ($PSBoundParameters.ContainsKey('AllowSystemFileDowngrade')) { [switch]$PSBoundParameters['AllowSystemFileDowngrade'] } else { [switch]$false }
     $IncludeServices = [bool]$PSBoundParameters.ContainsKey('IncludeServices')
     $IssuesOnly = [bool]$PSBoundParameters.ContainsKey('IssuesOnly')
     $KeepDefaultFilters = [bool]$PSBoundParameters.ContainsKey('KeepDefaultFilters')
