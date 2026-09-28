@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.9.0
+        Version: 0.9.1
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -18765,6 +18765,19 @@ public static extern bool CloseHandle(IntPtr handle);
         }
     }
 
+    function Get-FileHardLinkPaths {
+        # Every name of one file on its volume, read from the file's own MFT record, so
+        # the WinSxS twin of a live system file is found without walking the store.
+        # fsutil prints volume-relative names (\Windows\...); they are returned with the
+        # drive prefix of $Path.
+        param([Parameter(Mandatory = $true)][string]$Path)
+        $qualifier = Split-Path -Path $Path -Qualifier -ErrorAction SilentlyContinue
+        if (-not $qualifier) { return @() }
+        try { $lines = @(& fsutil.exe hardlink list $Path 2>$null) } catch { return @() }
+        if ($LASTEXITCODE -ne 0) { return @() }
+        return @($lines | ForEach-Object { "$_".Trim() } | Where-Object { $_.StartsWith('\') } | ForEach-Object { $qualifier + $_ })
+    }
+
     function Initialize-FastFileSearchType {
         if ($null -ne $script:FastFileSearchReady) { return $script:FastFileSearchReady }
         if ('RepairAzVMDisk.FastFileSearch' -as [type]) {
@@ -19979,7 +19992,9 @@ namespace RepairAzVMDisk
         # az CLI steps that create a donor disk from the Marketplace image of the guest's
         # build and attach it to this rescue VM. The text is identical in bash and
         # PowerShell (no $, double quotes outside, single quotes inside the JMESPath), so it
-        # can be pasted into Cloud Shell or handed to whoever owns the subscription.
+        # can be pasted into Cloud Shell or handed to whoever owns the subscription. The
+        # JMESPath keeps a space after every comma: az.cmd re-parses its arguments through
+        # cmd.exe, which splits an unspaced "(a,'b')" and fails with "... was unexpected".
         param(
             [object[]]$Images,
             [object]$Metadata,
@@ -20002,13 +20017,13 @@ namespace RepairAzVMDisk
             $lines.Add("# 1. List the Marketplace images of build $Build. Any update level works; pick the newest URN.")
         }
         foreach ($img in @($Images)) {
-            $lines.Add("az vm image list --subscription $sub --location $loc --publisher $($img.Publisher) --offer $($img.Offer) --sku $($img.Sku) --all --query ""[?starts_with(version,'$prefix')].urn"" -o tsv")
+            $lines.Add("az vm image list --subscription $sub --location $loc --publisher $($img.Publisher) --offer $($img.Offer) --sku $($img.Sku) --all --query ""[?sku=='$($img.Sku)' && starts_with(version, '$prefix')].urn"" -o tsv")
         }
         $lines.Add("# 2. Create the donor disk from one URN printed by step 1.")
         $lines.Add("az disk create --subscription $sub -g $rg -n $DiskName --location $loc$zoneArg --sku StandardSSD_LRS --image-reference URN-FROM-STEP-1")
         $lines.Add("# 3. Attach it to this rescue VM (the Azure VM running this script, not a nested Hyper-V guest).")
         $lines.Add("az vm disk attach --subscription $sub -g $rg --vm-name $vm --name $DiskName")
-        $lines.Add("# 4. Re-run the same Repair-AzVMDisk command. The donor disk is found, read and released automatically.")
+        $lines.Add("# 4. Note the donor's disk number on this VM (Get-Disk: the newest disk), then re-run the same Repair-AzVMDisk command adding -RepairSystemFileDonorDisk DISK-NUMBER. The donor is read first, without searching the component store again, and released afterwards.")
         $lines.Add("# 5. Afterwards, remove the donor disk.")
         $lines.Add("az vm disk detach --subscription $sub -g $rg --vm-name $vm --name $DiskName")
         $lines.Add("az disk delete --subscription $sub -g $rg -n $DiskName --yes")
@@ -20917,7 +20932,7 @@ namespace RepairAzVMDisk {
             return $true
         }
         if (-not (Test-InteractiveSession)) {
-            Write-Error "  '$FileName' was not repaired: the only compatible copy is $To, not the installed $From, and a $word needs explicit consent (-Force does not give it)."
+            Write-Host "  [ERROR] '$FileName' was not repaired: the only compatible copy is $To, not the installed $From, and a $word needs explicit consent (-Force does not give it)." -ForegroundColor Red
             Write-Warning "  To accept it, re-run with: -RepairSystemFile $RepairArgument -AllowSystemFileDowngrade"
             return $false
         }
@@ -20943,6 +20958,9 @@ namespace RepairAzVMDisk {
         # -RepairSystemFileDonorDisk is tried before the update. When the guest keeps a
         # forward differential for the file (1809+), its own older component versions are
         # tried first, and donors of the same build at any update level qualify.
+        # -DonorOnly stops after the guest's own store and the named donor (the fast path
+        # taken before the on-disk search); -DonorAlreadyTried skips both, so the fallback
+        # after a failed fast path does not open the same donor again.
         param(
             [Parameter(Mandatory)][string]$FileName,
             [Parameter(Mandatory)][string]$TargetPath,
@@ -20952,7 +20970,9 @@ namespace RepairAzVMDisk {
             [Parameter(Mandatory)][string]$GuestArchitecture,
             [int]$DonorDisk = -1,
             [string[]]$MsuPath = @(),
-            [switch]$SkipMsuDownload
+            [switch]$SkipMsuDownload,
+            [switch]$DonorOnly,
+            [switch]$DonorAlreadyTried
         )
         $run = $script:RepairSystemFileRun
         $relativePath = $TargetPath.Substring($WinRoot.TrimEnd('\').Length).TrimStart('\')
@@ -21023,7 +21043,7 @@ namespace RepairAzVMDisk {
         # -- 0. Other versions in the guest's own component store ------------------
         # Superseded versions that component cleanup has not removed yet still hold the
         # build's original file (full + r\). Nothing has to be downloaded or attached.
-        if ($forward.Count -gt 0) {
+        if ($forward.Count -gt 0 -and -not $DonorAlreadyTried) {
             Write-Host ""
             Write-Host "  The guest keeps $FileName $ExpectedVersion as a forward differential; looking in its component store for the build's original file..." -ForegroundColor Yellow
             $rb = New-SystemFileFromForwardDelta -ForwardDeltaPath $forward.ToArray() -Root $WinRoot -ComponentName $ExpectedComponent `
@@ -21036,10 +21056,11 @@ namespace RepairAzVMDisk {
         }
 
         # -- a. An explicitly named donor disk --------------------------------------
-        if ($DonorDisk -ge 0) {
+        if ($DonorDisk -ge 0 -and -not $DonorAlreadyTried) {
             $cand = & $tryDonors
             if ($cand) { return $cand }
         }
+        if ($DonorOnly) { return $null }
 
         # -- b. The guest's cumulative update (supplied, or downloaded) -------------
         Write-Host ""
@@ -21257,6 +21278,10 @@ namespace RepairAzVMDisk {
         # Repair order:
         #   1. -RepairSystemFileSource, when supplied. An explicit donor is authoritative,
         #      so neither SFC nor the component-store scan runs.
+        #   1b. -RepairSystemFileDonorDisk, when supplied. The installed version is read
+        #      from the target's WinSxS hard link and the donor is searched before the
+        #      component-store index is built; only when it has no match do 2-5 run
+        #      (without opening the donor again).
         #   2. A candidate search across the component store, its backup store and the
         #      driver store, ranked and verified before installation. A candidate of the
         #      exact installed version is required at this stage.
@@ -21296,7 +21321,7 @@ namespace RepairAzVMDisk {
         $portableExecutableExtensions = @('.sys', '.dll', '.exe', '.efi')
         if (-not [string]::IsNullOrWhiteSpace($SourcePath)) {
             if (-not (Test-Path -LiteralPath $SourcePath)) {
-                Write-Error "The -RepairSystemFileSource path does not exist: $SourcePath"
+                Write-Host "[ERROR] The -RepairSystemFileSource path does not exist: $SourcePath" -ForegroundColor Red
                 return
             }
             Write-Host "Repair source supplied: $SourcePath" -ForegroundColor DarkGray
@@ -21324,7 +21349,7 @@ namespace RepairAzVMDisk {
             # -- 1. Determine the expected target path on the offline disk --------
             $resolvedTarget = Resolve-SystemFileRepairTarget -Name $requestedName -WinRoot $winRoot
             if ($resolvedTarget.Error) {
-                Write-Error "  $($resolvedTarget.Error)"
+                Write-Host "  [ERROR] $($resolvedTarget.Error)" -ForegroundColor Red
                 continue
             }
             $fileName = $resolvedTarget.FileName
@@ -21386,6 +21411,10 @@ namespace RepairAzVMDisk {
                 else {
                     'not verified'
                 }
+                $searchText = if ($DonorDisk -ge 0 -and [string]::IsNullOrWhiteSpace($SourcePath)) {
+                    "The script will read donor disk $DonorDisk first (then WinSxS and DriverStore if it has no match)"
+                }
+                else { 'The script will search WinSxS and DriverStore' }
                 Write-Host "  $targetPath already exists ($currentSizeText, version: $($targetVersion.FileVersion), architecture: $currentArchitecture)" -ForegroundColor DarkGray
                 if (-not (Confirm-CriticalOperation -Operation "Force replace existing system file ($fileName)" -Details @"
 The target path already exists:
@@ -21396,7 +21425,7 @@ Current version     : $($targetVersion.FileVersion)
 Current architecture: $currentArchitecture
 Guest architecture : $guestArchitecture
 
-The script will search WinSxS and DriverStore for a replacement candidate,
+$searchText for a replacement candidate,
 back up the existing target to a .replaced.bak file, copy the selected candidate
 to the target path, verify its content and PE architecture when possible, and
 apply a protected Windows system-file ACL/owner baseline.
@@ -21456,7 +21485,7 @@ apply a protected Windows system-file ACL/owner baseline.
 
             # Per-file state: SFC and the outside sources are each tried at most once,
             # whichever path through the search reaches them first.
-            $rsfState = @{ SfcOutcome = $null; ExternalTried = $false; External = $null }
+            $rsfState = @{ SfcOutcome = $null; ExternalTried = $false; External = $null; DonorTried = $false }
             $expectedVersion = $null
             $expectedVersionSource = $null
             $expectedComponent = ''
@@ -21469,13 +21498,13 @@ apply a protected Windows system-file ACL/owner baseline.
 
                 $giveUp = {
                     param([string]$Why)
-                    Write-Error "  '$fileName' was not repaired: $Why"
+                    Write-Host "  [ERROR] '$fileName' was not repaired: $Why" -ForegroundColor Red
                     Write-Warning "  Supply a known-good copy taken from a machine on the same OS build and patch level, or extracted from matching installation media:"
                     Write-Warning "    -RepairSystemFile $(Get-RepairSystemFileArgument -Path $targetPath) -RepairSystemFileSource <file-or-folder>"
                 }
 
                 if (-not [string]::IsNullOrWhiteSpace($SourcePath)) {
-                    Write-Error "  '$fileName' was not repaired from the supplied source."
+                    Write-Host "  [ERROR] '$fileName' was not repaired from the supplied source." -ForegroundColor Red
                     return $false
                 }
                 if ($SkipOfflineSfc) {
@@ -21688,7 +21717,7 @@ apply a protected Windows system-file ACL/owner baseline.
                 }
                 $rsfState.External = Get-SystemFileExternalCandidate -FileName $fileName -TargetPath $targetPath -WinRoot $winRoot `
                     -ExpectedVersion $expectedVersion -ExpectedComponent $expectedComponent -GuestArchitecture $guestArchitecture `
-                    -DonorDisk $DonorDisk -MsuPath $MsuPath -SkipMsuDownload:$SkipMsuDownload
+                    -DonorDisk $DonorDisk -MsuPath $MsuPath -SkipMsuDownload:$SkipMsuDownload -DonorAlreadyTried:$rsfState.DonorTried
                 return $rsfState.External
             }
 
@@ -21703,6 +21732,47 @@ apply a protected Windows system-file ACL/owner baseline.
 
             if (-not [string]::IsNullOrWhiteSpace($SourcePath)) {
                 Write-Host "  A repair source was supplied, so the component-store scan is skipped." -ForegroundColor DarkGray
+            }
+
+            # -- 1b. A donor the operator named is read first ---------------------
+            # Naming a donor with -RepairSystemFileDonorDisk says where the good copy is, so
+            # it is tried before the on-disk search, which walks all of WinSxS and can take
+            # many minutes on a cold disk. The installed version and component come from
+            # the target's own hard links (its WinSxS twin), not from the index. When the
+            # donor has no matching copy the normal search runs, without opening it again.
+            if ($DonorDisk -ge 0 -and [string]::IsNullOrWhiteSpace($SourcePath) -and $targetIsUnderWindows -and
+                $portableExecutableExtensions -contains $ext -and $targetExists -and -not $targetIsDirectory) {
+                foreach ($linkPath in @(Get-FileHardLinkPaths -Path $targetPath)) {
+                    if ($linkPath -ieq $targetPath) { continue }
+                    $componentDir = Split-Path $linkPath -Parent
+                    if ((Split-Path (Split-Path $componentDir -Parent) -Leaf) -ine 'WinSxS') { continue }
+                    $hardLinkedCandidates += [pscustomobject]@{ Path = $linkPath }
+                    $hv = Get-ComponentDirectoryVersion -Path $linkPath
+                    if ($hv -and -not $expectedVersion) {
+                        $expectedVersion = $hv
+                        $expectedVersionSource = 'installed component ' + (Split-Path $componentDir -Leaf)
+                        $expectedComponent = Split-Path $componentDir -Leaf
+                    }
+                }
+                if (-not $expectedVersion -and $targetVersion) {
+                    $expectedVersion = Get-SystemFileVersionFromText -Text $targetVersion.FileVersion
+                    if ($expectedVersion) { $expectedVersionSource = 'version resource of the file being replaced' }
+                }
+                if ($expectedVersion) {
+                    Write-Host "  Donor disk $DonorDisk was named, so it is read before the component store is searched (installed: $expectedVersion, from the $expectedVersionSource)." -ForegroundColor Cyan
+                    $rsfState.DonorTried = $true
+                    $donorCandidate = Get-SystemFileExternalCandidate -FileName $fileName -TargetPath $targetPath -WinRoot $winRoot `
+                        -ExpectedVersion $expectedVersion -ExpectedComponent $expectedComponent -GuestArchitecture $guestArchitecture `
+                        -DonorDisk $DonorDisk -DonorOnly
+                    if ($donorCandidate) {
+                        $null = & $installCandidate $donorCandidate $null
+                        continue
+                    }
+                    Write-Warning "  Donor disk $DonorDisk had no usable copy of '$fileName' $expectedVersion; searching this disk's own stores instead."
+                }
+                else {
+                    Write-Warning "  The installed version of '$fileName' could not be read from the file or its hard links, so donor disk $DonorDisk will be tried after the component store is indexed."
+                }
             }
 
             # -- 2. Search the offline stores for replacement candidates ----------
@@ -21959,7 +22029,7 @@ apply a protected Windows system-file ACL/owner baseline.
                         }
 
                         if (-not $chosen) {
-                            Write-Error "  '$fileName' was not repaired: the only on-disk copies are a different version ($(@($eligibleCandidates | ForEach-Object { $_.ComparableVersion } | Where-Object { $_ } | Select-Object -Unique) -join ', ')) and none is proven link-compatible with the installed $expectedVersion modules. Installing one could replace this failure with a new one."
+                            Write-Host "  [ERROR] '$fileName' was not repaired: the only on-disk copies are a different version ($(@($eligibleCandidates | ForEach-Object { $_.ComparableVersion } | Where-Object { $_ } | Select-Object -Unique) -join ', ')) and none is proven link-compatible with the installed $expectedVersion modules. Installing one could replace this failure with a new one." -ForegroundColor Red
                             Write-Warning "  Supply a copy of version $expectedVersion from a machine on the same build and patch level, or from the matching cumulative update:"
                             Write-Warning "    -RepairSystemFile $(Get-RepairSystemFileArgument -Path $targetPath) -RepairSystemFileSource <file-or-folder>"
                             Write-ActionLog -Event 'SystemFileVersionChangeRefused' -Details @{
@@ -25135,7 +25205,7 @@ PARAMETERS:
             -SkipOfflineSfc        (sub-option) Never run offline SFC - neither before a same-build version change nor as the final fallback
             -RepairSystemFileMsu <path[,path]>  (sub-option) The guest's cumulative update (.msu/.cab, or a folder of them) to extract the file from
             -SkipMsuDownload       (sub-option) Never download the cumulative update from the Microsoft Update Catalog
-            -RepairSystemFileDonorDisk <n>  (sub-option) Disk number of an attached donor disk of the same build (tried first; 1809+ guests accept any update level of the build)
+            -RepairSystemFileDonorDisk <n>  (sub-option) Disk number of an attached donor disk of the same build (read before the component store is indexed; 1809+ guests accept any update level of the build)
             -AllowSystemFileDowngrade  (sub-option) Approve the last-resort same-build version change unattended (-Force does not)
   -FixBootSector         Inspect and repair the MBR bootstrap + NTFS volume boot record (Gen1/BIOS only).
                          Fixes what -FixBoot cannot: "Operating system not found", "Missing operating
