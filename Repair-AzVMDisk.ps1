@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.9.3
+        Version: 0.9.4
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -7933,7 +7933,9 @@ namespace RepairAzVMDisk {
     function Read-UefiTcgLog {
         param([string]$Path)
         $item = Get-Item -LiteralPath $Path -Force
-        $res = [pscustomobject]@{ File = $item.Name; Time = $item.LastWriteTime; BootOrder = @(); Entries = @(); Loaded = @(); Gpt = $null; Error = $null }
+        # DbCa2023 / DbPca2011 / DbxPca2011 stay $null when the log has no db/dbx measurement.
+        $res = [pscustomobject]@{ File = $item.Name; Time = $item.LastWriteTime; BootOrder = @(); Entries = @(); Loaded = @(); Gpt = $null; DbCa2023 = $null; DbPca2011 = $null; DbxPca2011 = $null; Error = $null }
+        $evVarCfg = [long]2147483649     # EV_EFI_VARIABLE_DRIVER_CONFIG 0x80000001
         $evVarBoot = [long]2147483650    # EV_EFI_VARIABLE_BOOT   0x80000002
         $evVarBoot2 = [long]2147483660   # EV_EFI_VARIABLE_BOOT2  0x8000000C
         $evApp = [long]2147483651        # EV_EFI_BOOT_SERVICES_APPLICATION 0x80000003
@@ -7968,7 +7970,25 @@ namespace RepairAzVMDisk {
                 if ($esz -lt 0 -or $d + $esz -gt $b.Length) { break }
                 $dEnd = $d + $esz
 
-                if (($type -eq $evVarBoot -or $type -eq $evVarBoot2) -and $esz -ge 32) {
+                if ($type -eq $evVarCfg -and $esz -ge 32) {
+                    # Secure Boot db/dbx as the firmware measured them: EFI_SIGNATURE_LISTs whose
+                    # X.509 entries carry the CA names in plain ASCII.
+                    $nameLen = [int][BitConverter]::ToUInt64($b, $d + 16)
+                    $dataLen = [int][BitConverter]::ToUInt64($b, $d + 24)
+                    $vd = $d + 32 + $nameLen * 2
+                    if ($nameLen -gt 0 -and $dataLen -ge 0 -and $vd + $dataLen -le $dEnd) {
+                        $name = [Text.Encoding]::Unicode.GetString($b, $d + 32, $nameLen * 2).TrimEnd([char]0)
+                        if ($name -ceq 'db' -or $name -ceq 'dbx') {
+                            $txt = [Text.Encoding]::ASCII.GetString($b, $vd, $dataLen)
+                            if ($name -ceq 'db') {
+                                $res.DbCa2023 = $txt.Contains('Windows UEFI CA 2023')
+                                $res.DbPca2011 = $txt.Contains('Windows Production PCA 2011')
+                            }
+                            else { $res.DbxPca2011 = $txt.Contains('Windows Production PCA 2011') }
+                        }
+                    }
+                }
+                elseif (($type -eq $evVarBoot -or $type -eq $evVarBoot2) -and $esz -ge 32) {
                     $nameLen = [int][BitConverter]::ToUInt64($b, $d + 16)
                     $dataLen = [int][BitConverter]::ToUInt64($b, $d + 24)
                     $vd = $d + 32 + $nameLen * 2
@@ -8028,6 +8048,84 @@ namespace RepairAzVMDisk {
         }
         catch { $res.Error = $_.Exception.Message }
         return $res
+    }
+
+    # Which Secure Boot CA signed a boot manager. Windows ships two: the original one
+    # (Microsoft Windows Production PCA 2011) and its replacement (Windows UEFI CA 2023).
+    function Get-UefiSigningCa {
+        param([AllowEmptyString()][string]$Text)
+        if ([string]::IsNullOrEmpty($Text)) { return 'Unknown' }
+        if ($Text.Contains('Windows UEFI CA 2023')) { return 'UefiCa2023' }
+        if ($Text.Contains('Windows Production PCA 2011')) { return 'Pca2011' }
+        return 'Other'
+    }
+
+    # Read the signer's issuer from the signature embedded in the file - the only one UEFI
+    # firmware checks. Get-AuthenticodeSignature is not used: it prefers a matching catalog
+    # signature, which for Windows boot files is PCA 2011 even when the embedded one is CA 2023.
+    # Fall back to the CA name embedded in the file bytes.
+    function Get-UefiBootManagerSigner {
+        param([string]$Path)
+        $issuer = $null
+        try {
+            $cert = [System.Security.Cryptography.X509Certificates.X509Certificate]::CreateFromSignedFile($Path)
+            if ($cert) { $issuer = $cert.Issuer }
+        }
+        catch { }
+        $ca = Get-UefiSigningCa -Text $issuer
+        if ($ca -eq 'UefiCa2023' -or $ca -eq 'Pca2011') {
+            return [pscustomobject]@{ Ca = $ca; Issuer = $issuer; Source = 'EmbeddedSignature' }
+        }
+        try {
+            $raw = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($Path))
+            $rawCa = Get-UefiSigningCa -Text $raw
+            if ($rawCa -eq 'UefiCa2023' -or $rawCa -eq 'Pca2011') {
+                return [pscustomobject]@{ Ca = $rawCa; Issuer = $issuer; Source = 'FileBytes' }
+            }
+        }
+        catch { }
+        return [pscustomobject]@{ Ca = $ca; Issuer = $issuer; Source = $(if ($issuer) { 'EmbeddedSignature' } else { 'None' }) }
+    }
+
+    # Compare the ESP boot managers' signing CA with the Secure Boot db/dbx that the
+    # newest measured boot log recorded (the platform the disk last booted on).
+    # $Loaders: objects with Name and Ca. $Firmware: a Read-UefiTcgLog result or $null.
+    function Get-UefiSigningCaFindings {
+        param([object[]]$Loaders, [object]$Firmware)
+        $findings = @()
+        $hvNote = "a Hyper-V Gen2 VM whose Secure Boot db predates CA 2023 rejects it ('The boot loader failed') - create a new Gen2 VM on an updated host or update its db; do not disable Secure Boot"
+        $fwName = if ($Firmware) { "the platform this disk last booted on ($($Firmware.File))" } else { $null }
+        $bootex = "bcdboot <Windows>\Windows /s <ESP> /f UEFI /bootex installs the CA 2023-signed boot manager"
+        foreach ($g in @($Loaders | Where-Object { $_ } | Group-Object -Property Ca)) {
+            $names = (@($g.Group | ForEach-Object { $_.Name }) -join ' and ')
+            $verb = if (@($g.Group).Count -gt 1) { 'are' } else { 'is' }
+            switch ($g.Name) {
+                'UefiCa2023' {
+                    if ($Firmware -and $Firmware.DbCa2023 -eq $false) {
+                        $findings += [pscustomobject]@{ Severity = 'WARN'; Fix = ''; Message = "ESP $names $verb signed by Windows UEFI CA 2023, but the Secure Boot db of $fwName does not include that CA - with Secure Boot on, that platform refuses the boot manager ('The boot loader failed'). Azure Trusted Launch trusts CA 2023; on Hyper-V, create a new Gen2 VM on an updated host or update its db; do not disable Secure Boot" }
+                    }
+                    else {
+                        $fwNote = if ($Firmware -and $Firmware.DbCa2023) { "trusted by the Secure Boot db of $fwName and by Azure Trusted Launch" } else { 'trusted by Azure Trusted Launch' }
+                        $findings += [pscustomobject]@{ Severity = 'INFO'; Fix = ''; Message = "ESP $names $verb signed by Windows UEFI CA 2023 - $fwNote; $hvNote" }
+                    }
+                }
+                'Pca2011' {
+                    if ($Firmware -and $Firmware.DbxPca2011) {
+                        $findings += [pscustomobject]@{ Severity = 'CRIT'; Fix = ''; Message = "ESP $names $verb signed by Microsoft Windows Production PCA 2011, which the Secure Boot dbx of $fwName revokes - Secure Boot refuses the boot manager. $bootex" }
+                    }
+                    elseif ($Firmware -and $Firmware.DbPca2011 -eq $false) {
+                        $findings += [pscustomobject]@{ Severity = 'WARN'; Fix = ''; Message = "ESP $names $verb signed by Microsoft Windows Production PCA 2011, but the Secure Boot db of $fwName does not include that CA - Secure Boot refuses the boot manager. $bootex" }
+                    }
+                    else {
+                        $findings += [pscustomobject]@{ Severity = 'OK'; Fix = ''; Message = "ESP $names $verb signed by Microsoft Windows Production PCA 2011 - trusted by Azure and Hyper-V Secure Boot" }
+                    }
+                }
+                default {
+                    $findings += [pscustomobject]@{ Severity = 'INFO'; Fix = ''; Message = "ESP $names - Secure Boot signing CA not recognised (neither Windows Production PCA 2011 nor Windows UEFI CA 2023)" }
+                }
+            }
+        }
+        return $findings
     }
 
     # Non-ESP partitions that carry a copy of the Windows EFI boot files. The
@@ -8129,17 +8227,24 @@ namespace RepairAzVMDisk {
         $current = @($candidates | Where-Object { $_.Status -eq 'CurrentEsp' })
         $missing = @($candidates | Where-Object { $_.Status -eq 'Missing' })
 
+        # One GUID can be recorded with more than one GPT slot: every Windows boot rewrites the entry
+        # for the ESP it booted from, so a brief boot elsewhere (for example nested Hyper-V after the
+        # ESP was recreated in another slot) records that slot too. Azure TL never boots on a slot
+        # mismatch, so its saved entry is the slot the firmware used most, not the newest one.
+        $bySeen = @(@{ Expression = 'Seen'; Descending = $true }, @{ Expression = 'LastSeen'; Descending = $true })
+        $dominantOf = { param($Guid) @($candidates | Where-Object { $_.Guid -eq $Guid } | Sort-Object -Property $bySeen) | Select-Object -First 1 }
+
         $target = $null
         if ($EspGuid) {
             $g = [guid]$EspGuid.Trim().Trim('{', '}')
-            $target = $candidates | Where-Object { $_.Guid -eq $g } | Select-Object -First 1
+            $target = & $dominantOf $g
             if (-not $target) { $target = [pscustomobject]@{ Guid = $g; Slot = $null; Status = 'UserSupplied'; Seen = 0; LastSeen = $null } }
         }
         # The previous ESP is the newest recorded GUID that no partition has any more. GUIDs still on
         # the disk (the current ESP, or another FAT partition) are never picked. When the current ESP is
         # also recorded, the old GUID wins only if the firmware used it more often, so a one-off boot on
         # another host never flips a restored ESP back.
-        elseif ($missing.Count -gt 0) { $target = $missing[0] }
+        elseif ($missing.Count -gt 0) { $target = & $dominantOf $missing[0].Guid }
 
         if ($esps.Count -eq 0) { $status = 'NoEsp' }
         elseif ($esps.Count -gt 1) { $status = 'MultipleEsp' }
@@ -8180,14 +8285,21 @@ namespace RepairAzVMDisk {
         # + GPT slot. Hyper-V and Standard-security VMs start without that entry, so a boot there says
         # nothing about Azure TL.
         $fwEntry = if ($target -and $target.Slot) { $target }
-        elseif ($current.Count -gt 0) { $current | Sort-Object -Property LastSeen -Descending | Select-Object -First 1 }
+        elseif ($current.Count -gt 0) { @($current | Sort-Object -Property $bySeen) | Select-Object -First 1 }
         else { $null }
+        $slotSightings = @()
+        $slotTie = $false
+        if ($fwEntry -and $fwEntry.Slot) {
+            $slotSightings = @($candidates | Where-Object { $_.Guid -eq $fwEntry.Guid } | Sort-Object -Property $bySeen)
+            $slotTie = $slotSightings.Count -gt 1 -and $slotSightings[0].Seen -eq $slotSightings[1].Seen
+        }
+        $slotConflict = $slotSightings.Count -gt 1
         $azureVerdict = switch ($status) {
             'NoEsp' { 'NoEsp' }
             'Stale' { 'NoMatch' }
             'Replaced' { 'NoMatch' }
             'Match' {
-                if (-not $espSlot -or -not $fwEntry) { 'Unknown' }
+                if (-not $espSlot -or -not $fwEntry -or $slotTie) { 'Unknown' }
                 elseif ($fwEntry.Slot -ne $espSlot) { 'NoMatch' }
                 else { 'Match' }
             }
@@ -8250,6 +8362,9 @@ namespace RepairAzVMDisk {
             RequiredSlot  = $requiredSlot
             SlotMoveNeeded = $slotMoveNeeded
             AzureEntry    = $fwEntry
+            SlotConflict  = $slotConflict
+            SlotTie       = $slotTie
+            SlotSightings = $slotSightings
             AzureVerdict  = $azureVerdict
             AzureLog      = $fwLog
             FallbackEntry = $fallbackEntry
@@ -8282,7 +8397,13 @@ namespace RepairAzVMDisk {
                 else { " -RecreateBootPartition restores GUID $($e.Guid) and moves the new ESP to GPT slot $($e.Slot) (it would otherwise land in slot $(if ($a.PredictedSlot) { $a.PredictedSlot } else { 'unknown' })), matching the saved entry." }
                 return "will NOT boot - there is no EFI System Partition.$after $notProof"
             }
-            default { return "cannot tell from the measured boot logs ($($a.Status))." }
+            default {
+                if ($a.SlotTie) {
+                    $list = (@($a.SlotSightings) | ForEach-Object { "slot $($_.Slot) ($($_.Seen)x)" }) -join ', '
+                    return "cannot tell - GUID $eGuid was recorded equally often in more than one GPT slot ($list), so the saved entry's slot is unknown. If you know which slot the VM last booted from in Azure, run -FixUefiBootEntry -EspSlot <n>."
+                }
+                return "cannot tell from the measured boot logs ($($a.Status))."
+            }
         }
     }
 
@@ -8332,6 +8453,11 @@ namespace RepairAzVMDisk {
         Write-Host "  Result          : $($a.Status) - $(Get-UefiBootStatusText -Analysis $a)" -ForegroundColor $color
         $color = switch ($a.AzureVerdict) { 'Match' { 'Green' } 'Unknown' { 'Yellow' } default { 'Red' } }
         Write-Host "  Azure TL / CVM  : $(Get-UefiAzureVerdictText -Analysis $a)" -ForegroundColor $color
+        if ($a.SlotConflict -and -not $a.SlotTie) {
+            $s0 = @($a.SlotSightings)[0]
+            $others = (@($a.SlotSightings) | Select-Object -Skip 1 | ForEach-Object { "slot $($_.Slot) ($($_.Seen)x, last $($_.LastSeen.ToString('yyyy-MM-dd HH:mm')))" }) -join ', '
+            Write-Host "  Slot conflict   : GUID $($s0.Guid) was recorded in GPT slot $($s0.Slot) ($($s0.Seen)x) and in $others. Azure TL never boots on a slot mismatch, so the most-used slot ($($s0.Slot)) is taken as the saved entry; the other sighting(s) are boots elsewhere (for example nested Hyper-V). To override, pass -EspSlot <n>." -ForegroundColor Yellow
+        }
         if ($a.SlotMoveNeeded) {
             $repairSwitch = if ($a.EspSlot) { '-FixUefiBootEntry' } else { '-RecreateBootPartition' }
             Write-Host "  Slot mismatch   : the saved entry uses GPT slot $($a.RequiredSlot) but the ESP $(if ($a.EspSlot) { "is in slot $($a.EspSlot)" } else { "would be created in slot $($a.PredictedSlot)" }). $repairSwitch moves it to slot $($a.RequiredSlot) (the partitions' location and contents are not changed)." -ForegroundColor Yellow
@@ -8423,6 +8549,22 @@ namespace RepairAzVMDisk {
             foreach ($e in $a.LatestLog.Entries) { Write-Host "  $($e.Name)  $($e.Description)`n      $($e.Path)" }
             $last = @($a.LatestLog.Loaded | Where-Object { $_.FilePath }) | Select-Object -Last 1
             if ($last) { Write-Host "  Last image loaded: $($last.Text)" }
+            if ($null -ne $a.LatestLog.DbCa2023 -or $null -ne $a.LatestLog.DbxPca2011) {
+                $yn = { param($v) if ($null -eq $v) { 'not measured' } elseif ($v) { 'yes' } else { 'NO' } }
+                Write-Host "  Secure Boot db : Windows UEFI CA 2023 = $(& $yn $a.LatestLog.DbCa2023); Windows Production PCA 2011 = $(& $yn $a.LatestLog.DbPca2011)"
+                Write-Host "  Secure Boot dbx: revokes Windows Production PCA 2011 = $(& $yn $a.LatestLog.DbxPca2011)"
+            }
+        }
+        if ($script:BootDriveLetter) {
+            $caNames = @{ UefiCa2023 = 'Windows UEFI CA 2023'; Pca2011 = 'Windows Production PCA 2011'; Unknown = 'no signature found' }
+            foreach ($rel in @('EFI\Microsoft\Boot\bootmgfw.efi', 'EFI\Boot\bootx64.efi')) {
+                $p = Join-Path $script:BootDriveLetter $rel
+                $fi = Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+                if (-not ($fi -and $fi.Length -gt 0)) { continue }
+                $sig = Get-UefiBootManagerSigner -Path $p
+                $who = if ($caNames.ContainsKey($sig.Ca)) { $caNames[$sig.Ca] } else { "other CA ($($sig.Issuer))" }
+                Write-Host "  Signed by      : \$rel -> $who"
+            }
         }
         if ($a.Status -eq 'NoEsp') {
             Write-Host "`nTo repair: .\Repair-AzVMDisk.ps1 -DiskNumber $($script:DiskNumber) -RecreateBootPartition" -ForegroundColor Yellow
@@ -16238,6 +16380,7 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
             }
 
             # UEFI boot entry match (measured boot logs) and stray \EFI copies
+            $uefiA = $null
             try {
                 $uefiA = Get-UefiBootAnalysis -DiskNumber $script:DiskNumber -WinRoot $script:WinDriveLetter
                 foreach ($s in @($uefiA.StrayEfi)) {
@@ -16251,10 +16394,14 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
                 $slotNote = if ($uefiA.SlotMoveNeeded) { " The entry also uses GPT slot $($uefiA.RequiredSlot) and the ESP is in slot $($uefiA.EspSlot); -FixUefiBootEntry moves it." } else { '' }
                 switch ($uefiA.Status) {
                     'Match' {
+                        $conflictNote = if ($uefiA.SlotConflict) { " (the GUID was also recorded in another slot: $((@($uefiA.SlotSightings) | ForEach-Object { "slot $($_.Slot) $($_.Seen)x" }) -join ', ') - boots elsewhere, e.g. nested Hyper-V)" } else { '' }
                         if ($uefiA.AzureVerdict -eq 'NoMatch') {
-                            & $emit 'BCD' (& $toSev $sevUefiEntryStale) "ESP GUID matches the firmware's 'Windows Boot Manager' entry, but the entry uses GPT slot $($uefiA.AzureEntry.Slot) and the ESP is in slot $($uefiA.EspSlot) - Trusted Launch/CVM will not find the boot loader" '-FixUefiBootEntry'
+                            & $emit 'BCD' (& $toSev $sevUefiEntryStale) "ESP GUID matches the firmware's 'Windows Boot Manager' entry, but the entry uses GPT slot $($uefiA.AzureEntry.Slot) and the ESP is in slot $($uefiA.EspSlot) - Trusted Launch/CVM will not find the boot loader$conflictNote" '-FixUefiBootEntry'
                         }
-                        else { & $emit 'BCD' 'OK' "ESP GUID and GPT slot match the firmware's most recent 'Windows Boot Manager' entry" }
+                        elseif ($uefiA.SlotTie) {
+                            & $emit 'BCD' 'WARN' "ESP GUID matches the firmware's 'Windows Boot Manager' entry, but it was recorded equally often in more than one GPT slot$conflictNote - the slot Trusted Launch/CVM expects is unknown" '-GetUefiBootEntry'
+                        }
+                        else { & $emit 'BCD' 'OK' "ESP GUID and GPT slot match the firmware's 'Windows Boot Manager' entry$conflictNote" }
                     }
                     'Stale' {
                         & $emit 'BCD' (& $toSev $sevUefiEntryStale) "Firmware 'Windows Boot Manager' entry points at ESP GUID $($uefiA.Target.Guid), which is no longer on the disk (current ESP: $($uefiA.EspGuid)) - Trusted Launch/CVM will not find the boot loader.$slotNote" '-FixUefiBootEntry'
@@ -16470,6 +16617,24 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
                     $x64Sev = if ($efiX64Sig.IsHardFailure) { 'CRIT' } else { & $toSev $sevBinarySignatureBad }
                     & $emit 'Security' $x64Sev "bootx64.efi failed trust validation - $(Get-TrustStateDescription -Signature $efiX64Sig)" $bcdFix
                 }
+            }
+
+            # Secure Boot CA of the ESP boot managers vs the db/dbx the firmware last measured
+            try {
+                $caLoaders = @()
+                foreach ($pair in @(@('bootmgfw.efi', $efiBootmgfw), @('bootx64.efi', $efiBootx64))) {
+                    $fi = Get-Item -LiteralPath $pair[1] -Force -ErrorAction SilentlyContinue
+                    if ($fi -and $fi.Length -gt 0) {
+                        $caLoaders += [pscustomobject]@{ Name = $pair[0]; Ca = (Get-UefiBootManagerSigner -Path $pair[1]).Ca }
+                    }
+                }
+                $caFw = if (Get-Variable -Name uefiA -ValueOnly -ErrorAction SilentlyContinue) { $uefiA.LatestLog } else { $null }
+                foreach ($f in @(Get-UefiSigningCaFindings -Loaders $caLoaders -Firmware $caFw)) {
+                    & $emit 'SecureBoot' $f.Severity $f.Message $f.Fix
+                }
+            }
+            catch {
+                & $emit 'SecureBoot' 'INFO' "Boot manager signing CA check skipped: $($_.Exception.Message)"
             }
         }
 

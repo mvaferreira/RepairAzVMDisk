@@ -111,6 +111,10 @@ You can also target a Hyper-V VM by name instead of disk number:
 # Gen2: check whether the VM's saved UEFI 'Windows Boot Manager' entry still matches the ESP.
 # Trusted Launch and Confidential VMs keep that entry and only boot when the ESP has the
 # original partition GUID and GPT slot (start offset and size do not need to match).
+# When the logs record the ESP under more than one GPT slot (for example after the disk was
+# booted once on nested Hyper-V), the slot the firmware recorded most often is used.
+# Also reports which Secure Boot CA signed the ESP boot manager (Windows Production PCA 2011
+# or Windows UEFI CA 2023) and whether the Secure Boot db in the newest log trusts it.
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -GetUefiBootEntry
 
 # Gen2: give the ESP back its original GUID and GPT slot, as read from the Measured Boot logs.
@@ -592,7 +596,7 @@ first.
 | **0xC0000359** | "Critical system driver is missing or corrupt" | A 32-bit system driver was installed on the x64 Windows guest | `-RepairSystemFile <driver.sys>` | [0xC0000359][c359] |
 | "An operating system wasn't found" / **0xC000000E** | Boot manager finds no bootable OS | Inactive/missing boot partition or empty BCD | `-FixBoot` → `-RecreateBootPartition` → `-FixBootSector` | [OS not found][osnf] |
 | "Unknown Device – The boot loader did not load an operating system" (Gen2) | UEFI firmware cannot resolve the saved 'Windows Boot Manager' entry | ESP was recreated or moved, so its partition GUID or GPT slot no longer matches the entry Trusted Launch / Confidential VMs keep | `-GetUefiBootEntry` → `-FixUefiBootEntry` (or `-RecreateBootPartition` when no ESP exists) | — |
-| **0x0000007B** | INACCESSIBLE_BOOT_DEVICE | Storage driver `Start`/filters/SAN policy after migration | `-FixBootStorageDrivers` → `-EnsureSyntheticDriversEnabled` → `-FixDeviceFilters` → `-FixSanPolicy` | [INACCESSIBLE_BOOT_DEVICE][7b], [Server 2012 R2 / platform update][2012] |
+| "The boot loader failed" (Gen2, Secure Boot on) | Secure Boot rejects the boot manager's signature | The ESP boot manager is signed by Windows UEFI CA 2023, but the platform's Secure Boot `db` (for example an older Hyper-V Gen2 VM) does not contain that CA | `-GetUefiBootEntry` / `-SysCheck` to confirm the signing CA → boot on a platform whose `db` has CA 2023 (for example a newly created Hyper-V Gen2 VM on an updated host) | — || **0x0000007B** | INACCESSIBLE_BOOT_DEVICE | Storage driver `Start`/filters/SAN policy after migration | `-FixBootStorageDrivers` → `-EnsureSyntheticDriversEnabled` → `-FixDeviceFilters` → `-FixSanPolicy` | [INACCESSIBLE_BOOT_DEVICE][7b], [Server 2012 R2 / platform update][2012] |
 | **0x000000ED** | UNMOUNTABLE_BOOT_VOLUME | File-system corruption on boot volume | `-CheckDiskHealth` → `-FixFileSystem` | [Check-disk boot error][chk] |
 | **0x00000074** / **0xC000014C** | BAD_SYSTEM_CONFIG_INFO / STATUS_REGISTRY_CORRUPT | Corrupt SYSTEM/SOFTWARE hive | `-CheckRegistryHealth` → `-FixRegistryCorruption` → `-RestoreRegistryFromRegBack` | [Fix corrupted hive][hive] |
 | **0xC0000218** | STATUS_CANNOT_LOAD_REGISTRY_FILE | Registry hive missing, 0-byte, or unreadable | `-RestoreRegistryFromRegBack` → `-FixRegistryCorruption` | [0xC0000218][c218], [Fix corrupted hive][hive] |
