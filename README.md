@@ -59,6 +59,21 @@ You can also target a Hyper-V VM by name instead of disk number:
 # credential guard, network bindings, Azure VM agent, and more
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -SysCheck
 
+# Faster, focused check: limit -SysCheck to one or more areas. The other areas'
+# checks are skipped, not just hidden. Disk/file-system, control-set and OS
+# information are always reported.
+#   -BootOnly          BCD, ESP/UEFI, hives, boot files and boot drivers
+#   -RDPOnly           listener, NLA/CredSSP, certificate, firewall
+#   -ConnectivityOnly  TCP/IP, bindings, DNS, proxy, Azure VM agent
+#   -UpdateOnly        pending operations, Windows Update / CBS servicing
+#   -SecurityOnly      signatures, Secure Boot, LSA, AppLocker
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -SysCheck -BootOnly
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -SysCheck -BootOnly -RDPOnly
+
+# Also save the full -SysCheck output to Repair-AzVMDisk_SysCheck.txt next to
+# the script (overwritten on each run) - handy for sharing the results
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -SysCheck -SaveOutput
+
 # Check disk health (SMART-like status)
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -CheckDiskHealth
 
@@ -520,6 +535,11 @@ For advanced troubleshooting, you can load offline registry hives to inspect the
 ### Session Logging
 
 All actions are logged to a JSON-line audit file (`Repair-AzVMDisk_actions.log`) alongside the script.
+
+`-SysCheck -SaveOutput` additionally writes the complete console output of the check to
+`Repair-AzVMDisk_SysCheck.txt` alongside the script, replacing the previous file. Under Windows
+PowerShell 5.1 the file starts with the standard PowerShell transcript header, which includes the
+computer and user name - review it before sharing.
 
 ```powershell
 # Review the last repair session

@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.9.4
+        Version: 0.9.5
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -205,6 +205,14 @@
     .EXAMPLE
         # Run a full diagnostic check on disk 3
         PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -SysCheck
+
+    .EXAMPLE
+        # Check only the boot and RDP areas (faster - the other areas are skipped)
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -SysCheck -BootOnly -RDPOnly
+
+    .EXAMPLE
+        # Full check, also saved to Repair-AzVMDisk_SysCheck.txt next to the script
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -SysCheck -SaveOutput
 
     .EXAMPLE
         # Repair the RPC service-host path mismatch reported by -SysCheck
@@ -442,7 +450,8 @@ dynamicparam {
         'FixDeviceFilters',
         'AnalyzeRecentChanges',
         'FixTxRLogs',
-        'ShowLastSession'
+        'ShowLastSession',
+        'SysCheck'
     )
     $hasSubParameterParent = @(
         $subParameterParents | Where-Object { $PSBoundParameters.ContainsKey($_) }
@@ -509,6 +518,15 @@ dynamicparam {
     if ($PSBoundParameters.ContainsKey('GetServicesReport')) {
         & $addParam 'IncludeServices' ([switch]) 'Repair' $null
         & $addParam 'IssuesOnly'      ([switch]) 'Repair' $null
+    }
+    # -BootOnly, -RDPOnly, -ConnectivityOnly, -UpdateOnly, -SecurityOnly, -SaveOutput: sub-options of -SysCheck
+    if ($PSBoundParameters.ContainsKey('SysCheck')) {
+        & $addParam 'BootOnly'         ([switch]) 'Repair' $null
+        & $addParam 'RDPOnly'          ([switch]) 'Repair' $null
+        & $addParam 'ConnectivityOnly' ([switch]) 'Repair' $null
+        & $addParam 'UpdateOnly'       ([switch]) 'Repair' $null
+        & $addParam 'SecurityOnly'     ([switch]) 'Repair' $null
+        & $addParam 'SaveOutput'       ([switch]) 'Repair' $null
     }
     # -IncludeHealthy: sub-option of -GetCatalogStoreReport
     if ($PSBoundParameters.ContainsKey('GetCatalogStoreReport')) {
@@ -15834,8 +15852,10 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
         $guestComputerName = $script:GuestComputerName
         $guestLabel = if ($guestComputerName) { "  Guest: $guestComputerName" } else { '' }
 
+        $areaLabel = if ($script:SysCheckAreas -and @($script:SysCheckAreas).Count -gt 0) { "  |  Areas: $(@($script:SysCheckAreas) -join ', ')" } else { '' }
+
         Write-Host "`n===================================================================" -ForegroundColor Cyan
-        Write-Host "  Offline System Health Check" -ForegroundColor Cyan
+        Write-Host "  Offline System Health Check$areaLabel" -ForegroundColor Cyan
         Write-Host "  Disk $script:DiskNumber  |  Windows: $script:WinDriveLetter  |  Boot: $script:BootDriveLetter  |  Gen$script:VMGen$guestLabel" -ForegroundColor Cyan
         Write-Host "===================================================================`n" -ForegroundColor Cyan
 
@@ -15845,6 +15865,15 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
         # documented default rather than carrying a value over from an earlier call.
         $script:_sysCheckRdpPort = 3389
         $scriptFile = if ($PSCommandPath) { Split-Path -Leaf $PSCommandPath } else { 'Repair-AzVMDisk.ps1' }
+
+        # Area filter (-BootOnly, -RDPOnly, -ConnectivityOnly, -UpdateOnly, -SecurityOnly).
+        # A section runs when no filter is set or when it belongs to any selected area.
+        $inArea = {
+            param([string[]]$Area)
+            if (-not $script:SysCheckAreas -or @($script:SysCheckAreas).Count -eq 0) { return $true }
+            foreach ($a in $Area) { if (@($script:SysCheckAreas) -contains $a) { return $true } }
+            return $false
+        }
 
         # Inline helper: emit one finding to the console and add it to $findings.
         # Called as: & $emit 'Category' 'CRIT|WARN|INFO|OK' 'Message' '-FixParam'
@@ -16234,566 +16263,591 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
         catch { Write-Warning "Disk space check failed: $_" }
 
         # -- 2. Crash & Boot Artefacts --------------------------------------------
-        Write-Host "--- Crash & Boot Artefacts" -ForegroundColor DarkGray
-        $minidumpDir = Join-Path $script:WinDriveLetter 'Windows\Minidump'
-        if (Test-Path $minidumpDir) {
-            $dumps = @(Get-ChildItem $minidumpDir -Filter '*.dmp' -ErrorAction SilentlyContinue)
-            if ($dumps.Count -gt 0) {
-                $newest = $dumps | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-                & $emit 'Crash' (& $toSev $sevCrashMinidumps) "$($dumps.Count) minidump(s) found - latest: $($newest.Name) [$($newest.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))]" "-CollectEventLogs"
+        if (& $inArea 'Boot', 'Update') {
+            Write-Host "--- Crash & Boot Artefacts" -ForegroundColor DarkGray
+            $minidumpDir = Join-Path $script:WinDriveLetter 'Windows\Minidump'
+            if (Test-Path $minidumpDir) {
+                $dumps = @(Get-ChildItem $minidumpDir -Filter '*.dmp' -ErrorAction SilentlyContinue)
+                if ($dumps.Count -gt 0) {
+                    $newest = $dumps | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                    & $emit 'Crash' (& $toSev $sevCrashMinidumps) "$($dumps.Count) minidump(s) found - latest: $($newest.Name) [$($newest.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))]" "-CollectEventLogs"
+                }
+                else { & $emit 'Crash' 'OK' 'No minidump files' }
             }
-            else { & $emit 'Crash' 'OK' 'No minidump files' }
-        }
-        else { & $emit 'Crash' 'OK' 'No Minidump folder' }
+            else { & $emit 'Crash' 'OK' 'No Minidump folder' }
 
-        # A complete/kernel dump is written to a single file rather than the Minidump
-        # folder, so a guest that bugchecks with CrashDumpEnabled=1 leaves this behind and
-        # nothing in Minidump. Reporting only the folder made a crashed guest look clean.
-        $memoryDumpPath = Join-Path $script:WinDriveLetter 'Windows\MEMORY.DMP'
-        $memoryDumpItem = Get-Item -LiteralPath $memoryDumpPath -Force -ErrorAction SilentlyContinue
-        if ($memoryDumpItem -and -not $memoryDumpItem.PSIsContainer -and $memoryDumpItem.Length -gt 0) {
-            $memoryDumpMB = [math]::Round($memoryDumpItem.Length / 1MB, 1)
-            & $emit 'Crash' (& $toSev $sevCrashMinidumps) "MEMORY.DMP present ($memoryDumpMB MB, written $($memoryDumpItem.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))) - the guest bugchecked; collect it for the stop code" "-CollectCrashDumps"
-        }
+            # A complete/kernel dump is written to a single file rather than the Minidump
+            # folder, so a guest that bugchecks with CrashDumpEnabled=1 leaves this behind and
+            # nothing in Minidump. Reporting only the folder made a crashed guest look clean.
+            $memoryDumpPath = Join-Path $script:WinDriveLetter 'Windows\MEMORY.DMP'
+            $memoryDumpItem = Get-Item -LiteralPath $memoryDumpPath -Force -ErrorAction SilentlyContinue
+            if ($memoryDumpItem -and -not $memoryDumpItem.PSIsContainer -and $memoryDumpItem.Length -gt 0) {
+                $memoryDumpMB = [math]::Round($memoryDumpItem.Length / 1MB, 1)
+                & $emit 'Crash' (& $toSev $sevCrashMinidumps) "MEMORY.DMP present ($memoryDumpMB MB, written $($memoryDumpItem.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))) - the guest bugchecked; collect it for the stop code" "-CollectCrashDumps"
+            }
 
-        $ntbtlogpath = Join-Path $script:WinDriveLetter 'Windows\ntbtlog.txt'
-        if (Test-Path $ntbtlogpath) {
-            & $emit 'Boot' (& $toSev $sevBootNtbtlog) "$($ntbtlogpath) present - check for DIDNOTLOAD entries" "-CollectEventLogs"
-        }
+            $ntbtlogpath = Join-Path $script:WinDriveLetter 'Windows\ntbtlog.txt'
+            if (Test-Path $ntbtlogpath) {
+                & $emit 'Boot' (& $toSev $sevBootNtbtlog) "$($ntbtlogpath) present - check for DIDNOTLOAD entries" "-CollectEventLogs"
+            }
 
-        $pendingXmlPresent = Test-Path (Join-Path $script:WinDriveLetter 'Windows\WinSxS\pending.xml')
-        if ($pendingXmlPresent) {
-            & $emit 'WindowsUpdate' (& $toSev $sevUpdatePendingXml) 'Pending Windows Update transaction (pending.xml) - may cause boot loop on Configuring Updates screen' "-FixPendingUpdates"
-        }
+            $pendingXmlPresent = Test-Path (Join-Path $script:WinDriveLetter 'Windows\WinSxS\pending.xml')
+            if ($pendingXmlPresent) {
+                & $emit 'WindowsUpdate' (& $toSev $sevUpdatePendingXml) 'Pending Windows Update transaction (pending.xml) - may cause boot loop on Configuring Updates screen' "-FixPendingUpdates"
+            }
 
-        # 0x800719e4 / ERROR_LOG_FULL - the CLFS/KTM transaction logs are exhausted, so
-        # servicing cannot commit. Clearing the logs is the documented repair; reverting
-        # pending updates is not needed and is heavier than the scenario calls for.
-        # Evaluated before the TxR/SMI checks below because it is what makes the presence
-        # of those files meaningful.
-        # https://learn.microsoft.com/troubleshoot/windows-server/installing-updates-features-roles/error-0x800719e4-windows-update-fails
-        $logFullHits = @()
-        $cbsLogPath = Join-Path $script:WinDriveLetter 'Windows\Logs\CBS\CBS.log'
-        if (Test-Path $cbsLogPath) {
-            try {
-                $cbsTail = Get-Content -LiteralPath $cbsLogPath -Tail 4000 -ErrorAction Stop
-                $logFullHits = @($cbsTail | Where-Object {
-                        $_ -match '0x800719e4' -or
-                        $_ -match 'ERROR_LOG_FULL' -or
-                        $_ -match 'Failed while processing non-critical driver operations queue'
-                    })
-                if ($logFullHits.Count -gt 0) {
-                    & $emit 'WindowsUpdate' (& $toSev $sevUpdateLogFull) "CBS.log reports transaction log exhaustion ($($logFullHits.Count) hit(s), e.g. 0x800719e4/ERROR_LOG_FULL) - see KB error-0x800719e4-windows-update-fails" "-FixTxRLogs"
+            # 0x800719e4 / ERROR_LOG_FULL - the CLFS/KTM transaction logs are exhausted, so
+            # servicing cannot commit. Clearing the logs is the documented repair; reverting
+            # pending updates is not needed and is heavier than the scenario calls for.
+            # Evaluated before the TxR/SMI checks below because it is what makes the presence
+            # of those files meaningful.
+            # https://learn.microsoft.com/troubleshoot/windows-server/installing-updates-features-roles/error-0x800719e4-windows-update-fails
+            $logFullHits = @()
+            $cbsLogPath = Join-Path $script:WinDriveLetter 'Windows\Logs\CBS\CBS.log'
+            if (Test-Path $cbsLogPath) {
+                try {
+                    $cbsTail = Get-Content -LiteralPath $cbsLogPath -Tail 4000 -ErrorAction Stop
+                    $logFullHits = @($cbsTail | Where-Object {
+                            $_ -match '0x800719e4' -or
+                            $_ -match 'ERROR_LOG_FULL' -or
+                            $_ -match 'Failed while processing non-critical driver operations queue'
+                        })
+                    if ($logFullHits.Count -gt 0) {
+                        & $emit 'WindowsUpdate' (& $toSev $sevUpdateLogFull) "CBS.log reports transaction log exhaustion ($($logFullHits.Count) hit(s), e.g. 0x800719e4/ERROR_LOG_FULL) - see KB error-0x800719e4-windows-update-fails" "-FixTxRLogs"
+                    }
+                }
+                catch {
+                    # SysCheck is read-only; a locked or unreadable CBS.log must not fail it.
+                    Write-Verbose "CBS.log could not be read for transaction log analysis: $($_.Exception.Message)"
                 }
             }
-            catch {
-                # SysCheck is read-only; a locked or unreadable CBS.log must not fail it.
-                Write-Verbose "CBS.log could not be read for transaction log analysis: $($_.Exception.Message)"
-            }
-        }
-        $servicingStuck = ($logFullHits.Count -gt 0) -or $pendingXmlPresent
+            $servicingStuck = ($logFullHits.Count -gt 0) -or $pendingXmlPresent
 
-        # Transaction log files in config\TxR and SMI\Store\Machine.
-        #
-        # Presence alone is NOT a fault. Every healthy Windows installation keeps these
-        # files - verified on clean Server 2012 R2, 2016, 2019 and 2022 images, all of
-        # which carry a full set. Reporting them as a problem produces a warning on every
-        # machine ever scanned, so they are reported as INFO and only become actionable
-        # when something else shows servicing is genuinely stuck.
-        #
-        # Note the -Force on the enumeration. These files are Hidden+System, so a plain
-        # Get-ChildItem returns nothing at all and the check can never fire.
-        $txrFolder = Join-Path $script:WinDriveLetter 'Windows\System32\config\TxR'
-        if (Test-Path $txrFolder) {
-            $txrFiles = @(Get-ChildItem $txrFolder -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @('.blf', '.regtrans-ms') })
-            if ($txrFiles.Count -gt 0) {
-                $txrKB = [math]::Round((($txrFiles | Measure-Object -Property Length -Sum).Sum) / 1KB)
-                if ($servicingStuck) {
-                    & $emit 'WindowsUpdate' (& $toSev $sevUpdateTxRLogs) "$($txrFiles.Count) TxR transaction log file(s) in config\TxR ($txrKB KB) alongside evidence that servicing is stuck - clearing them is the documented repair" "-FixTxRLogs"
-                }
-                else {
-                    & $emit 'WindowsUpdate' 'INFO' "config\TxR holds $($txrFiles.Count) transaction log file(s) ($txrKB KB) - normal for a healthy installation, no action needed"
+            # Transaction log files in config\TxR and SMI\Store\Machine.
+            #
+            # Presence alone is NOT a fault. Every healthy Windows installation keeps these
+            # files - verified on clean Server 2012 R2, 2016, 2019 and 2022 images, all of
+            # which carry a full set. Reporting them as a problem produces a warning on every
+            # machine ever scanned, so they are reported as INFO and only become actionable
+            # when something else shows servicing is genuinely stuck.
+            #
+            # Note the -Force on the enumeration. These files are Hidden+System, so a plain
+            # Get-ChildItem returns nothing at all and the check can never fire.
+            $txrFolder = Join-Path $script:WinDriveLetter 'Windows\System32\config\TxR'
+            if (Test-Path $txrFolder) {
+                $txrFiles = @(Get-ChildItem $txrFolder -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @('.blf', '.regtrans-ms') })
+                if ($txrFiles.Count -gt 0) {
+                    $txrKB = [math]::Round((($txrFiles | Measure-Object -Property Length -Sum).Sum) / 1KB)
+                    if ($servicingStuck) {
+                        & $emit 'WindowsUpdate' (& $toSev $sevUpdateTxRLogs) "$($txrFiles.Count) TxR transaction log file(s) in config\TxR ($txrKB KB) alongside evidence that servicing is stuck - clearing them is the documented repair" "-FixTxRLogs"
+                    }
+                    else {
+                        & $emit 'WindowsUpdate' 'INFO' "config\TxR holds $($txrFiles.Count) transaction log file(s) ($txrKB KB) - normal for a healthy installation, no action needed"
+                    }
                 }
             }
-        }
 
-        $smiFolder = Join-Path $script:WinDriveLetter 'Windows\System32\SMI\Store\Machine'
-        if (Test-Path $smiFolder) {
-            $smiFiles = @(Get-ChildItem $smiFolder -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @('.blf', '.regtrans-ms') })
-            if ($smiFiles.Count -gt 0) {
-                $smiKB = [math]::Round((($smiFiles | Measure-Object -Property Length -Sum).Sum) / 1KB)
-                if ($servicingStuck) {
-                    & $emit 'WindowsUpdate' (& $toSev $sevUpdateSmiLogs) "$($smiFiles.Count) SMI Store transaction log file(s) ($smiKB KB) alongside evidence that servicing is stuck" "-FixTxRLogs -TransactionLogScope SMI"
-                }
-                else {
-                    & $emit 'WindowsUpdate' 'INFO' "SMI\Store\Machine holds $($smiFiles.Count) transaction log file(s) ($smiKB KB) - normal for a healthy installation, no action needed"
+            $smiFolder = Join-Path $script:WinDriveLetter 'Windows\System32\SMI\Store\Machine'
+            if (Test-Path $smiFolder) {
+                $smiFiles = @(Get-ChildItem $smiFolder -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @('.blf', '.regtrans-ms') })
+                if ($smiFiles.Count -gt 0) {
+                    $smiKB = [math]::Round((($smiFiles | Measure-Object -Property Length -Sum).Sum) / 1KB)
+                    if ($servicingStuck) {
+                        & $emit 'WindowsUpdate' (& $toSev $sevUpdateSmiLogs) "$($smiFiles.Count) SMI Store transaction log file(s) ($smiKB KB) alongside evidence that servicing is stuck" "-FixTxRLogs -TransactionLogScope SMI"
+                    }
+                    else {
+                        & $emit 'WindowsUpdate' 'INFO' "SMI\Store\Machine holds $($smiFiles.Count) transaction log file(s) ($smiKB KB) - normal for a healthy installation, no action needed"
+                    }
                 }
             }
         }
 
         # -- 2b. Registry Hive Files -----------------------------------------------
-        Write-Host "--- Registry Hive Files" -ForegroundColor DarkGray
-        $configDir = Join-Path $script:WinDriveLetter 'Windows\System32\config'
-        $expectedHives = @(
-            @{ Name = 'SYSTEM';       IsCrit = $true;  Desc = 'kernel config - BSOD 0xC0000218 if missing' }
-            @{ Name = 'SOFTWARE';     IsCrit = $true;  Desc = 'app/system config - BSOD 0xC0000218 if missing' }
-            @{ Name = 'SAM';          IsCrit = $true;  Desc = 'account database - logon failure if missing' }
-            @{ Name = 'SECURITY';     IsCrit = $true;  Desc = 'security policy - logon failure if missing' }
-            @{ Name = 'DEFAULT';      IsCrit = $false; Desc = 'default user profile hive' }
-            @{ Name = 'COMPONENTS';   IsCrit = $false; Desc = 'CBS/servicing store - update/install failures' }
-            @{ Name = 'BCD-Template'; IsCrit = $false; Desc = 'bcdboot template - needed only for BCD rebuild' }
-            @{ Name = 'DRIVERS';      IsCrit = $false; Desc = 'driver database' }
-        )
-        $hiveIssues = 0
-        foreach ($h in $expectedHives) {
-            $hivePath = Join-Path $configDir $h.Name
-            $hiveItem = Get-Item -LiteralPath $hivePath -Force -ErrorAction SilentlyContinue
-            if (-not $hiveItem) {
-                $missingSev = if ($h.IsCrit) { & $toSev $sevHiveMissing } else { 'WARN' }
-                & $emit 'Registry' $missingSev "$($h.Name) hive MISSING ($hivePath) - $($h.Desc)" '-RestoreRegistryFromRegBack'
-                $hiveIssues++
+        if (& $inArea 'Boot') {
+            Write-Host "--- Registry Hive Files" -ForegroundColor DarkGray
+            $configDir = Join-Path $script:WinDriveLetter 'Windows\System32\config'
+            $expectedHives = @(
+                @{ Name = 'SYSTEM';       IsCrit = $true;  Desc = 'kernel config - BSOD 0xC0000218 if missing' }
+                @{ Name = 'SOFTWARE';     IsCrit = $true;  Desc = 'app/system config - BSOD 0xC0000218 if missing' }
+                @{ Name = 'SAM';          IsCrit = $true;  Desc = 'account database - logon failure if missing' }
+                @{ Name = 'SECURITY';     IsCrit = $true;  Desc = 'security policy - logon failure if missing' }
+                @{ Name = 'DEFAULT';      IsCrit = $false; Desc = 'default user profile hive' }
+                @{ Name = 'COMPONENTS';   IsCrit = $false; Desc = 'CBS/servicing store - update/install failures' }
+                @{ Name = 'BCD-Template'; IsCrit = $false; Desc = 'bcdboot template - needed only for BCD rebuild' }
+                @{ Name = 'DRIVERS';      IsCrit = $false; Desc = 'driver database' }
+            )
+            $hiveIssues = 0
+            foreach ($h in $expectedHives) {
+                $hivePath = Join-Path $configDir $h.Name
+                $hiveItem = Get-Item -LiteralPath $hivePath -Force -ErrorAction SilentlyContinue
+                if (-not $hiveItem) {
+                    $missingSev = if ($h.IsCrit) { & $toSev $sevHiveMissing } else { 'WARN' }
+                    & $emit 'Registry' $missingSev "$($h.Name) hive MISSING ($hivePath) - $($h.Desc)" '-RestoreRegistryFromRegBack'
+                    $hiveIssues++
+                }
+                elseif ($hiveItem.Length -eq 0) {
+                    $emptySev = if ($h.IsCrit) { & $toSev $sevHiveEmpty } else { 'WARN' }
+                    & $emit 'Registry' $emptySev "$($h.Name) hive is 0 bytes ($hivePath) - $($h.Desc)" '-RestoreRegistryFromRegBack'
+                    $hiveIssues++
+                }
             }
-            elseif ($hiveItem.Length -eq 0) {
-                $emptySev = if ($h.IsCrit) { & $toSev $sevHiveEmpty } else { 'WARN' }
-                & $emit 'Registry' $emptySev "$($h.Name) hive is 0 bytes ($hivePath) - $($h.Desc)" '-RestoreRegistryFromRegBack'
-                $hiveIssues++
+            if ($hiveIssues -eq 0) {
+                & $emit 'Registry' 'OK' "All expected registry hive files present and non-empty ($($expectedHives.Count) checked)"
             }
-        }
-        if ($hiveIssues -eq 0) {
-            & $emit 'Registry' 'OK' "All expected registry hive files present and non-empty ($($expectedHives.Count) checked)"
         }
 
         # -- 3. BCD ---------------------------------------------------------------
-        Write-Host "--- BCD / Boot Configuration" -ForegroundColor DarkGray
+        if (& $inArea 'Boot') {
+            Write-Host "--- BCD / Boot Configuration" -ForegroundColor DarkGray
 
-        # Check for missing boot partition (System Reserved on Gen1, EFI System Partition on Gen2)
-        $scPartitions = Get-Partition -DiskNumber $script:DiskNumber -ErrorAction SilentlyContinue
-        $bootPartMissing = $false
-        if ($script:VMGen -eq 2) {
-            $espExists = $scPartitions | Where-Object { $_.Type -eq 'System' }
-            if (-not $espExists) {
-                & $emit 'BCD' (& $toSev $sevBootPartitionMissing) "EFI System Partition is MISSING - Gen2 (UEFI) VM cannot boot without it" "-RecreateBootPartition"
-                $bootPartMissing = $true
-            }
-            else {
-                & $emit 'BCD' 'OK' "EFI System Partition present (Partition $($espExists.PartitionNumber))"
-            }
-
-            # UEFI boot entry match (measured boot logs) and stray \EFI copies
-            $uefiA = $null
-            try {
-                $uefiA = Get-UefiBootAnalysis -DiskNumber $script:DiskNumber -WinRoot $script:WinDriveLetter
-                foreach ($s in @($uefiA.StrayEfi)) {
-                    if ($s.IsFat) {
-                        & $emit 'BCD' (& $toSev $sevStrayEfiFat) "Non-ESP FAT partition $($s.PartitionNumber) holds EFI boot files ($($s.Path)) - the firmware fallback can load its BCD instead of the ESP (winload 0xc000000e)" $(if ($uefiA.Status -eq 'NoEsp') { '-RecreateBootPartition' } else { '-FixUefiBootEntry' })
-                    }
-                    else {
-                        & $emit 'BCD' (& $toSev $sevStrayEfiNtfs) "Non-ESP $($s.FileSystem) partition $($s.PartitionNumber) holds EFI boot files ($($s.Path)) - not used by the firmware, but may confuse repairs" ''
-                    }
-                }
-                $slotNote = if ($uefiA.SlotMoveNeeded) { " The entry also uses GPT slot $($uefiA.RequiredSlot) and the ESP is in slot $($uefiA.EspSlot); -FixUefiBootEntry moves it." } else { '' }
-                switch ($uefiA.Status) {
-                    'Match' {
-                        $conflictNote = if ($uefiA.SlotConflict) { " (the GUID was also recorded in another slot: $((@($uefiA.SlotSightings) | ForEach-Object { "slot $($_.Slot) $($_.Seen)x" }) -join ', ') - boots elsewhere, e.g. nested Hyper-V)" } else { '' }
-                        if ($uefiA.AzureVerdict -eq 'NoMatch') {
-                            & $emit 'BCD' (& $toSev $sevUefiEntryStale) "ESP GUID matches the firmware's 'Windows Boot Manager' entry, but the entry uses GPT slot $($uefiA.AzureEntry.Slot) and the ESP is in slot $($uefiA.EspSlot) - Trusted Launch/CVM will not find the boot loader$conflictNote" '-FixUefiBootEntry'
-                        }
-                        elseif ($uefiA.SlotTie) {
-                            & $emit 'BCD' 'WARN' "ESP GUID matches the firmware's 'Windows Boot Manager' entry, but it was recorded equally often in more than one GPT slot$conflictNote - the slot Trusted Launch/CVM expects is unknown" '-GetUefiBootEntry'
-                        }
-                        else { & $emit 'BCD' 'OK' "ESP GUID and GPT slot match the firmware's 'Windows Boot Manager' entry$conflictNote" }
-                    }
-                    'Stale' {
-                        & $emit 'BCD' (& $toSev $sevUefiEntryStale) "Firmware 'Windows Boot Manager' entry points at ESP GUID $($uefiA.Target.Guid), which is no longer on the disk (current ESP: $($uefiA.EspGuid)) - Trusted Launch/CVM will not find the boot loader.$slotNote" '-FixUefiBootEntry'
-                    }
-                    'Mixed' { & $emit 'BCD' (& $toSev $sevUefiEntryMixed) "ESP GUID matches an older firmware 'Windows Boot Manager' entry, but a newer boot recorded a different GUID (disk booted on another host?)" '-GetUefiBootEntry' }
-                    'Replaced' {
-                        & $emit 'BCD' (& $toSev $sevUefiEntryMixed) "ESP was recreated: previous ESP GUID $($uefiA.Target.Guid) (GPT slot $($uefiA.Target.Slot)) is no longer on the disk (current ESP: $($uefiA.EspGuid)). Trusted Launch/CVM keep the old entry and will not find the boot loader until the ESP gets that GUID and slot back.$slotNote" '-FixUefiBootEntry'
-                    }
-                    'Ambiguous' { & $emit 'BCD' (& $toSev $sevUefiEntryMixed) "Recorded firmware 'Windows Boot Manager' GUIDs belong to other partitions, not the ESP" '-GetUefiBootEntry' }
-                    'MultipleEsp' { & $emit 'BCD' 'WARN' "More than one EFI System Partition on the disk" '-GetUefiBootEntry' }
-                    'NoLogs' { & $emit 'BCD' 'INFO' "No 'Windows Boot Manager' entry in the measured boot logs - UEFI boot entry match not checked" }
-                    'NoEsp' {
-                        if ($uefiA.Target) { & $emit 'BCD' 'INFO' "Previous ESP GUID $($uefiA.Target.Guid) (GPT slot $($uefiA.Target.Slot)) found in the measured boot logs - -RecreateBootPartition will restore it$(if ($uefiA.Target.Slot) { " and place the ESP in GPT slot $($uefiA.Target.Slot)" })" }
-                    }
-                }
-            }
-            catch {
-                & $emit 'BCD' 'INFO' "UEFI boot entry check skipped: $($_.Exception.Message)"
-            }
-        }
-        else {
-            # Gen1: check if a separate boot partition exists (Active partition != Windows partition)
-            $winTrimmed = $script:WinDriveLetter.TrimEnd('\')
-            $separateBootPart = $scPartitions | Where-Object {
-                $_.IsActive -and ($_.AccessPaths | Where-Object { $_ -and $_.TrimEnd('\') -ne $winTrimmed })
-            }
-            if (-not $separateBootPart) {
-                # Check if Windows partition is Active (single-partition layout)
-                $winIsActive = $scPartitions | Where-Object {
-                    $_.AccessPaths | Where-Object { $_ -and $_.TrimEnd('\') -eq $winTrimmed }
-                } | Where-Object { $_.IsActive }
-                if ($winIsActive) {
-                    & $emit 'BCD' 'OK' "No separate System Reserved partition - Windows partition is Active (single-partition layout)"
-                }
-                else {
-                    & $emit 'BCD' (& $toSev $sevBootPartitionMissing) "No bootable partition found - System Reserved partition is missing and Windows partition is not Active" "-RecreateBootPartition"
+            # Check for missing boot partition (System Reserved on Gen1, EFI System Partition on Gen2)
+            $scPartitions = Get-Partition -DiskNumber $script:DiskNumber -ErrorAction SilentlyContinue
+            $bootPartMissing = $false
+            if ($script:VMGen -eq 2) {
+                $espExists = $scPartitions | Where-Object { $_.Type -eq 'System' }
+                if (-not $espExists) {
+                    & $emit 'BCD' (& $toSev $sevBootPartitionMissing) "EFI System Partition is MISSING - Gen2 (UEFI) VM cannot boot without it" "-RecreateBootPartition"
                     $bootPartMissing = $true
                 }
-            }
-            else {
-                & $emit 'BCD' 'OK' "System Reserved partition present (Partition $($separateBootPart.PartitionNumber), Active)"
-            }
-        }
-
-        # When the boot partition itself is missing, all BCD/boot-file findings are symptoms
-        # of that root cause - redirect fix suggestions to -RecreateBootPartition
-        $bcdFix = if ($bootPartMissing) { '-RecreateBootPartition' } else { '-FixBoot' }
-
-        $installCandidates = @($script:WindowsInstallCandidates)
-        if ($installCandidates.Count -gt 0) {
-            $selectedInstall = @($installCandidates | Where-Object { $_.Selected } | Select-Object -First 1)
-            if (-not $selectedInstall) {
-                $selectedInstall = @($installCandidates | Select-Object -First 1)
-            }
-            if ($selectedInstall) {
-                $selected = $selectedInstall[0]
-                $selectedBuild = Format-WindowsBuildLabel -Build $selected.CurrentBuildNumber -Ubr $selected.UBR -Fallback 'unknown'
-                & $emit 'Windows' 'INFO' "Selected Windows install: $($selected.Drive) ($($selected.ProductName), build $selectedBuild, score=$($selected.Score))"
-                if ($selected.SetupEvidence) {
-                    & $emit 'Windows' (& $toSev $sevWindowsInstallSetupState) "Selected Windows install still shows setup/upgrade markers: $($selected.SetupEvidence)" '-AnalyzeServicingState'
+                else {
+                    & $emit 'BCD' 'OK' "EFI System Partition present (Partition $($espExists.PartitionNumber))"
                 }
-            }
-            if ($installCandidates.Count -gt 1) {
-                $candidateSummary = ($installCandidates | ForEach-Object {
-                    $build = Format-WindowsBuildLabel -Build $_.CurrentBuildNumber -Ubr $_.UBR -Fallback 'unknown'
-                    $name = if ($_.ProductName) { $_.ProductName } else { 'Unknown Windows install' }
-                    "$($_.Drive)=$name build $build score=$($_.Score)"
-                }) -join '; '
-                & $emit 'Windows' (& $toSev $sevMultipleWindowsInstalls) "Multiple Windows installs detected: $candidateSummary" $bcdFix
-                if ($installCandidates.Count -gt 1 -and (($installCandidates[0].Score - $installCandidates[1].Score) -lt 5)) {
-                    & $emit 'Windows' (& $toSev $sevWindowsInstallSelectionAmbiguous) "Top Windows install candidates scored too closely to auto-pick confidently: $($installCandidates[0].Drive)=$($installCandidates[0].Score), $($installCandidates[1].Drive)=$($installCandidates[1].Score)" '-GetBootPathReport'
-                }
-            }
-        }
 
-        $bcdPath = Get-BcdStorePath -Generation $script:VMGen -BootDrive $script:BootDriveLetter.TrimEnd('\')
-        $bcdItem = Get-BcdStoreItem -StorePath $bcdPath
-        if (-not $bcdItem) {
-            & $emit 'BCD' (& $toSev $sevBcdMissing) "BCD store not found at $bcdPath - VM will fail to boot" $bcdFix
-        }
-        else {
-            if ($bcdItem.Length -eq 0) {
-                & $emit 'BCD' (& $toSev $sevBcdMissing) "BCD store is 0 bytes (corrupt) at $bcdPath - VM will fail to boot" $bcdFix
-            }
-            else {
-                & $emit 'BCD' 'OK' "BCD store present: $bcdPath"
+                # UEFI boot entry match (measured boot logs) and stray \EFI copies
+                $uefiA = $null
                 try {
-                    $bcdInventory = Get-BcdInventory -StorePath $bcdPath
-                    $bcdText = $bcdInventory.RawText
-                    $preferredLoaderId = Get-BcdBootLoaderId -StorePath $bcdPath
-                    $preferredLoaderDetails = if ($preferredLoaderId) { Get-BcdLoaderDetails -StorePath $bcdPath -Identifier $preferredLoaderId } else { $null }
-                    $startupRepairConfigured = [bool]($preferredLoaderDetails -and $preferredLoaderDetails.RawText -match '(?im)^\s*recoverysequence\s+\{[^\r\n]+\}\s*$')
-                    if (@($bcdInventory.Loaders).Count -eq 0) {
-                        & $emit 'BCD' (& $toSev $sevBcdNoBootLoader) 'No Windows Boot Loader entry found in BCD' "-FixBoot"
-                    }
-                    else {
-                        & $emit 'BCD' 'OK' "Windows Boot Loader entries present: $(@($bcdInventory.Loaders).Count)"
-                        if (@($bcdInventory.Loaders).Count -gt 1) {
-                            $loaderSummary = ($bcdInventory.Loaders | ForEach-Object {
-                                $desc = if ($_.Description) { $_.Description } else { $_.Identifier }
-                                if ($_.PartitionDrive) { "$desc@$($_.PartitionDrive)" } else { $desc }
-                            }) -join '; '
-                            & $emit 'BCD' (& $toSev $sevBcdMultipleLoaders) "Multiple Windows Boot Loader entries found: $loaderSummary" '-FixBoot'
+                    $uefiA = Get-UefiBootAnalysis -DiskNumber $script:DiskNumber -WinRoot $script:WinDriveLetter
+                    foreach ($s in @($uefiA.StrayEfi)) {
+                        if ($s.IsFat) {
+                            & $emit 'BCD' (& $toSev $sevStrayEfiFat) "Non-ESP FAT partition $($s.PartitionNumber) holds EFI boot files ($($s.Path)) - the firmware fallback can load its BCD instead of the ESP (winload 0xc000000e)" $(if ($uefiA.Status -eq 'NoEsp') { '-RecreateBootPartition' } else { '-FixUefiBootEntry' })
                         }
-                        $setupLoaders = @($bcdInventory.Loaders | Where-Object { $_.IsSetupEntry })
-                        if ($setupLoaders.Count -gt 0) {
-                            $setupSummary = ($setupLoaders | ForEach-Object { if ($_.Description) { $_.Description } else { $_.Identifier } }) -join '; '
-                            & $emit 'BCD' (& $toSev $sevBcdSetupEntry) "BCD contains setup/stale loader entries: $setupSummary" '-FixBoot'
+                        else {
+                            & $emit 'BCD' (& $toSev $sevStrayEfiNtfs) "Non-ESP $($s.FileSystem) partition $($s.PartitionNumber) holds EFI boot files ($($s.Path)) - not used by the firmware, but may confuse repairs" ''
                         }
                     }
-                if ($bcdText -match 'safeboot\s+(\S+)') {
-                    & $emit 'BCD' (& $toSev $sevBcdSafeMode) "Safe Mode boot flag is active (safeboot $($Matches[1])) - VM will boot into Safe Mode" "-RemoveSafeModeFlag"
-                }
-                if ($bcdText -match 'bootstatuspolicy\s+ignoreallfailures') {
-                    & $emit 'BCD' (& $toSev $sevBcdBootStatusPolicy) 'bootstatuspolicy IgnoreAllFailures is set - startup repair is suppressed'
-                }
-                if ($bcdText -match 'recoveryenabled\s+no') {
-                    & $emit 'BCD' (& $toSev $sevBcdRecoveryDisabled) 'recoveryenabled is Off - WinRE recovery disabled'
-                }
-                $winre = Get-WinREStatus
-                if (-not $winre.ReagentcAvailable) {
-                    & $emit 'WinRE' 'INFO' 'reagentc.exe is not available on the rescue host, so offline WinRE status could not be evaluated'
-                }
-                elseif ($startupRepairConfigured -and -not $winre.ImageFound) {
-                    $detail = 'No usable Winre.wim found on mounted guest partitions.'
-                    if ($winre.HiddenRecoveryPartitions -gt 0) {
-                        $detail += " Hidden Recovery partition(s) without drive letters detected: $($winre.HiddenRecoveryPartitions)."
+                    $slotNote = if ($uefiA.SlotMoveNeeded) { " The entry also uses GPT slot $($uefiA.RequiredSlot) and the ESP is in slot $($uefiA.EspSlot); -FixUefiBootEntry moves it." } else { '' }
+                    switch ($uefiA.Status) {
+                        'Match' {
+                            $conflictNote = if ($uefiA.SlotConflict) { " (the GUID was also recorded in another slot: $((@($uefiA.SlotSightings) | ForEach-Object { "slot $($_.Slot) $($_.Seen)x" }) -join ', ') - boots elsewhere, e.g. nested Hyper-V)" } else { '' }
+                            if ($uefiA.AzureVerdict -eq 'NoMatch') {
+                                & $emit 'BCD' (& $toSev $sevUefiEntryStale) "ESP GUID matches the firmware's 'Windows Boot Manager' entry, but the entry uses GPT slot $($uefiA.AzureEntry.Slot) and the ESP is in slot $($uefiA.EspSlot) - Trusted Launch/CVM will not find the boot loader$conflictNote" '-FixUefiBootEntry'
+                            }
+                            elseif ($uefiA.SlotTie) {
+                                & $emit 'BCD' 'WARN' "ESP GUID matches the firmware's 'Windows Boot Manager' entry, but it was recorded equally often in more than one GPT slot$conflictNote - the slot Trusted Launch/CVM expects is unknown" '-GetUefiBootEntry'
+                            }
+                            else { & $emit 'BCD' 'OK' "ESP GUID and GPT slot match the firmware's 'Windows Boot Manager' entry$conflictNote" }
+                        }
+                        'Stale' {
+                            & $emit 'BCD' (& $toSev $sevUefiEntryStale) "Firmware 'Windows Boot Manager' entry points at ESP GUID $($uefiA.Target.Guid), which is no longer on the disk (current ESP: $($uefiA.EspGuid)) - Trusted Launch/CVM will not find the boot loader.$slotNote" '-FixUefiBootEntry'
+                        }
+                        'Mixed' { & $emit 'BCD' (& $toSev $sevUefiEntryMixed) "ESP GUID matches an older firmware 'Windows Boot Manager' entry, but a newer boot recorded a different GUID (disk booted on another host?)" '-GetUefiBootEntry' }
+                        'Replaced' {
+                            & $emit 'BCD' (& $toSev $sevUefiEntryMixed) "ESP was recreated: previous ESP GUID $($uefiA.Target.Guid) (GPT slot $($uefiA.Target.Slot)) is no longer on the disk (current ESP: $($uefiA.EspGuid)). Trusted Launch/CVM keep the old entry and will not find the boot loader until the ESP gets that GUID and slot back.$slotNote" '-FixUefiBootEntry'
+                        }
+                        'Ambiguous' { & $emit 'BCD' (& $toSev $sevUefiEntryMixed) "Recorded firmware 'Windows Boot Manager' GUIDs belong to other partitions, not the ESP" '-GetUefiBootEntry' }
+                        'MultipleEsp' { & $emit 'BCD' 'WARN' "More than one EFI System Partition on the disk" '-GetUefiBootEntry' }
+                        'NoLogs' { & $emit 'BCD' 'INFO' "No 'Windows Boot Manager' entry in the measured boot logs - UEFI boot entry match not checked" }
+                        'NoEsp' {
+                            if ($uefiA.Target) { & $emit 'BCD' 'INFO' "Previous ESP GUID $($uefiA.Target.Guid) (GPT slot $($uefiA.Target.Slot)) found in the measured boot logs - -RecreateBootPartition will restore it$(if ($uefiA.Target.Slot) { " and place the ESP in GPT slot $($uefiA.Target.Slot)" })" }
+                        }
                     }
-                    & $emit 'WinRE' (& $toSev $sevWinreImageMissing) "$detail WinRE cannot be registered until a recovery image is accessible." '-EnableStartupRepair'
                 }
-                elseif ($startupRepairConfigured) {
-                    $winreEnabled = ($winre.ReStatus -match '(?i)^enabled$') -and $winre.ReBcdIdentifier -and ($winre.ReBcdIdentifier -ne '00000000-0000-0000-0000-000000000000')
-                    if ($winreEnabled) {
-                        $locationLabel = if ($winre.ReLocation) { $winre.ReLocation } else { $winre.PreferredDirectory }
-                        & $emit 'WinRE' 'OK' "Windows RE is enabled and registered ($locationLabel)"
+                catch {
+                    & $emit 'BCD' 'INFO' "UEFI boot entry check skipped: $($_.Exception.Message)"
+                }
+            }
+            else {
+                # Gen1: check if a separate boot partition exists (Active partition != Windows partition)
+                $winTrimmed = $script:WinDriveLetter.TrimEnd('\')
+                $separateBootPart = $scPartitions | Where-Object {
+                    $_.IsActive -and ($_.AccessPaths | Where-Object { $_ -and $_.TrimEnd('\') -ne $winTrimmed })
+                }
+                if (-not $separateBootPart) {
+                    # Check if Windows partition is Active (single-partition layout)
+                    $winIsActive = $scPartitions | Where-Object {
+                        $_.AccessPaths | Where-Object { $_ -and $_.TrimEnd('\') -eq $winTrimmed }
+                    } | Where-Object { $_.IsActive }
+                    if ($winIsActive) {
+                        & $emit 'BCD' 'OK' "No separate System Reserved partition - Windows partition is Active (single-partition layout)"
                     }
                     else {
-                        & $emit 'WinRE' (& $toSev $sevWinreDisabled) "WinRE image found at $($winre.PreferredDirectory), but Windows RE is disabled or not registered (BCD id: $($winre.ReBcdIdentifier))." '-EnableStartupRepair'
+                        & $emit 'BCD' (& $toSev $sevBootPartitionMissing) "No bootable partition found - System Reserved partition is missing and Windows partition is not Active" "-RecreateBootPartition"
+                        $bootPartMissing = $true
                     }
                 }
-                if ($bcdText -match 'testsigning\s+yes') {
-                    & $emit 'BCD' (& $toSev $sevBcdTestSigning) 'Test signing is ON - unsigned drivers are permitted to load' "-DisableTestSigning"
+                else {
+                    & $emit 'BCD' 'OK' "System Reserved partition present (Partition $($separateBootPart.PartitionNumber), Active)"
                 }
-                if ($bcdText -match 'nointegritychecks\s+yes') {
-                    & $emit 'BCD' (& $toSev $sevBcdNoIntegrityChecks) 'nointegritychecks is ON - code integrity checks are bypassed; FATAL if Secure Boot is enabled' "-FixBoot"
+            }
+
+            # When the boot partition itself is missing, all BCD/boot-file findings are symptoms
+            # of that root cause - redirect fix suggestions to -RecreateBootPartition
+            $bcdFix = if ($bootPartMissing) { '-RecreateBootPartition' } else { '-FixBoot' }
+
+            $installCandidates = @($script:WindowsInstallCandidates)
+            if ($installCandidates.Count -gt 0) {
+                $selectedInstall = @($installCandidates | Where-Object { $_.Selected } | Select-Object -First 1)
+                if (-not $selectedInstall) {
+                    $selectedInstall = @($installCandidates | Select-Object -First 1)
                 }
-                if ($bcdText -match '\bunknown\b') {
-                    & $emit 'BCD' (& $toSev $sevBcdUnknownDevice) 'BCD contains entries with unknown device/path - may point to wrong or missing partition' "-FixBoot"
+                if ($selectedInstall) {
+                    $selected = $selectedInstall[0]
+                    $selectedBuild = Format-WindowsBuildLabel -Build $selected.CurrentBuildNumber -Ubr $selected.UBR -Fallback 'unknown'
+                    & $emit 'Windows' 'INFO' "Selected Windows install: $($selected.Drive) ($($selected.ProductName), build $selectedBuild, score=$($selected.Score))"
+                    if ($selected.SetupEvidence) {
+                        & $emit 'Windows' (& $toSev $sevWindowsInstallSetupState) "Selected Windows install still shows setup/upgrade markers: $($selected.SetupEvidence)" '-AnalyzeServicingState'
+                    }
                 }
-                if ($bcdText -match 'imcdevice|imchivename') {
-                    & $emit 'BCD' (& $toSev $sevBcdImcHive) 'BCD contains imcdevice/imchivename entries (IMC.hiv) - causes BSOD 0x67 CONFIG_INITIALIZATION_FAILED; rebuild BCD to remove' "-FixBoot"
-                }
-                # Gen2 UEFI-specific BCD checks
-                if ($script:VMGen -eq 2) {
-                    # winload path mismatch: Gen2 must use winload.efi, not winload.exe
-                    if ($bcdText -match 'path\s+.*\\winload\.exe') {
-                        & $emit 'BCD' (& $toSev $sevBcdWinloadMismatch) 'BCD Boot Loader path references winload.exe on a Gen2 (UEFI) disk - must be winload.efi' "-FixBoot"
+                if ($installCandidates.Count -gt 1) {
+                    $candidateSummary = ($installCandidates | ForEach-Object {
+                        $build = Format-WindowsBuildLabel -Build $_.CurrentBuildNumber -Ubr $_.UBR -Fallback 'unknown'
+                        $name = if ($_.ProductName) { $_.ProductName } else { 'Unknown Windows install' }
+                        "$($_.Drive)=$name build $build score=$($_.Score)"
+                    }) -join '; '
+                    & $emit 'Windows' (& $toSev $sevMultipleWindowsInstalls) "Multiple Windows installs detected: $candidateSummary" $bcdFix
+                    if ($installCandidates.Count -gt 1 -and (($installCandidates[0].Score - $installCandidates[1].Score) -lt 5)) {
+                        & $emit 'Windows' (& $toSev $sevWindowsInstallSelectionAmbiguous) "Top Windows install candidates scored too closely to auto-pick confidently: $($installCandidates[0].Drive)=$($installCandidates[0].Score), $($installCandidates[1].Drive)=$($installCandidates[1].Score)" '-GetBootPathReport'
                     }
                 }
             }
-            catch { & $emit 'BCD' 'WARN' "Could not enumerate BCD: $_" }
+
+            $bcdPath = Get-BcdStorePath -Generation $script:VMGen -BootDrive $script:BootDriveLetter.TrimEnd('\')
+            $bcdItem = Get-BcdStoreItem -StorePath $bcdPath
+            if (-not $bcdItem) {
+                & $emit 'BCD' (& $toSev $sevBcdMissing) "BCD store not found at $bcdPath - VM will fail to boot" $bcdFix
+            }
+            else {
+                if ($bcdItem.Length -eq 0) {
+                    & $emit 'BCD' (& $toSev $sevBcdMissing) "BCD store is 0 bytes (corrupt) at $bcdPath - VM will fail to boot" $bcdFix
+                }
+                else {
+                    & $emit 'BCD' 'OK' "BCD store present: $bcdPath"
+                    try {
+                        $bcdInventory = Get-BcdInventory -StorePath $bcdPath
+                        $bcdText = $bcdInventory.RawText
+                        $preferredLoaderId = Get-BcdBootLoaderId -StorePath $bcdPath
+                        $preferredLoaderDetails = if ($preferredLoaderId) { Get-BcdLoaderDetails -StorePath $bcdPath -Identifier $preferredLoaderId } else { $null }
+                        $startupRepairConfigured = [bool]($preferredLoaderDetails -and $preferredLoaderDetails.RawText -match '(?im)^\s*recoverysequence\s+\{[^\r\n]+\}\s*$')
+                        if (@($bcdInventory.Loaders).Count -eq 0) {
+                            & $emit 'BCD' (& $toSev $sevBcdNoBootLoader) 'No Windows Boot Loader entry found in BCD' "-FixBoot"
+                        }
+                        else {
+                            & $emit 'BCD' 'OK' "Windows Boot Loader entries present: $(@($bcdInventory.Loaders).Count)"
+                            if (@($bcdInventory.Loaders).Count -gt 1) {
+                                $loaderSummary = ($bcdInventory.Loaders | ForEach-Object {
+                                    $desc = if ($_.Description) { $_.Description } else { $_.Identifier }
+                                    if ($_.PartitionDrive) { "$desc@$($_.PartitionDrive)" } else { $desc }
+                                }) -join '; '
+                                & $emit 'BCD' (& $toSev $sevBcdMultipleLoaders) "Multiple Windows Boot Loader entries found: $loaderSummary" '-FixBoot'
+                            }
+                            $setupLoaders = @($bcdInventory.Loaders | Where-Object { $_.IsSetupEntry })
+                            if ($setupLoaders.Count -gt 0) {
+                                $setupSummary = ($setupLoaders | ForEach-Object { if ($_.Description) { $_.Description } else { $_.Identifier } }) -join '; '
+                                & $emit 'BCD' (& $toSev $sevBcdSetupEntry) "BCD contains setup/stale loader entries: $setupSummary" '-FixBoot'
+                            }
+                        }
+                    if ($bcdText -match 'safeboot\s+(\S+)') {
+                        & $emit 'BCD' (& $toSev $sevBcdSafeMode) "Safe Mode boot flag is active (safeboot $($Matches[1])) - VM will boot into Safe Mode" "-RemoveSafeModeFlag"
+                    }
+                    if ($bcdText -match 'bootstatuspolicy\s+ignoreallfailures') {
+                        & $emit 'BCD' (& $toSev $sevBcdBootStatusPolicy) 'bootstatuspolicy IgnoreAllFailures is set - startup repair is suppressed'
+                    }
+                    if ($bcdText -match 'recoveryenabled\s+no') {
+                        & $emit 'BCD' (& $toSev $sevBcdRecoveryDisabled) 'recoveryenabled is Off - WinRE recovery disabled'
+                    }
+                    $winre = Get-WinREStatus
+                    if (-not $winre.ReagentcAvailable) {
+                        & $emit 'WinRE' 'INFO' 'reagentc.exe is not available on the rescue host, so offline WinRE status could not be evaluated'
+                    }
+                    elseif ($startupRepairConfigured -and -not $winre.ImageFound) {
+                        $detail = 'No usable Winre.wim found on mounted guest partitions.'
+                        if ($winre.HiddenRecoveryPartitions -gt 0) {
+                            $detail += " Hidden Recovery partition(s) without drive letters detected: $($winre.HiddenRecoveryPartitions)."
+                        }
+                        & $emit 'WinRE' (& $toSev $sevWinreImageMissing) "$detail WinRE cannot be registered until a recovery image is accessible." '-EnableStartupRepair'
+                    }
+                    elseif ($startupRepairConfigured) {
+                        $winreEnabled = ($winre.ReStatus -match '(?i)^enabled$') -and $winre.ReBcdIdentifier -and ($winre.ReBcdIdentifier -ne '00000000-0000-0000-0000-000000000000')
+                        if ($winreEnabled) {
+                            $locationLabel = if ($winre.ReLocation) { $winre.ReLocation } else { $winre.PreferredDirectory }
+                            & $emit 'WinRE' 'OK' "Windows RE is enabled and registered ($locationLabel)"
+                        }
+                        else {
+                            & $emit 'WinRE' (& $toSev $sevWinreDisabled) "WinRE image found at $($winre.PreferredDirectory), but Windows RE is disabled or not registered (BCD id: $($winre.ReBcdIdentifier))." '-EnableStartupRepair'
+                        }
+                    }
+                    if ($bcdText -match 'testsigning\s+yes') {
+                        & $emit 'BCD' (& $toSev $sevBcdTestSigning) 'Test signing is ON - unsigned drivers are permitted to load' "-DisableTestSigning"
+                    }
+                    if ($bcdText -match 'nointegritychecks\s+yes') {
+                        & $emit 'BCD' (& $toSev $sevBcdNoIntegrityChecks) 'nointegritychecks is ON - code integrity checks are bypassed; FATAL if Secure Boot is enabled' "-FixBoot"
+                    }
+                    if ($bcdText -match '\bunknown\b') {
+                        & $emit 'BCD' (& $toSev $sevBcdUnknownDevice) 'BCD contains entries with unknown device/path - may point to wrong or missing partition' "-FixBoot"
+                    }
+                    if ($bcdText -match 'imcdevice|imchivename') {
+                        & $emit 'BCD' (& $toSev $sevBcdImcHive) 'BCD contains imcdevice/imchivename entries (IMC.hiv) - causes BSOD 0x67 CONFIG_INITIALIZATION_FAILED; rebuild BCD to remove' "-FixBoot"
+                    }
+                    # Gen2 UEFI-specific BCD checks
+                    if ($script:VMGen -eq 2) {
+                        # winload path mismatch: Gen2 must use winload.efi, not winload.exe
+                        if ($bcdText -match 'path\s+.*\\winload\.exe') {
+                            & $emit 'BCD' (& $toSev $sevBcdWinloadMismatch) 'BCD Boot Loader path references winload.exe on a Gen2 (UEFI) disk - must be winload.efi' "-FixBoot"
+                        }
+                    }
+                }
+                catch { & $emit 'BCD' 'WARN' "Could not enumerate BCD: $_" }
+                }
             }
         }
 
         # Gen2 UEFI: verify EFI System Partition boot files
-        if ($script:VMGen -eq 2) {
-            $efiBootmgfw = Join-Path $script:BootDriveLetter 'EFI\Microsoft\Boot\bootmgfw.efi'
-            $efiBootx64 = Join-Path $script:BootDriveLetter 'EFI\Boot\bootx64.efi'
-            # Both ESP loaders are copies of the same Windows-staged file, which is the
-            # reference Test-BootPayloadPeParity compares them against.
-            $stagedBootmgfw = Join-Path $script:WinDriveLetter 'Windows\Boot\EFI\bootmgfw.efi'
-            $espFix = '-FixSecureBootCodeIntegrity'
-
-            if (-not (Test-Path $efiBootmgfw)) {
-                & $emit 'BCD' (& $toSev $sevBootmgfwMissing) "bootmgfw.efi missing from EFI System Partition ($efiBootmgfw) - UEFI firmware cannot start Windows Boot Manager" $bcdFix
-            }
-            elseif ((Get-Item -LiteralPath $efiBootmgfw -ErrorAction SilentlyContinue).Length -eq 0) {
-                & $emit 'BCD' (& $toSev $sevBootmgfwMissing) "bootmgfw.efi is 0 bytes (corrupt) on EFI System Partition ($efiBootmgfw) - UEFI firmware cannot start Windows Boot Manager" $bcdFix
-            }
-            else {
-                $mgfwParity = Test-BootPayloadPeParity -TargetPath $efiBootmgfw -SourcePath $stagedBootmgfw
-                $efiMgfwSig = Test-MicrosoftSignature -FilePath $efiBootmgfw
-                if ($mgfwParity.Damaged) {
-                    # Whichever copy is the odd one out, one of them is damaged. Repair
-                    # the ESP by recopying the staged file; repair a damaged staged file
-                    # from the component store first, or the recopy has nothing good to
-                    # copy from.
-                    $mgfwFix = if ($mgfwParity.Suspect -eq 'Source') { '-RepairSystemFile bootmgfw.efi' } else { $espFix }
-                    & $emit 'BCD' (& $toSev $sevBootmgfwMissing) "bootmgfw.efi is damaged - $($mgfwParity.Reason). UEFI firmware may be unable to start Windows Boot Manager" $mgfwFix
+        if (& $inArea 'Boot', 'Security') {
+            # -SecurityOnly skips the BCD section, which normally sets these two.
+            if (-not $bcdFix) {
+                $bcdFix = '-FixBoot'
+                if ($script:VMGen -eq 2 -and -not (Get-Partition -DiskNumber $script:DiskNumber -ErrorAction SilentlyContinue | Where-Object { $_.Type -eq 'System' })) {
+                    $bcdFix = '-RecreateBootPartition'
                 }
-                elseif (-not $efiMgfwSig.IsAcceptableMicrosoft) {
-                    $mgfwSev = if ($efiMgfwSig.IsHardFailure) { 'CRIT' } else { & $toSev $sevBinarySignatureBad }
-                    & $emit 'Security' $mgfwSev "bootmgfw.efi failed trust validation - $(Get-TrustStateDescription -Signature $efiMgfwSig)" $bcdFix
+            }
+            if ($script:VMGen -eq 2 -and -not (Get-Variable -Name uefiA -ValueOnly -ErrorAction SilentlyContinue)) {
+                $uefiA = $null
+                try { $uefiA = Get-UefiBootAnalysis -DiskNumber $script:DiskNumber -WinRoot $script:WinDriveLetter } catch { $uefiA = $null }
+            }
+            if ($script:VMGen -eq 2) {
+                $efiBootmgfw = Join-Path $script:BootDriveLetter 'EFI\Microsoft\Boot\bootmgfw.efi'
+                $efiBootx64 = Join-Path $script:BootDriveLetter 'EFI\Boot\bootx64.efi'
+                # Both ESP loaders are copies of the same Windows-staged file, which is the
+                # reference Test-BootPayloadPeParity compares them against.
+                $stagedBootmgfw = Join-Path $script:WinDriveLetter 'Windows\Boot\EFI\bootmgfw.efi'
+                $espFix = '-FixSecureBootCodeIntegrity'
+
+                if (-not (Test-Path $efiBootmgfw)) {
+                    & $emit 'BCD' (& $toSev $sevBootmgfwMissing) "bootmgfw.efi missing from EFI System Partition ($efiBootmgfw) - UEFI firmware cannot start Windows Boot Manager" $bcdFix
+                }
+                elseif ((Get-Item -LiteralPath $efiBootmgfw -ErrorAction SilentlyContinue).Length -eq 0) {
+                    & $emit 'BCD' (& $toSev $sevBootmgfwMissing) "bootmgfw.efi is 0 bytes (corrupt) on EFI System Partition ($efiBootmgfw) - UEFI firmware cannot start Windows Boot Manager" $bcdFix
                 }
                 else {
-                    & $emit 'BCD' 'OK' 'bootmgfw.efi present on EFI System Partition'
-                }
-            }
-            if (-not (Test-Path $efiBootx64)) {
-                & $emit 'BCD' (& $toSev $sevBootx64Missing) "EFI\\Boot\\bootx64.efi fallback loader missing - some UEFI firmware relies on this path" $bcdFix
-            }
-            elseif ((Get-Item -LiteralPath $efiBootx64 -ErrorAction SilentlyContinue).Length -eq 0) {
-                & $emit 'BCD' (& $toSev $sevBootx64Missing) "EFI\\Boot\\bootx64.efi is 0 bytes (corrupt) - some UEFI firmware relies on this path" $bcdFix
-            }
-            else {
-                $x64Parity = Test-BootPayloadPeParity -TargetPath $efiBootx64 -SourcePath $stagedBootmgfw
-                $efiX64Sig = Test-MicrosoftSignature -FilePath $efiBootx64
-                if ($x64Parity.Damaged) {
-                    $x64Fix = if ($x64Parity.Suspect -eq 'Source') { '-RepairSystemFile bootmgfw.efi' } else { $espFix }
-                    & $emit 'BCD' (& $toSev $sevBootx64Missing) "EFI\\Boot\\bootx64.efi is damaged - $($x64Parity.Reason). Some UEFI firmware relies on this path" $x64Fix
-                }
-                elseif (-not $efiX64Sig.IsAcceptableMicrosoft) {
-                    $x64Sev = if ($efiX64Sig.IsHardFailure) { 'CRIT' } else { & $toSev $sevBinarySignatureBad }
-                    & $emit 'Security' $x64Sev "bootx64.efi failed trust validation - $(Get-TrustStateDescription -Signature $efiX64Sig)" $bcdFix
-                }
-            }
-
-            # Secure Boot CA of the ESP boot managers vs the db/dbx the firmware last measured
-            try {
-                $caLoaders = @()
-                foreach ($pair in @(@('bootmgfw.efi', $efiBootmgfw), @('bootx64.efi', $efiBootx64))) {
-                    $fi = Get-Item -LiteralPath $pair[1] -Force -ErrorAction SilentlyContinue
-                    if ($fi -and $fi.Length -gt 0) {
-                        $caLoaders += [pscustomobject]@{ Name = $pair[0]; Ca = (Get-UefiBootManagerSigner -Path $pair[1]).Ca }
+                    $mgfwParity = Test-BootPayloadPeParity -TargetPath $efiBootmgfw -SourcePath $stagedBootmgfw
+                    $efiMgfwSig = Test-MicrosoftSignature -FilePath $efiBootmgfw
+                    if ($mgfwParity.Damaged) {
+                        # Whichever copy is the odd one out, one of them is damaged. Repair
+                        # the ESP by recopying the staged file; repair a damaged staged file
+                        # from the component store first, or the recopy has nothing good to
+                        # copy from.
+                        $mgfwFix = if ($mgfwParity.Suspect -eq 'Source') { '-RepairSystemFile bootmgfw.efi' } else { $espFix }
+                        & $emit 'BCD' (& $toSev $sevBootmgfwMissing) "bootmgfw.efi is damaged - $($mgfwParity.Reason). UEFI firmware may be unable to start Windows Boot Manager" $mgfwFix
+                    }
+                    elseif (-not $efiMgfwSig.IsAcceptableMicrosoft) {
+                        $mgfwSev = if ($efiMgfwSig.IsHardFailure) { 'CRIT' } else { & $toSev $sevBinarySignatureBad }
+                        & $emit 'Security' $mgfwSev "bootmgfw.efi failed trust validation - $(Get-TrustStateDescription -Signature $efiMgfwSig)" $bcdFix
+                    }
+                    else {
+                        & $emit 'BCD' 'OK' 'bootmgfw.efi present on EFI System Partition'
                     }
                 }
-                $caFw = if (Get-Variable -Name uefiA -ValueOnly -ErrorAction SilentlyContinue) { $uefiA.LatestLog } else { $null }
-                foreach ($f in @(Get-UefiSigningCaFindings -Loaders $caLoaders -Firmware $caFw)) {
-                    & $emit 'SecureBoot' $f.Severity $f.Message $f.Fix
+                if (-not (Test-Path $efiBootx64)) {
+                    & $emit 'BCD' (& $toSev $sevBootx64Missing) "EFI\\Boot\\bootx64.efi fallback loader missing - some UEFI firmware relies on this path" $bcdFix
                 }
-            }
-            catch {
-                & $emit 'SecureBoot' 'INFO' "Boot manager signing CA check skipped: $($_.Exception.Message)"
+                elseif ((Get-Item -LiteralPath $efiBootx64 -ErrorAction SilentlyContinue).Length -eq 0) {
+                    & $emit 'BCD' (& $toSev $sevBootx64Missing) "EFI\\Boot\\bootx64.efi is 0 bytes (corrupt) - some UEFI firmware relies on this path" $bcdFix
+                }
+                else {
+                    $x64Parity = Test-BootPayloadPeParity -TargetPath $efiBootx64 -SourcePath $stagedBootmgfw
+                    $efiX64Sig = Test-MicrosoftSignature -FilePath $efiBootx64
+                    if ($x64Parity.Damaged) {
+                        $x64Fix = if ($x64Parity.Suspect -eq 'Source') { '-RepairSystemFile bootmgfw.efi' } else { $espFix }
+                        & $emit 'BCD' (& $toSev $sevBootx64Missing) "EFI\\Boot\\bootx64.efi is damaged - $($x64Parity.Reason). Some UEFI firmware relies on this path" $x64Fix
+                    }
+                    elseif (-not $efiX64Sig.IsAcceptableMicrosoft) {
+                        $x64Sev = if ($efiX64Sig.IsHardFailure) { 'CRIT' } else { & $toSev $sevBinarySignatureBad }
+                        & $emit 'Security' $x64Sev "bootx64.efi failed trust validation - $(Get-TrustStateDescription -Signature $efiX64Sig)" $bcdFix
+                    }
+                }
+
+                # Secure Boot CA of the ESP boot managers vs the db/dbx the firmware last measured
+                try {
+                    $caLoaders = @()
+                    foreach ($pair in @(@('bootmgfw.efi', $efiBootmgfw), @('bootx64.efi', $efiBootx64))) {
+                        $fi = Get-Item -LiteralPath $pair[1] -Force -ErrorAction SilentlyContinue
+                        if ($fi -and $fi.Length -gt 0) {
+                            $caLoaders += [pscustomobject]@{ Name = $pair[0]; Ca = (Get-UefiBootManagerSigner -Path $pair[1]).Ca }
+                        }
+                    }
+                    $caFw = if (Get-Variable -Name uefiA -ValueOnly -ErrorAction SilentlyContinue) { $uefiA.LatestLog } else { $null }
+                    foreach ($f in @(Get-UefiSigningCaFindings -Loaders $caLoaders -Firmware $caFw)) {
+                        & $emit 'SecureBoot' $f.Severity $f.Message $f.Fix
+                    }
+                }
+                catch {
+                    & $emit 'SecureBoot' 'INFO' "Boot manager signing CA check skipped: $($_.Exception.Message)"
+                }
             }
         }
 
         # Gen1 BIOS: verify boot partition has the Active flag set
-        if ($script:VMGen -eq 1) {
-            $bootPartition = Get-Partition -DiskNumber $script:DiskNumber -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.AccessPaths | Where-Object {
-                    $_ -and $script:BootDriveLetter.TrimEnd('\') -eq $_.TrimEnd('\')
+        if (& $inArea 'Boot') {
+            if ($script:VMGen -eq 1) {
+                $bootPartition = Get-Partition -DiskNumber $script:DiskNumber -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.AccessPaths | Where-Object {
+                        $_ -and $script:BootDriveLetter.TrimEnd('\') -eq $_.TrimEnd('\')
+                    }
                 }
-            }
-            if ($bootPartition) {
-                if (-not $bootPartition.IsActive) {
-                    & $emit 'BCD' (& $toSev $sevBootPartitionNotActive) "Gen1 boot partition (Partition $($bootPartition.PartitionNumber)) is NOT marked as Active - BIOS cannot locate the boot sector; VM will fail to boot (black screen)" "-FixBoot"
-                }
-                else {
-                    & $emit 'BCD' 'OK' "Gen1 boot partition (Partition $($bootPartition.PartitionNumber)) is marked as Active"
+                if ($bootPartition) {
+                    if (-not $bootPartition.IsActive) {
+                        & $emit 'BCD' (& $toSev $sevBootPartitionNotActive) "Gen1 boot partition (Partition $($bootPartition.PartitionNumber)) is NOT marked as Active - BIOS cannot locate the boot sector; VM will fail to boot (black screen)" "-FixBoot"
+                    }
+                    else {
+                        & $emit 'BCD' 'OK' "Gen1 boot partition (Partition $($bootPartition.PartitionNumber)) is marked as Active"
+                    }
                 }
             }
         }
 
         # -- 3b. Critical boot/system binaries ------------------------------------
-        Write-Host "--- Critical Boot Files" -ForegroundColor DarkGray
-        $winloadFile = if ($script:VMGen -eq 2) { 'winload.efi' } else { 'winload.exe' }
-        $bootBinaries = @(
-            @{ Name = $winloadFile; Path = (Join-Path $script:WinDriveLetter "Windows\System32\$winloadFile"); Fix = "-RepairSystemFile $winloadFile" }
-            @{ Name = 'ntdll.dll'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\ntdll.dll'); Fix = '-RepairSystemFile ntdll.dll' }
-            @{ Name = 'kernel32.dll'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\kernel32.dll'); Fix = '-RepairSystemFile kernel32.dll' }
-            @{ Name = 'hal.dll'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\hal.dll'); Fix = '-RepairSystemFile hal.dll' }
-            @{ Name = 'ntoskrnl.exe'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\ntoskrnl.exe'); Fix = '-RepairSystemFile ntoskrnl.exe' }
-            @{ Name = 'ci.dll'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\ci.dll'); Fix = '-RepairSystemFile ci.dll' }
-        )
-        if ($script:VMGen -eq 1) {
-            $bootBinaries += @{ Name = 'bootmgr'; Path = (Join-Path $script:BootDriveLetter 'bootmgr'); Fix = '-FixBoot' }
-        }
+        if (& $inArea 'Boot', 'Security') {
+            Write-Host "--- Critical Boot Files" -ForegroundColor DarkGray
+            $winloadFile = if ($script:VMGen -eq 2) { 'winload.efi' } else { 'winload.exe' }
+            $bootBinaries = @(
+                @{ Name = $winloadFile; Path = (Join-Path $script:WinDriveLetter "Windows\System32\$winloadFile"); Fix = "-RepairSystemFile $winloadFile" }
+                @{ Name = 'ntdll.dll'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\ntdll.dll'); Fix = '-RepairSystemFile ntdll.dll' }
+                @{ Name = 'kernel32.dll'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\kernel32.dll'); Fix = '-RepairSystemFile kernel32.dll' }
+                @{ Name = 'hal.dll'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\hal.dll'); Fix = '-RepairSystemFile hal.dll' }
+                @{ Name = 'ntoskrnl.exe'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\ntoskrnl.exe'); Fix = '-RepairSystemFile ntoskrnl.exe' }
+                @{ Name = 'ci.dll'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\ci.dll'); Fix = '-RepairSystemFile ci.dll' }
+            )
+            if ($script:VMGen -eq 1) {
+                $bootBinaries += @{ Name = 'bootmgr'; Path = (Join-Path $script:BootDriveLetter 'bootmgr'); Fix = '-FixBoot' }
+            }
 
-        # BCD-Template hive: required by bcdboot to create a new BCD store. If missing, -FixBoot
-        # will fail with BFSVC error c000000f (cannot open BCD template store).
-        $bcdTemplateHive = Join-Path $script:WinDriveLetter 'Windows\System32\config\BCD-Template'
-        $bcdTemplateItem = Get-Item -LiteralPath $bcdTemplateHive -Force -ErrorAction SilentlyContinue
-        if (-not $bcdTemplateItem) {
-            & $emit 'Boot' (& $toSev $sevBcdTemplateMissing) "BCD-Template hive MISSING ($bcdTemplateHive) - bcdboot will fail with error c000000f; -FixBoot cannot succeed until this file is restored" '-FixBoot'
-        }
-        elseif ($bcdTemplateItem.Length -eq 0) {
-            & $emit 'Boot' (& $toSev $sevBcdTemplateMissing) "BCD-Template hive is 0 bytes (corrupt) ($bcdTemplateHive) - bcdboot will fail with error c000000f; restore from a healthy Windows source" '-FixBoot'
-        }
-        else {
-            & $emit 'Boot' 'OK' "BCD-Template hive present ($bcdTemplateHive)"
-        }
-
-        # Boot sectors (Gen1/BIOS only). bcdboot repairs boot FILES; it never writes
-        # sector 0 of the disk or of the boot partition. A damaged MBR bootstrap or a
-        # stale BPB HiddenSectors value fails the boot before bootmgr ever loads, and
-        # is invisible to chkdsk, sfc and every BCD-level check above.
-        if ($script:VMGen -eq 1) {
-            try {
-                $bsReport = Get-BootSectorReport -DiskNumber $script:DiskNumber -BootDriveLetter $script:BootDriveLetter
-                $script:BootSectorReport = $bsReport
-                if ($bsReport.Findings.Count -eq 0 -and $bsReport.Errors.Count -eq 0) {
-                    & $emit 'Boot' 'OK' 'MBR bootstrap, active flag and volume boot record (VBR) all valid'
-                }
-                foreach ($bsf in $bsReport.Findings) {
-                    $bsSev = if ($bsf.Severity -eq 'CRITICAL') { & $toSev 2 } else { & $toSev 1 }
-                    & $emit 'Boot' $bsSev $bsf.Message $bsf.Fix
-                }
-                foreach ($bsErr in $bsReport.Errors) {
-                    & $emit 'Boot' (& $toSev 1) "Boot sector check incomplete: $bsErr"
-                }
+            # BCD-Template hive: required by bcdboot to create a new BCD store. If missing, -FixBoot
+            # will fail with BFSVC error c000000f (cannot open BCD template store).
+            $bcdTemplateHive = Join-Path $script:WinDriveLetter 'Windows\System32\config\BCD-Template'
+            $bcdTemplateItem = Get-Item -LiteralPath $bcdTemplateHive -Force -ErrorAction SilentlyContinue
+            if (-not $bcdTemplateItem) {
+                & $emit 'Boot' (& $toSev $sevBcdTemplateMissing) "BCD-Template hive MISSING ($bcdTemplateHive) - bcdboot will fail with error c000000f; -FixBoot cannot succeed until this file is restored" '-FixBoot'
             }
-            catch {
-                & $emit 'Boot' (& $toSev 1) "Boot sector check could not run: $_"
-            }
-        }
-        $bootFileIssues = 0
-        $sigIssues = 0
-        foreach ($bf in $bootBinaries) {
-            $bfExists = Test-Path -LiteralPath $bf.Path
-            $bfSize = if ($bfExists) { (Get-Item -LiteralPath $bf.Path -Force -ErrorAction SilentlyContinue).Length } else { 0 }
-            if (-not $bfExists) {
-                & $emit 'Boot' (& $toSev $sevCriticalBootFileMissing) "$($bf.Name) is MISSING ($($bf.Path)) - VM will fail to boot" $bf.Fix
-                $bootFileIssues++
-            }
-            elseif ($bfSize -eq 0) {
-                & $emit 'Boot' (& $toSev $sevCriticalBootFileMissing) "$($bf.Name) is 0 bytes (corrupt) ($($bf.Path)) - VM will fail to boot" $bf.Fix
-                $bootFileIssues++
+            elseif ($bcdTemplateItem.Length -eq 0) {
+                & $emit 'Boot' (& $toSev $sevBcdTemplateMissing) "BCD-Template hive is 0 bytes (corrupt) ($bcdTemplateHive) - bcdboot will fail with error c000000f; restore from a healthy Windows source" '-FixBoot'
             }
             else {
-                # Binary exists and is non-zero  -  verify Microsoft signature
-                if (-not ([bool]$bf.SkipSignature)) {
-                    $sigCheck = Test-MicrosoftSignature -FilePath $bf.Path
-                    if (-not $sigCheck.IsAcceptableMicrosoft) {
-                        $bfSev = if ($sigCheck.IsHardFailure) { 'CRIT' } else { & $toSev $sevBinarySignatureBad }
-                        & $emit 'Security' $bfSev "$($bf.Name) failed trust validation - $(Get-TrustStateDescription -Signature $sigCheck)" $bf.Fix
-                        $sigIssues++
+                & $emit 'Boot' 'OK' "BCD-Template hive present ($bcdTemplateHive)"
+            }
+
+            # Boot sectors (Gen1/BIOS only). bcdboot repairs boot FILES; it never writes
+            # sector 0 of the disk or of the boot partition. A damaged MBR bootstrap or a
+            # stale BPB HiddenSectors value fails the boot before bootmgr ever loads, and
+            # is invisible to chkdsk, sfc and every BCD-level check above.
+            if ($script:VMGen -eq 1) {
+                try {
+                    $bsReport = Get-BootSectorReport -DiskNumber $script:DiskNumber -BootDriveLetter $script:BootDriveLetter
+                    $script:BootSectorReport = $bsReport
+                    if ($bsReport.Findings.Count -eq 0 -and $bsReport.Errors.Count -eq 0) {
+                        & $emit 'Boot' 'OK' 'MBR bootstrap, active flag and volume boot record (VBR) all valid'
+                    }
+                    foreach ($bsf in $bsReport.Findings) {
+                        $bsSev = if ($bsf.Severity -eq 'CRITICAL') { & $toSev 2 } else { & $toSev 1 }
+                        & $emit 'Boot' $bsSev $bsf.Message $bsf.Fix
+                    }
+                    foreach ($bsErr in $bsReport.Errors) {
+                        & $emit 'Boot' (& $toSev 1) "Boot sector check incomplete: $bsErr"
+                    }
+                }
+                catch {
+                    & $emit 'Boot' (& $toSev 1) "Boot sector check could not run: $_"
+                }
+            }
+            $bootFileIssues = 0
+            $sigIssues = 0
+            foreach ($bf in $bootBinaries) {
+                $bfExists = Test-Path -LiteralPath $bf.Path
+                $bfSize = if ($bfExists) { (Get-Item -LiteralPath $bf.Path -Force -ErrorAction SilentlyContinue).Length } else { 0 }
+                if (-not $bfExists) {
+                    & $emit 'Boot' (& $toSev $sevCriticalBootFileMissing) "$($bf.Name) is MISSING ($($bf.Path)) - VM will fail to boot" $bf.Fix
+                    $bootFileIssues++
+                }
+                elseif ($bfSize -eq 0) {
+                    & $emit 'Boot' (& $toSev $sevCriticalBootFileMissing) "$($bf.Name) is 0 bytes (corrupt) ($($bf.Path)) - VM will fail to boot" $bf.Fix
+                    $bootFileIssues++
+                }
+                else {
+                    # Binary exists and is non-zero  -  verify Microsoft signature
+                    if (-not ([bool]$bf.SkipSignature)) {
+                        $sigCheck = Test-MicrosoftSignature -FilePath $bf.Path
+                        if (-not $sigCheck.IsAcceptableMicrosoft) {
+                            $bfSev = if ($sigCheck.IsHardFailure) { 'CRIT' } else { & $toSev $sevBinarySignatureBad }
+                            & $emit 'Security' $bfSev "$($bf.Name) failed trust validation - $(Get-TrustStateDescription -Signature $sigCheck)" $bf.Fix
+                            $sigIssues++
+                        }
                     }
                 }
             }
-        }
-        if ($bootFileIssues -eq 0 -and $sigIssues -eq 0) {
-            & $emit 'Boot' 'OK' "All critical boot binaries present, non-empty, and Microsoft-signed"
-        }
-        elseif ($bootFileIssues -eq 0) {
-            & $emit 'Boot' 'OK' "All critical boot binaries present and non-empty"
+            if ($bootFileIssues -eq 0 -and $sigIssues -eq 0) {
+                & $emit 'Boot' 'OK' "All critical boot binaries present, non-empty, and Microsoft-signed"
+            }
+            elseif ($bootFileIssues -eq 0) {
+                & $emit 'Boot' 'OK' "All critical boot binaries present and non-empty"
+            }
         }
 
         # -- 3c. Session initialization executables --------------------------------
         # These run early in the Windows boot chain after ntoskrnl hands off to user mode.
         # Missing or tampered copies cause boot loops, black screens, or automatic repair loops.
-        Write-Host "--- Session Init Executables" -ForegroundColor DarkGray
-        $sessionBinaries = @(
-            @{ Name = 'smss.exe'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\smss.exe'); Desc = 'Session Manager - first user-mode process; missing = immediate boot failure' }
-            @{ Name = 'csrss.exe'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\csrss.exe'); Desc = 'Client/Server Runtime - Win32 subsystem; missing = BSOD STOP 0xEF' }
-            @{ Name = 'wininit.exe'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\wininit.exe'); Desc = 'Windows Init - starts services.exe and lsass.exe' }
-            @{ Name = 'services.exe'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\services.exe'); Desc = 'Service Control Manager - without it no services start' }
-            @{ Name = 'lsass.exe'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\lsass.exe'); Desc = 'Local Security Authority - auth/logon; missing = boot loop' }
-            @{ Name = 'winlogon.exe'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\winlogon.exe'); Desc = 'Winlogon - interactive logon handler; missing = black screen' }
-            @{ Name = 'logonui.exe'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\logonui.exe'); Desc = 'Logon UI - credential provider host; missing = black screen at logon' }
-            # Session-space kernel images. smss loads the SubSystems Kmode image (win32k.sys)
-            # into every session, and win32k.sys imports win32kbase.sys and win32kfull.sys
-            # on Windows 10 / Server 2016 and later. A damaged or unsigned copy of any of them
-            # stops the guest with 0xC000021A, Arg2 0xC0000428 STATUS_INVALID_IMAGE_HASH.
-            # They live in System32, not System32\drivers.
-            @{ Name = 'win32k.sys'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\win32k.sys'); Desc = 'Win32k session driver (SubSystems Kmode); damaged = STOP 0xC000021A / 0xC0000428' }
-            @{ Name = 'win32kbase.sys'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\win32kbase.sys'); Desc = 'Win32k base, imported by win32k.sys; damaged = STOP 0xC000021A / 0xC0000428'; MinBuild = 10240 }
-            @{ Name = 'win32kfull.sys'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\win32kfull.sys'); Desc = 'Win32k full, imported by win32k.sys; damaged = STOP 0xC000021A / 0xC0000428'; MinBuild = 10240 }
-        )
-        $sessGuestBuild = 0
-        [void][int]::TryParse((Get-GuestCurrentVersion).CurrentBuildNumber, [ref]$sessGuestBuild)
-        $sessIssues = 0
-        $sessSigIssues = 0
-        foreach ($sb in $sessionBinaries) {
-            # Build unknown (0): only check a build-specific image when it is actually present.
-            if ($sb.MinBuild -and (($sessGuestBuild -gt 0 -and $sessGuestBuild -lt $sb.MinBuild) -or
-                    ($sessGuestBuild -eq 0 -and -not (Test-Path -LiteralPath $sb.Path)))) { continue }
-            $sbFix = "-RepairSystemFile $(Get-RepairSystemFileArgument -Path $sb.Path)"
-            $sbExists = Test-Path -LiteralPath $sb.Path
-            $sbSize = if ($sbExists) { (Get-Item -LiteralPath $sb.Path -Force -ErrorAction SilentlyContinue).Length } else { 0 }
-            if (-not $sbExists) {
-                & $emit 'Boot' (& $toSev $sevSessionInitMissing) "$($sb.Name) is MISSING - $($sb.Desc)" $sbFix
-                $sessIssues++
-            }
-            elseif ($sbSize -eq 0) {
-                & $emit 'Boot' (& $toSev $sevSessionInitMissing) "$($sb.Name) is 0 bytes (corrupt) - $($sb.Desc)" $sbFix
-                $sessIssues++
-            }
-            else {
-                $sigCheck = Test-MicrosoftSignature -FilePath $sb.Path
-                if (-not $sigCheck.IsAcceptableMicrosoft) {
-                    $sbSev = if ($sigCheck.IsHardFailure) { 'CRIT' } else { & $toSev $sevBinarySignatureBad }
-                    & $emit 'Security' $sbSev "$($sb.Name) failed trust validation - $(Get-TrustStateDescription -Signature $sigCheck)" $sbFix
-                    $sessSigIssues++
+        if (& $inArea 'Boot', 'Security') {
+            Write-Host "--- Session Init Executables" -ForegroundColor DarkGray
+            $sessionBinaries = @(
+                @{ Name = 'smss.exe'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\smss.exe'); Desc = 'Session Manager - first user-mode process; missing = immediate boot failure' }
+                @{ Name = 'csrss.exe'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\csrss.exe'); Desc = 'Client/Server Runtime - Win32 subsystem; missing = BSOD STOP 0xEF' }
+                @{ Name = 'wininit.exe'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\wininit.exe'); Desc = 'Windows Init - starts services.exe and lsass.exe' }
+                @{ Name = 'services.exe'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\services.exe'); Desc = 'Service Control Manager - without it no services start' }
+                @{ Name = 'lsass.exe'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\lsass.exe'); Desc = 'Local Security Authority - auth/logon; missing = boot loop' }
+                @{ Name = 'winlogon.exe'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\winlogon.exe'); Desc = 'Winlogon - interactive logon handler; missing = black screen' }
+                @{ Name = 'logonui.exe'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\logonui.exe'); Desc = 'Logon UI - credential provider host; missing = black screen at logon' }
+                # Session-space kernel images. smss loads the SubSystems Kmode image (win32k.sys)
+                # into every session, and win32k.sys imports win32kbase.sys and win32kfull.sys
+                # on Windows 10 / Server 2016 and later. A damaged or unsigned copy of any of them
+                # stops the guest with 0xC000021A, Arg2 0xC0000428 STATUS_INVALID_IMAGE_HASH.
+                # They live in System32, not System32\drivers.
+                @{ Name = 'win32k.sys'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\win32k.sys'); Desc = 'Win32k session driver (SubSystems Kmode); damaged = STOP 0xC000021A / 0xC0000428' }
+                @{ Name = 'win32kbase.sys'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\win32kbase.sys'); Desc = 'Win32k base, imported by win32k.sys; damaged = STOP 0xC000021A / 0xC0000428'; MinBuild = 10240 }
+                @{ Name = 'win32kfull.sys'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\win32kfull.sys'); Desc = 'Win32k full, imported by win32k.sys; damaged = STOP 0xC000021A / 0xC0000428'; MinBuild = 10240 }
+            )
+            $sessGuestBuild = 0
+            [void][int]::TryParse((Get-GuestCurrentVersion).CurrentBuildNumber, [ref]$sessGuestBuild)
+            $sessIssues = 0
+            $sessSigIssues = 0
+            foreach ($sb in $sessionBinaries) {
+                # Build unknown (0): only check a build-specific image when it is actually present.
+                if ($sb.MinBuild -and (($sessGuestBuild -gt 0 -and $sessGuestBuild -lt $sb.MinBuild) -or
+                        ($sessGuestBuild -eq 0 -and -not (Test-Path -LiteralPath $sb.Path)))) { continue }
+                $sbFix = "-RepairSystemFile $(Get-RepairSystemFileArgument -Path $sb.Path)"
+                $sbExists = Test-Path -LiteralPath $sb.Path
+                $sbSize = if ($sbExists) { (Get-Item -LiteralPath $sb.Path -Force -ErrorAction SilentlyContinue).Length } else { 0 }
+                if (-not $sbExists) {
+                    & $emit 'Boot' (& $toSev $sevSessionInitMissing) "$($sb.Name) is MISSING - $($sb.Desc)" $sbFix
+                    $sessIssues++
+                }
+                elseif ($sbSize -eq 0) {
+                    & $emit 'Boot' (& $toSev $sevSessionInitMissing) "$($sb.Name) is 0 bytes (corrupt) - $($sb.Desc)" $sbFix
+                    $sessIssues++
+                }
+                else {
+                    $sigCheck = Test-MicrosoftSignature -FilePath $sb.Path
+                    if (-not $sigCheck.IsAcceptableMicrosoft) {
+                        $sbSev = if ($sigCheck.IsHardFailure) { 'CRIT' } else { & $toSev $sevBinarySignatureBad }
+                        & $emit 'Security' $sbSev "$($sb.Name) failed trust validation - $(Get-TrustStateDescription -Signature $sigCheck)" $sbFix
+                        $sessSigIssues++
+                    }
                 }
             }
-        }
-        if ($sessIssues -eq 0 -and $sessSigIssues -eq 0) {
-            & $emit 'Boot' 'OK' "All session init executables and Win32k session images present, non-empty, and Microsoft-signed"
-        }
-        elseif ($sessIssues -eq 0) {
-            & $emit 'Boot' 'OK' "All session init executables and Win32k session images present and non-empty"
+            if ($sessIssues -eq 0 -and $sessSigIssues -eq 0) {
+                & $emit 'Boot' 'OK' "All session init executables and Win32k session images present, non-empty, and Microsoft-signed"
+            }
+            elseif ($sessIssues -eq 0) {
+                & $emit 'Boot' 'OK' "All session init executables and Win32k session images present and non-empty"
+            }
         }
 
         # -- 4. SYSTEM hive -------------------------------------------------------
@@ -16811,6 +16865,10 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
                 $SystemRoot = "HKLM:\BROKENSYSTEM\$csName"
                 $svcRoot = "$SystemRoot\Services"
                 $ctrlRoot = "$SystemRoot\Control"
+                # Shared by more than one area, so read up front rather than inside a gated section.
+                $lsaProps = Get-ItemProperty "$ctrlRoot\Lsa" -ErrorAction SilentlyContinue
+                $rdpPortProbe = (Get-ItemProperty "$ctrlRoot\Terminal Server\WinStations\RDP-Tcp" -ErrorAction SilentlyContinue).PortNumber
+                if ($null -ne $rdpPortProbe -and $rdpPortProbe -ge 1 -and $rdpPortProbe -le 65535) { $script:_sysCheckRdpPort = [int]$rdpPortProbe }
 
                 # ControlSet mismatch
                 if ($null -ne $curSet -and $null -ne $defSet -and $curSet -ne $defSet) {
@@ -16859,378 +16917,398 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
 
                 # -- Critical boot services ------------------------------------------
                 # These disabled = guaranteed BSOD 0x7B or non-boot
-                $critical = @(
-                    @{ N = 'disk'; ExpStart = 0; Desc = 'storage bus driver (0x7B if disabled)' }
-                    @{ N = 'volmgr'; ExpStart = 0; Desc = 'volume manager (0x7B if disabled)' }
-                    @{ N = 'partmgr'; ExpStart = 1; Desc = 'partition manager (0x7B if disabled)' }
-                    @{ N = 'storport'; ExpStart = 0; Desc = 'storage port driver (0x7B if disabled)' }
-                    @{ N = 'NTFS'; ExpStart = 1; Desc = 'NTFS filesystem driver (0x7B if disabled)' }
-                    @{ N = 'volsnap'; ExpStart = 1; Desc = 'volume shadow copy filter' }
-                    @{ N = 'msrpc'; ExpStart = 2; Desc = 'RPC subsystem' }
-                    @{ N = 'rpcss'; ExpStart = 2; Desc = 'Remote Procedure Call (RPC)' }
-                    @{ N = 'RpcEptMapper'; ExpStart = 2; Desc = 'RPC Endpoint Mapper' }
-                    @{ N = 'LSM'; ExpStart = 2; Desc = 'Local Session Manager' }
-                )
-                foreach ($s in $critical) {
-                    $sp = "$svcRoot\$($s.N)"
-                    if (Test-Path $sp) {
-                        $start = (Get-ItemProperty $sp -ErrorAction SilentlyContinue).Start
-                        if ($start -eq 4) {
-                            & $emit 'Services' (& $toSev $sevCriticalSvcDisabled) "$($s.N) is DISABLED (Start=4) - $($s.Desc) [ re-enable: Set Start=$($s.ExpStart) ]" "-EnableDriverOrService $($s.N) -DriverStartType $(ConvertTo-DriverStartTypeName -StartValue $s.ExpStart)"
+                if (& $inArea 'Boot') {
+                    $critical = @(
+                        @{ N = 'disk'; ExpStart = 0; Desc = 'storage bus driver (0x7B if disabled)' }
+                        @{ N = 'volmgr'; ExpStart = 0; Desc = 'volume manager (0x7B if disabled)' }
+                        @{ N = 'partmgr'; ExpStart = 1; Desc = 'partition manager (0x7B if disabled)' }
+                        @{ N = 'storport'; ExpStart = 0; Desc = 'storage port driver (0x7B if disabled)' }
+                        @{ N = 'NTFS'; ExpStart = 1; Desc = 'NTFS filesystem driver (0x7B if disabled)' }
+                        @{ N = 'volsnap'; ExpStart = 1; Desc = 'volume shadow copy filter' }
+                        @{ N = 'msrpc'; ExpStart = 2; Desc = 'RPC subsystem' }
+                        @{ N = 'rpcss'; ExpStart = 2; Desc = 'Remote Procedure Call (RPC)' }
+                        @{ N = 'RpcEptMapper'; ExpStart = 2; Desc = 'RPC Endpoint Mapper' }
+                        @{ N = 'LSM'; ExpStart = 2; Desc = 'Local Session Manager' }
+                    )
+                    foreach ($s in $critical) {
+                        $sp = "$svcRoot\$($s.N)"
+                        if (Test-Path $sp) {
+                            $start = (Get-ItemProperty $sp -ErrorAction SilentlyContinue).Start
+                            if ($start -eq 4) {
+                                & $emit 'Services' (& $toSev $sevCriticalSvcDisabled) "$($s.N) is DISABLED (Start=4) - $($s.Desc) [ re-enable: Set Start=$($s.ExpStart) ]" "-EnableDriverOrService $($s.N) -DriverStartType $(ConvertTo-DriverStartTypeName -StartValue $s.ExpStart)"
+                            }
                         }
                     }
                 }
 
                 # -- RPC shared service host ----------------------------------------
-                try {
-                    $rpcHostState = Invoke-WithHive 'SOFTWARE' { Get-RpcHostSplitState }
-                    if ($rpcHostState.HasMismatch) {
-                        $rpcFix = if ($rpcHostState.CanRepair) { '-FixRpcHostSplit' } else { '' }
-                        & $emit 'Services' (& $toSev $sevRpcHostSplit) "$csName RPC host-split ImagePath mismatch: RpcSs='$($rpcHostState.RpcSs.ImagePath)'; RpcEptMapper='$($rpcHostState.RpcEptMapper.ImagePath)'. Can cause service-start timeouts, DWM/LogonUI failures and a black screen before sign-in." $rpcFix
-                        if (-not $rpcHostState.CanRepair) {
-                            & $emit 'Services' 'WARN' $rpcHostState.Reason
+                if (& $inArea 'Boot') {
+                    try {
+                        $rpcHostState = Invoke-WithHive 'SOFTWARE' { Get-RpcHostSplitState }
+                        if ($rpcHostState.HasMismatch) {
+                            $rpcFix = if ($rpcHostState.CanRepair) { '-FixRpcHostSplit' } else { '' }
+                            & $emit 'Services' (& $toSev $sevRpcHostSplit) "$csName RPC host-split ImagePath mismatch: RpcSs='$($rpcHostState.RpcSs.ImagePath)'; RpcEptMapper='$($rpcHostState.RpcEptMapper.ImagePath)'. Can cause service-start timeouts, DWM/LogonUI failures and a black screen before sign-in." $rpcFix
+                            if (-not $rpcHostState.CanRepair) {
+                                & $emit 'Services' 'WARN' $rpcHostState.Reason
+                            }
+                        }
+                        else {
+                            & $emit 'Services' 'OK' "$csName RPC ImagePath command lines match; no path-induced host split detected."
                         }
                     }
-                    else {
-                        & $emit 'Services' 'OK' "$csName RPC ImagePath command lines match; no path-induced host split detected."
+                    catch {
+                        & $emit 'Services' 'WARN' "RPC service-host ImagePath check could not complete: $($_.Exception.Message). No automatic repair is recommended."
                     }
-                }
-                catch {
-                    & $emit 'Services' 'WARN' "RPC service-host ImagePath check could not complete: $($_.Exception.Message). No automatic repair is recommended."
                 }
 
                 # -- Migration boot storage readiness ------------------------------
                 # Report only unexpected settings. These values control whether the
                 # boot bus/storage stack can enumerate the OS disk early enough to
                 # satisfy the loader-provided boot device path.
-                $bootStorageFindings = @(Get-BootStorageDriverFindings -ControlSetNames @($csName))
-                foreach ($bs in $bootStorageFindings) {
-                    $bsSeverity = if ($null -ne $bs.Severity) { [int]$bs.Severity } else { $sevBootStorageReadiness }
-                    & $emit 'BootStorage' (& $toSev $bsSeverity) "$($bs.ControlSet): $($bs.Message)" $bs.Fix
+                if (& $inArea 'Boot') {
+                    $bootStorageFindings = @(Get-BootStorageDriverFindings -ControlSetNames @($csName))
+                    foreach ($bs in $bootStorageFindings) {
+                        $bsSeverity = if ($null -ne $bs.Severity) { [int]$bs.Severity } else { $sevBootStorageReadiness }
+                        & $emit 'BootStorage' (& $toSev $bsSeverity) "$($bs.ControlSet): $($bs.Message)" $bs.Fix
+                    }
                 }
 
                 # -- Azure/Hyper-V synthetic drivers ---------------------------------
-                $synBad = 0
-                foreach ($sd in (Get-SyntheticDriverSpec)) {
-                    $sdSeverity = if ($null -ne $sd.Severity) { [int]$sd.Severity } else { $sevSyntheticDriverBroken }
-                    $sdSvcPath = "$svcRoot\$($sd.Name)"
-                    $sdExists = Test-Path $sdSvcPath
-                    $sdStart = if ($sdExists) { (Get-ItemProperty $sdSvcPath -ErrorAction SilentlyContinue).Start } else { $null }
-                    $sdBin = Resolve-DriverBinaryCandidate -Binary $sd.Bin -AlternatePatterns $sd.AlternateBinPatterns
-                    $sdBinExists = [bool]$sdBin.Exists
-                    $sdBinZero = $sdBinExists -and $sdBin.Size -eq 0
-                    $sdBinName = if ($sdBinExists) { $sdBin.Name } else { $sd.Bin }
-                    if (-not $sdExists) {
-                        $sdFix = if (-not $sdBinExists -or $sdBinZero) {
-                            "-RepairSystemFile $($sd.Bin), then restore the $($sd.Name) service key from a matching Windows image or registry backup"
-                        }
-                        else {
-                            "Restore the $($sd.Name) service key from a matching Windows image or registry backup, then run -EnsureSyntheticDriversEnabled"
-                        }
-                        & $emit 'Drivers' (& $toSev $sdSeverity) "$($sd.Name) service key missing - $($sd.Desc) will not load" $sdFix
-                        $synBad++
-                    }
-                    elseif (-not $sdBinExists -or $sdBinZero) {
-                        $state = if (-not $sdBinExists) { 'missing' } else { '0-byte' }
-                        & $emit 'Drivers' (& $toSev $sdSeverity) "$($sd.Name) binary $($sd.Bin) is $state - $($sd.Desc)" "-RepairSystemFile $($sd.Bin)"
-                        $synBad++
-                    }
-                    elseif ($null -ne $sdStart -and [int]$sdStart -ne [int]$sd.Start) {
-                        & $emit 'Drivers' (& $toSev $sdSeverity) "$($sd.Name) Start=$sdStart (expected $($sd.Start)) - $($sd.Desc)" "-EnsureSyntheticDriversEnabled"
-                        $synBad++
-                    }
-                    else {
-                        # Binary exists, non-zero, start value correct  -  verify signature
-                        $sdSig = Test-MicrosoftSignature -FilePath $sdBin.Path
-                        if (-not $sdSig.IsAcceptableMicrosoft) {
-                            $sigSeverity = if ($sdSig.TrustState -eq 'ValidOtherPublisher') { $sevThirdPartyBootSystemDriver } else { $sdSeverity }
-                            $sigSev = if ($sdSig.IsHardFailure) { 'CRIT' } else { & $toSev $sigSeverity }
-                            & $emit 'Security' $sigSev "$sdBinName failed trust validation - $(Get-TrustStateDescription -Signature $sdSig)" "-RepairSystemFile $sdBinName"
+                if (& $inArea 'Boot', 'Connectivity', 'Security') {
+                    $synBad = 0
+                    foreach ($sd in (Get-SyntheticDriverSpec)) {
+                        $sdSeverity = if ($null -ne $sd.Severity) { [int]$sd.Severity } else { $sevSyntheticDriverBroken }
+                        $sdSvcPath = "$svcRoot\$($sd.Name)"
+                        $sdExists = Test-Path $sdSvcPath
+                        $sdStart = if ($sdExists) { (Get-ItemProperty $sdSvcPath -ErrorAction SilentlyContinue).Start } else { $null }
+                        $sdBin = Resolve-DriverBinaryCandidate -Binary $sd.Bin -AlternatePatterns $sd.AlternateBinPatterns
+                        $sdBinExists = [bool]$sdBin.Exists
+                        $sdBinZero = $sdBinExists -and $sdBin.Size -eq 0
+                        $sdBinName = if ($sdBinExists) { $sdBin.Name } else { $sd.Bin }
+                        if (-not $sdExists) {
+                            $sdFix = if (-not $sdBinExists -or $sdBinZero) {
+                                "-RepairSystemFile $($sd.Bin), then restore the $($sd.Name) service key from a matching Windows image or registry backup"
+                            }
+                            else {
+                                "Restore the $($sd.Name) service key from a matching Windows image or registry backup, then run -EnsureSyntheticDriversEnabled"
+                            }
+                            & $emit 'Drivers' (& $toSev $sdSeverity) "$($sd.Name) service key missing - $($sd.Desc) will not load" $sdFix
                             $synBad++
                         }
+                        elseif (-not $sdBinExists -or $sdBinZero) {
+                            $state = if (-not $sdBinExists) { 'missing' } else { '0-byte' }
+                            & $emit 'Drivers' (& $toSev $sdSeverity) "$($sd.Name) binary $($sd.Bin) is $state - $($sd.Desc)" "-RepairSystemFile $($sd.Bin)"
+                            $synBad++
+                        }
+                        elseif ($null -ne $sdStart -and [int]$sdStart -ne [int]$sd.Start) {
+                            & $emit 'Drivers' (& $toSev $sdSeverity) "$($sd.Name) Start=$sdStart (expected $($sd.Start)) - $($sd.Desc)" "-EnsureSyntheticDriversEnabled"
+                            $synBad++
+                        }
+                        else {
+                            # Binary exists, non-zero, start value correct  -  verify signature
+                            $sdSig = Test-MicrosoftSignature -FilePath $sdBin.Path
+                            if (-not $sdSig.IsAcceptableMicrosoft) {
+                                $sigSeverity = if ($sdSig.TrustState -eq 'ValidOtherPublisher') { $sevThirdPartyBootSystemDriver } else { $sdSeverity }
+                                $sigSev = if ($sdSig.IsHardFailure) { 'CRIT' } else { & $toSev $sigSeverity }
+                                & $emit 'Security' $sigSev "$sdBinName failed trust validation - $(Get-TrustStateDescription -Signature $sdSig)" "-RepairSystemFile $sdBinName"
+                                $synBad++
+                            }
+                        }
                     }
-                }
-                if ($synBad -eq 0) {
-                    & $emit 'Drivers' 'OK' "Azure synthetic drivers (vmbus/storvsc/netvsc) healthy"
+                    if ($synBad -eq 0) {
+                        & $emit 'Drivers' 'OK' "Azure synthetic drivers (vmbus/storvsc/netvsc) healthy"
+                    }
                 }
 
                 # -- Hyper-V integration services ------------------------------------
                 # These don't block boot but missing/broken ones cause "VM running but
                 # unusable" states on Azure (no heartbeat, no graceful shutdown, no time
                 # sync, no KVP metadata exchange, no VSS backup).
-                $intSvcs = @(
-                    @{ Name = 'vmicheartbeat'; Desc = 'Heartbeat (host knows OS is alive)' }
-                    @{ Name = 'vmicshutdown'; Desc = 'Graceful shutdown from host/portal' }
-                    @{ Name = 'vmictimesync'; Desc = 'Time synchronisation with host' }
-                    @{ Name = 'vmickvpexchange'; Desc = 'KVP data exchange (Azure metadata/hostname)' }
-                    @{ Name = 'vmicvss'; Desc = 'VSS integration (Azure Backup snapshots)' }
-                )
-                $intBad = 0
-                foreach ($ic in $intSvcs) {
-                    $icPath = "$svcRoot\$($ic.Name)"
-                    $icExists = Test-Path $icPath
-                    if (-not $icExists) {
-                        & $emit 'HyperV' (& $toSev $sevIntegrationSvcMissing) "$($ic.Name) service key missing - $($ic.Desc)" "-EnableDriverOrService $($ic.Name) -DriverStartType Manual"
-                        $intBad++
-                        continue
-                    }
-                    $icProps = Get-ItemProperty $icPath -ErrorAction SilentlyContinue
-                    $icStart = $icProps.Start
-                    if ($icStart -eq 4) {
-                        & $emit 'HyperV' (& $toSev $sevIntegrationSvcDisabled) "$($ic.Name) is DISABLED (Start=4) - $($ic.Desc)" "-EnableDriverOrService $($ic.Name) -DriverStartType Manual"
-                        $intBad++
-                        continue
-                    }
-                    # Check binary exists and signature
-                    if ($icProps.ImagePath) {
-                        $icBinPath = Resolve-GuestImagePath $icProps.ImagePath
-                        $icBinExists = Test-Path -LiteralPath $icBinPath
-                        $icBinZero = $icBinExists -and (Get-Item -LiteralPath $icBinPath -Force -ErrorAction SilentlyContinue).Length -eq 0
-                        if (-not $icBinExists -or $icBinZero) {
-                            $bState = if (-not $icBinExists) { 'missing' } else { '0-byte' }
-                            & $emit 'HyperV' (& $toSev $sevIntegrationSvcBinMissing) "$($ic.Name) binary is $bState ($icBinPath) - $($ic.Desc)"
+                if (& $inArea 'Connectivity', 'Security') {
+                    $intSvcs = @(
+                        @{ Name = 'vmicheartbeat'; Desc = 'Heartbeat (host knows OS is alive)' }
+                        @{ Name = 'vmicshutdown'; Desc = 'Graceful shutdown from host/portal' }
+                        @{ Name = 'vmictimesync'; Desc = 'Time synchronisation with host' }
+                        @{ Name = 'vmickvpexchange'; Desc = 'KVP data exchange (Azure metadata/hostname)' }
+                        @{ Name = 'vmicvss'; Desc = 'VSS integration (Azure Backup snapshots)' }
+                    )
+                    $intBad = 0
+                    foreach ($ic in $intSvcs) {
+                        $icPath = "$svcRoot\$($ic.Name)"
+                        $icExists = Test-Path $icPath
+                        if (-not $icExists) {
+                            & $emit 'HyperV' (& $toSev $sevIntegrationSvcMissing) "$($ic.Name) service key missing - $($ic.Desc)" "-EnableDriverOrService $($ic.Name) -DriverStartType Manual"
                             $intBad++
+                            continue
                         }
-                        elseif ($icBinExists) {
-                            $icSig = Test-MicrosoftSignature -FilePath $icBinPath
-                            if (-not $icSig.IsAcceptableMicrosoft) {
-                                & $emit 'Security' (& $toSev $sevBinarySignatureBad) "$($ic.Name) binary failed trust validation - $(Get-TrustStateDescription -Signature $icSig)" "-RepairSystemFile $(Get-RepairSystemFileArgument -Path $icBinPath)"
+                        $icProps = Get-ItemProperty $icPath -ErrorAction SilentlyContinue
+                        $icStart = $icProps.Start
+                        if ($icStart -eq 4) {
+                            & $emit 'HyperV' (& $toSev $sevIntegrationSvcDisabled) "$($ic.Name) is DISABLED (Start=4) - $($ic.Desc)" "-EnableDriverOrService $($ic.Name) -DriverStartType Manual"
+                            $intBad++
+                            continue
+                        }
+                        # Check binary exists and signature
+                        if ($icProps.ImagePath) {
+                            $icBinPath = Resolve-GuestImagePath $icProps.ImagePath
+                            $icBinExists = Test-Path -LiteralPath $icBinPath
+                            $icBinZero = $icBinExists -and (Get-Item -LiteralPath $icBinPath -Force -ErrorAction SilentlyContinue).Length -eq 0
+                            if (-not $icBinExists -or $icBinZero) {
+                                $bState = if (-not $icBinExists) { 'missing' } else { '0-byte' }
+                                & $emit 'HyperV' (& $toSev $sevIntegrationSvcBinMissing) "$($ic.Name) binary is $bState ($icBinPath) - $($ic.Desc)"
                                 $intBad++
+                            }
+                            elseif ($icBinExists) {
+                                $icSig = Test-MicrosoftSignature -FilePath $icBinPath
+                                if (-not $icSig.IsAcceptableMicrosoft) {
+                                    & $emit 'Security' (& $toSev $sevBinarySignatureBad) "$($ic.Name) binary failed trust validation - $(Get-TrustStateDescription -Signature $icSig)" "-RepairSystemFile $(Get-RepairSystemFileArgument -Path $icBinPath)"
+                                    $intBad++
+                                }
                             }
                         }
                     }
-                }
-                if ($intBad -eq 0) {
-                    & $emit 'HyperV' 'OK' 'Hyper-V integration services present and enabled (heartbeat/shutdown/timesync/kvp/vss)'
+                    if ($intBad -eq 0) {
+                        & $emit 'HyperV' 'OK' 'Hyper-V integration services present and enabled (heartbeat/shutdown/timesync/kvp/vss)'
+                    }
                 }
 
                 # -- Domain trust / Netlogon -----------------------------------------
-                $tcpipParams = "$svcRoot\Tcpip\Parameters"
-                $domainVal = (Get-ItemProperty $tcpipParams -ErrorAction SilentlyContinue).Domain
-                $netlogonSt = (Get-ItemProperty "$svcRoot\Netlogon" -ErrorAction SilentlyContinue).Start
-                $isDomainJoined = $domainVal -and $domainVal -notmatch '^(WORKGROUP|LOCALDOMAIN)?$'
-                if ($isDomainJoined -and $netlogonSt -eq 4) {
-                    & $emit 'Networking' (& $toSev $sevNetlogonDisabled) "Domain-joined (domain='$domainVal') but Netlogon is DISABLED (Start=4) - domain auth and RDP will fail" "-EnableDriverOrService Netlogon -DriverStartType Manual"
+                if (& $inArea 'RDP', 'Connectivity') {
+                    $tcpipParams = "$svcRoot\Tcpip\Parameters"
+                    $domainVal = (Get-ItemProperty $tcpipParams -ErrorAction SilentlyContinue).Domain
+                    $netlogonSt = (Get-ItemProperty "$svcRoot\Netlogon" -ErrorAction SilentlyContinue).Start
+                    $isDomainJoined = $domainVal -and $domainVal -notmatch '^(WORKGROUP|LOCALDOMAIN)?$'
+                    if ($isDomainJoined -and $netlogonSt -eq 4) {
+                        & $emit 'Networking' (& $toSev $sevNetlogonDisabled) "Domain-joined (domain='$domainVal') but Netlogon is DISABLED (Start=4) - domain auth and RDP will fail" "-EnableDriverOrService Netlogon -DriverStartType Manual"
+                    }
                 }
 
                 # -- RDP ------------------------------------------------------------
-                $tsPath = "$ctrlRoot\Terminal Server"
-                $rdpTcpPath = "$ctrlRoot\Terminal Server\WinStations\RDP-Tcp"
-                $fDeny = (Get-ItemProperty $tsPath -ErrorAction SilentlyContinue).fDenyTSConnections
-                if ($fDeny -eq 1) {
-                    & $emit 'RDP' (& $toSev $sevRdpDenied) 'fDenyTSConnections=1 - RDP is disabled at canonical key' "-FixRDP"
-                }
-                elseif ($null -eq $fDeny) {
-                    & $emit 'RDP' (& $toSev $sevRdpDenyUnknown) 'fDenyTSConnections not found - RDP state unclear' "-FixRDP"
-                }
-                else {
-                    & $emit 'RDP' 'OK' 'fDenyTSConnections=0 - RDP is enabled'
-                }
-
-                # TermService, SessionEnv, UmRdpService
-                foreach ($rdpSvc in @(
-                        @{ N = 'TermService'; Desc = 'Remote Desktop Services'; Crit = $true }
-                        @{ N = 'SessionEnv'; Desc = 'Remote Desktop Config'; Crit = $true }
-                        @{ N = 'UmRdpService'; Desc = 'RDP UserMode Port Redirector'; Crit = $false }
-                    )) {
-                    $svcStart = (Get-ItemProperty "$svcRoot\$($rdpSvc.N)" -ErrorAction SilentlyContinue).Start
-                    if ($svcStart -eq 4) {
-                        $sev = if ($rdpSvc.Crit) { (& $toSev $sevRdpSvcDisabledCrit) } else { (& $toSev $sevRdpSvcDisabledWarn) }
-                        & $emit 'RDP' $sev "$($rdpSvc.N) ($($rdpSvc.Desc)) is DISABLED (Start=4) - RDP will not work" "-FixRDP"
+                if (& $inArea 'RDP') {
+                    $tsPath = "$ctrlRoot\Terminal Server"
+                    $rdpTcpPath = "$ctrlRoot\Terminal Server\WinStations\RDP-Tcp"
+                    $fDeny = (Get-ItemProperty $tsPath -ErrorAction SilentlyContinue).fDenyTSConnections
+                    if ($fDeny -eq 1) {
+                        & $emit 'RDP' (& $toSev $sevRdpDenied) 'fDenyTSConnections=1 - RDP is disabled at canonical key' "-FixRDP"
                     }
-                    elseif ($null -ne $svcStart) {
-                        & $emit 'RDP' 'OK' "$($rdpSvc.N) Start=$svcStart"
-                    }
-                }
-
-                if (Test-Path $rdpTcpPath) {
-                    $rdpP = Get-ItemProperty $rdpTcpPath -ErrorAction SilentlyContinue
-
-                    # Port number
-                    $rdpPort = $rdpP.PortNumber
-                    if ($null -ne $rdpPort -and $rdpPort -ge 1 -and $rdpPort -le 65535) { $script:_sysCheckRdpPort = [int]$rdpPort }
-                    if ($null -ne $rdpPort -and $rdpPort -ne 3389) {
-                        & $emit 'RDP' (& $toSev $sevRdpNonDefaultPort) "RDP-Tcp port is $rdpPort (not the default 3389) - ensure firewall allows this port or run -FixRDP to reset" "-FixRDP"
+                    elseif ($null -eq $fDeny) {
+                        & $emit 'RDP' (& $toSev $sevRdpDenyUnknown) 'fDenyTSConnections not found - RDP state unclear' "-FixRDP"
                     }
                     else {
-                        & $emit 'RDP' 'OK' "RDP-Tcp port: $(if ($null -eq $rdpPort) { '(not set, default 3389)' } else { $rdpPort })"
+                        & $emit 'RDP' 'OK' 'fDenyTSConnections=0 - RDP is enabled'
                     }
 
-                    # Security layer
-                    $sl = $rdpP.SecurityLayer
-                    if ($null -ne $sl) {
-                        $slDesc = switch ($sl) { 0 { 'RDP native (no SSL) - weakest encryption' } 1 { 'Negotiate' } 2 { 'SSL/TLS required' } default { "Unknown ($sl)" } }
-                        $slSev = if ($sl -eq 0) { (& $toSev $sevRdpSecurityLayerWeak) } else { 'INFO' }
-                        & $emit 'RDP' $slSev "SecurityLayer=$sl ($slDesc)"
-                    }
-
-                    # NLA / UserAuthentication
-                    $ua = $rdpP.UserAuthentication
-                    if ($ua -eq 0) {
-                        & $emit 'RDP' (& $toSev $sevRdpNLADisabled) 'NLA is DISABLED (UserAuthentication=0) - any user can attempt login without pre-auth; run -EnableNLA to restore' "-EnableNLA"
-                    }
-                    elseif ($ua -eq 1) {
-                        & $emit 'RDP' 'OK' 'NLA is enabled (UserAuthentication=1)'
-                    }
-                    else {
-                        & $emit 'RDP' 'INFO' 'NLA/UserAuthentication not set on RDP-Tcp key (policy may control this)'
-                    }
-
-                    # fAllowSecProtocolNegotiation (also touched by -DisableNLA)
-                    $aspn = $rdpP.fAllowSecProtocolNegotiation
-                    if ($aspn -eq 0) {
-                        & $emit 'RDP' (& $toSev $sevRdpSecProtoNeg) 'fAllowSecProtocolNegotiation=0 - security protocol negotiation disabled; run -EnableNLA or -FixRDP to reset' "-EnableNLA"
-                    }
-
-                    # MinEncryptionLevel (1=Low was set by -DisableNLA; default is typically 2)
-                    $mel = $rdpP.MinEncryptionLevel
-                    if ($null -ne $mel -and $mel -lt 2) {
-                        & $emit 'RDP' (& $toSev $sevRdpMinEncLevel) "MinEncryptionLevel=$mel (below recommended 2) - may indicate NLA was disabled" "-EnableNLA"
-                    }
-
-                    # SSL certificate thumbprint - absence is normal (Windows generates one on first RDP connection)
-                    $cert = $rdpP.SSLCertificateSHA1Hash
-                    if ($null -ne $cert -and -not ($cert -is [byte[]] -and $cert.Count -eq 0)) {
-                        & $emit 'RDP' 'OK' 'RDP SSL certificate thumbprint is present'
-                    }
-                    # No thumbprint = not flagged; Windows auto-generates one at first RDP connection
-
-                    # MaxInstanceCount - if 0, RDP refuses every connection attempt
-                    $maxInst = $rdpP.MaxInstanceCount
-                    if ($null -ne $maxInst -and $maxInst -eq 0) {
-                        & $emit 'RDP' (& $toSev $sevRdpMaxInstanceZero) "MaxInstanceCount=0 on RDP-Tcp - RDP will refuse ALL connections; run -FixRDP to reset" "-FixRDP"
-                    }
-                }
-                else {
-                    & $emit 'RDP' (& $toSev $sevRdpTcpKeyMissing) 'RDP-Tcp WinStation key not found - RDP listener may be misconfigured' "-FixRDP"
-                }
-
-                # RDP-related crypto services (required for certificate/key operations)
-                foreach ($cryptSvc in @(
-                        @{ N = 'KeyIso'; DefStart = 3; Desc = 'CNG Key Isolation (needed for RDP private key)' }
-                        @{ N = 'CryptSvc'; DefStart = 2; Desc = 'Cryptographic Services (needed for cert store)' }
-                        @{ N = 'CertPropSvc'; DefStart = 3; Desc = 'Certificate Propagation (needed for user certs)' }
-                    )) {
-                    $cs = (Get-ItemProperty "$svcRoot\$($cryptSvc.N)" -ErrorAction SilentlyContinue).Start
-                    if ($cs -eq 4) {
-                        & $emit 'RDP' (& $toSev $sevRdpCryptoSvcDisabled) "$($cryptSvc.N) ($($cryptSvc.Desc)) is DISABLED - RDP certificate operations will fail" "-FixRDPPermissions"
-                    }
-                }
-
-                # TLS 1.2 explicitly disabled in SCHANNEL
-                foreach ($tlsRole in @('Client', 'Server')) {
-                    $tlsPath = "$ctrlRoot\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\$tlsRole"
-                    if (Test-Path $tlsPath) {
-                        $tlsProps = Get-ItemProperty $tlsPath -ErrorAction SilentlyContinue
-                        if ($tlsProps.Enabled -eq 0 -or $tlsProps.DisabledByDefault -eq 1) {
-                            & $emit 'RDP' (& $toSev $sevRdpTlsDisabled) "TLS 1.2 $tlsRole is explicitly DISABLED in SCHANNEL - RDP SSL handshake may fail" "-FixRDP"
+                    # TermService, SessionEnv, UmRdpService
+                    foreach ($rdpSvc in @(
+                            @{ N = 'TermService'; Desc = 'Remote Desktop Services'; Crit = $true }
+                            @{ N = 'SessionEnv'; Desc = 'Remote Desktop Config'; Crit = $true }
+                            @{ N = 'UmRdpService'; Desc = 'RDP UserMode Port Redirector'; Crit = $false }
+                        )) {
+                        $svcStart = (Get-ItemProperty "$svcRoot\$($rdpSvc.N)" -ErrorAction SilentlyContinue).Start
+                        if ($svcStart -eq 4) {
+                            $sev = if ($rdpSvc.Crit) { (& $toSev $sevRdpSvcDisabledCrit) } else { (& $toSev $sevRdpSvcDisabledWarn) }
+                            & $emit 'RDP' $sev "$($rdpSvc.N) ($($rdpSvc.Desc)) is DISABLED (Start=4) - RDP will not work" "-FixRDP"
+                        }
+                        elseif ($null -ne $svcStart) {
+                            & $emit 'RDP' 'OK' "$($rdpSvc.N) Start=$svcStart"
                         }
                     }
-                }
 
-                # NTLM restrictions
-                $msv1 = Get-ItemProperty "$ctrlRoot\Lsa\MSV1_0" -ErrorAction SilentlyContinue
-                if ($msv1) {
-                    if ($msv1.RestrictSendingNTLMTraffic -ge 2 -or $msv1.RestrictReceivingNTLMTraffic -ge 1) {
-                        & $emit 'RDP' (& $toSev $sevRdpNtlmRestrict) "NTLM restrictions: RestrictSending=$($msv1.RestrictSendingNTLMTraffic) RestrictReceiving=$($msv1.RestrictReceivingNTLMTraffic) - may block RDP auth" "-FixRDPAuth"
+                    if (Test-Path $rdpTcpPath) {
+                        $rdpP = Get-ItemProperty $rdpTcpPath -ErrorAction SilentlyContinue
+
+                        # Port number
+                        $rdpPort = $rdpP.PortNumber
+                        if ($null -ne $rdpPort -and $rdpPort -ge 1 -and $rdpPort -le 65535) { $script:_sysCheckRdpPort = [int]$rdpPort }
+                        if ($null -ne $rdpPort -and $rdpPort -ne 3389) {
+                            & $emit 'RDP' (& $toSev $sevRdpNonDefaultPort) "RDP-Tcp port is $rdpPort (not the default 3389) - ensure firewall allows this port or run -FixRDP to reset" "-FixRDP"
+                        }
+                        else {
+                            & $emit 'RDP' 'OK' "RDP-Tcp port: $(if ($null -eq $rdpPort) { '(not set, default 3389)' } else { $rdpPort })"
+                        }
+
+                        # Security layer
+                        $sl = $rdpP.SecurityLayer
+                        if ($null -ne $sl) {
+                            $slDesc = switch ($sl) { 0 { 'RDP native (no SSL) - weakest encryption' } 1 { 'Negotiate' } 2 { 'SSL/TLS required' } default { "Unknown ($sl)" } }
+                            $slSev = if ($sl -eq 0) { (& $toSev $sevRdpSecurityLayerWeak) } else { 'INFO' }
+                            & $emit 'RDP' $slSev "SecurityLayer=$sl ($slDesc)"
+                        }
+
+                        # NLA / UserAuthentication
+                        $ua = $rdpP.UserAuthentication
+                        if ($ua -eq 0) {
+                            & $emit 'RDP' (& $toSev $sevRdpNLADisabled) 'NLA is DISABLED (UserAuthentication=0) - any user can attempt login without pre-auth; run -EnableNLA to restore' "-EnableNLA"
+                        }
+                        elseif ($ua -eq 1) {
+                            & $emit 'RDP' 'OK' 'NLA is enabled (UserAuthentication=1)'
+                        }
+                        else {
+                            & $emit 'RDP' 'INFO' 'NLA/UserAuthentication not set on RDP-Tcp key (policy may control this)'
+                        }
+
+                        # fAllowSecProtocolNegotiation (also touched by -DisableNLA)
+                        $aspn = $rdpP.fAllowSecProtocolNegotiation
+                        if ($aspn -eq 0) {
+                            & $emit 'RDP' (& $toSev $sevRdpSecProtoNeg) 'fAllowSecProtocolNegotiation=0 - security protocol negotiation disabled; run -EnableNLA or -FixRDP to reset' "-EnableNLA"
+                        }
+
+                        # MinEncryptionLevel (1=Low was set by -DisableNLA; default is typically 2)
+                        $mel = $rdpP.MinEncryptionLevel
+                        if ($null -ne $mel -and $mel -lt 2) {
+                            & $emit 'RDP' (& $toSev $sevRdpMinEncLevel) "MinEncryptionLevel=$mel (below recommended 2) - may indicate NLA was disabled" "-EnableNLA"
+                        }
+
+                        # SSL certificate thumbprint - absence is normal (Windows generates one on first RDP connection)
+                        $cert = $rdpP.SSLCertificateSHA1Hash
+                        if ($null -ne $cert -and -not ($cert -is [byte[]] -and $cert.Count -eq 0)) {
+                            & $emit 'RDP' 'OK' 'RDP SSL certificate thumbprint is present'
+                        }
+                        # No thumbprint = not flagged; Windows auto-generates one at first RDP connection
+
+                        # MaxInstanceCount - if 0, RDP refuses every connection attempt
+                        $maxInst = $rdpP.MaxInstanceCount
+                        if ($null -ne $maxInst -and $maxInst -eq 0) {
+                            & $emit 'RDP' (& $toSev $sevRdpMaxInstanceZero) "MaxInstanceCount=0 on RDP-Tcp - RDP will refuse ALL connections; run -FixRDP to reset" "-FixRDP"
+                        }
                     }
-                }
+                    else {
+                        & $emit 'RDP' (& $toSev $sevRdpTcpKeyMissing) 'RDP-Tcp WinStation key not found - RDP listener may be misconfigured' "-FixRDP"
+                    }
 
-                # LmCompatibilityLevel (too restrictive blocks older clients)
-                $lsaProps = Get-ItemProperty "$ctrlRoot\Lsa" -ErrorAction SilentlyContinue
-                $lmCompat = $lsaProps.LmCompatibilityLevel
-                if ($null -ne $lmCompat -and $lmCompat -gt 5) {
-                    & $emit 'RDP' (& $toSev $sevRdpLmCompat) "LmCompatibilityLevel=$lmCompat (>5) - may block NTLM-based RDP auth from some clients" "-FixRDPAuth"
+                    # RDP-related crypto services (required for certificate/key operations)
+                    foreach ($cryptSvc in @(
+                            @{ N = 'KeyIso'; DefStart = 3; Desc = 'CNG Key Isolation (needed for RDP private key)' }
+                            @{ N = 'CryptSvc'; DefStart = 2; Desc = 'Cryptographic Services (needed for cert store)' }
+                            @{ N = 'CertPropSvc'; DefStart = 3; Desc = 'Certificate Propagation (needed for user certs)' }
+                        )) {
+                        $cs = (Get-ItemProperty "$svcRoot\$($cryptSvc.N)" -ErrorAction SilentlyContinue).Start
+                        if ($cs -eq 4) {
+                            & $emit 'RDP' (& $toSev $sevRdpCryptoSvcDisabled) "$($cryptSvc.N) ($($cryptSvc.Desc)) is DISABLED - RDP certificate operations will fail" "-FixRDPPermissions"
+                        }
+                    }
+
+                    # TLS 1.2 explicitly disabled in SCHANNEL
+                    foreach ($tlsRole in @('Client', 'Server')) {
+                        $tlsPath = "$ctrlRoot\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\$tlsRole"
+                        if (Test-Path $tlsPath) {
+                            $tlsProps = Get-ItemProperty $tlsPath -ErrorAction SilentlyContinue
+                            if ($tlsProps.Enabled -eq 0 -or $tlsProps.DisabledByDefault -eq 1) {
+                                & $emit 'RDP' (& $toSev $sevRdpTlsDisabled) "TLS 1.2 $tlsRole is explicitly DISABLED in SCHANNEL - RDP SSL handshake may fail" "-FixRDP"
+                            }
+                        }
+                    }
+
+                    # NTLM restrictions
+                    $msv1 = Get-ItemProperty "$ctrlRoot\Lsa\MSV1_0" -ErrorAction SilentlyContinue
+                    if ($msv1) {
+                        if ($msv1.RestrictSendingNTLMTraffic -ge 2 -or $msv1.RestrictReceivingNTLMTraffic -ge 1) {
+                            & $emit 'RDP' (& $toSev $sevRdpNtlmRestrict) "NTLM restrictions: RestrictSending=$($msv1.RestrictSendingNTLMTraffic) RestrictReceiving=$($msv1.RestrictReceivingNTLMTraffic) - may block RDP auth" "-FixRDPAuth"
+                        }
+                    }
+
+                    # LmCompatibilityLevel (too restrictive blocks older clients)
+                    $lsaProps = Get-ItemProperty "$ctrlRoot\Lsa" -ErrorAction SilentlyContinue
+                    $lmCompat = $lsaProps.LmCompatibilityLevel
+                    if ($null -ne $lmCompat -and $lmCompat -gt 5) {
+                        & $emit 'RDP' (& $toSev $sevRdpLmCompat) "LmCompatibilityLevel=$lmCompat (>5) - may block NTLM-based RDP auth from some clients" "-FixRDPAuth"
+                    }
                 }
 
                 # -- Credential Guard ------------------------------------------------
-                $cgLsa = $lsaProps.LsaCfgFlags
-                if ($cgLsa -and $cgLsa -ne 0) {
-                    $lockType = if ($cgLsa -eq 1) { 'UEFI lock - registry change alone is insufficient' } else { 'software lock' }
-                    & $emit 'Security' (& $toSev $sevCredentialGuard) "Credential Guard is enabled (LsaCfgFlags=$cgLsa, $lockType)" "-DisableCredentialGuard"
-                }
-                $runAsPPL = $lsaProps.RunAsPPL
-                if ($null -ne $runAsPPL -and [int]$runAsPPL -ne 0) {
-                    & $emit 'Security' (& $toSev $sevLsaPPL) "LSA Protected Process (RunAsPPL=$runAsPPL) is active - may affect some security tools"
-                }
-                $appProxyConnectorServices = [System.Collections.Generic.List[string]]::new()
-                foreach ($svcKey in (Get-ChildItem $svcRoot -ErrorAction SilentlyContinue)) {
-                    $svcProps = Get-ItemProperty $svcKey.PSPath -ErrorAction SilentlyContinue
-                    $svcName = $svcKey.PSChildName
-                    $svcDisplay = [string]$svcProps.DisplayName
-                    $svcImage = [string]$svcProps.ImagePath
-                    if ($svcName -in @('WAPCSvc', 'WAPCUpdaterSvc') -or
-                        $svcDisplay -match '(?i)(AAD|Entra).*Application Proxy.*Connector|Application Proxy Connector' -or
-                        $svcImage -match '(?i)AAD App Proxy Connector|Application Proxy Connector|WAPC') {
-                        $label = if ($svcDisplay) { "$svcName ($svcDisplay)" } else { $svcName }
-                        if (-not $appProxyConnectorServices.Contains($label)) { $appProxyConnectorServices.Add($label) }
+                if (& $inArea 'RDP', 'Security') {
+                    $cgLsa = $lsaProps.LsaCfgFlags
+                    if ($cgLsa -and $cgLsa -ne 0) {
+                        $lockType = if ($cgLsa -eq 1) { 'UEFI lock - registry change alone is insufficient' } else { 'software lock' }
+                        & $emit 'Security' (& $toSev $sevCredentialGuard) "Credential Guard is enabled (LsaCfgFlags=$cgLsa, $lockType)" "-DisableCredentialGuard"
                     }
-                }
-                if ($appProxyConnectorServices.Count -gt 0 -and $null -ne $runAsPPL -and [int]$runAsPPL -ne 0) {
-                    & $emit 'Security' (& $toSev $sevAppProxyLsaProtection) "Microsoft Entra application proxy connector installed ($($appProxyConnectorServices -join ', ')) and LSA protection is enabled (RunAsPPL=$runAsPPL) - if Kerberos delegation fails or LSASS restarts after servicing, disable only LSA protection" "-DisableLsaProtection"
+                    $runAsPPL = $lsaProps.RunAsPPL
+                    if ($null -ne $runAsPPL -and [int]$runAsPPL -ne 0) {
+                        & $emit 'Security' (& $toSev $sevLsaPPL) "LSA Protected Process (RunAsPPL=$runAsPPL) is active - may affect some security tools"
+                    }
+                    $appProxyConnectorServices = [System.Collections.Generic.List[string]]::new()
+                    foreach ($svcKey in (Get-ChildItem $svcRoot -ErrorAction SilentlyContinue)) {
+                        $svcProps = Get-ItemProperty $svcKey.PSPath -ErrorAction SilentlyContinue
+                        $svcName = $svcKey.PSChildName
+                        $svcDisplay = [string]$svcProps.DisplayName
+                        $svcImage = [string]$svcProps.ImagePath
+                        if ($svcName -in @('WAPCSvc', 'WAPCUpdaterSvc') -or
+                            $svcDisplay -match '(?i)(AAD|Entra).*Application Proxy.*Connector|Application Proxy Connector' -or
+                            $svcImage -match '(?i)AAD App Proxy Connector|Application Proxy Connector|WAPC') {
+                            $label = if ($svcDisplay) { "$svcName ($svcDisplay)" } else { $svcName }
+                            if (-not $appProxyConnectorServices.Contains($label)) { $appProxyConnectorServices.Add($label) }
+                        }
+                    }
+                    if ($appProxyConnectorServices.Count -gt 0 -and $null -ne $runAsPPL -and [int]$runAsPPL -ne 0) {
+                        & $emit 'Security' (& $toSev $sevAppProxyLsaProtection) "Microsoft Entra application proxy connector installed ($($appProxyConnectorServices -join ', ')) and LSA protection is enabled (RunAsPPL=$runAsPPL) - if Kerberos delegation fails or LSASS restarts after servicing, disable only LSA protection" "-DisableLsaProtection"
+                    }
                 }
 
                 # -- Azure Guest Agent ------------------------------------------------
-                foreach ($ag in @('WindowsAzureGuestAgent', 'RdAgent')) {
-                    $ap = "$svcRoot\$ag"
-                    if (Test-Path $ap) {
-                        $aStart = (Get-ItemProperty $ap -ErrorAction SilentlyContinue).Start
-                        if ($aStart -eq 4) {
-                            & $emit 'AzureAgent' (& $toSev $sevAzureAgentDisabled) "$ag is DISABLED (Start=4) - VM will not respond to Azure platform operations" "-FixAzureGuestAgent"
-                        }
-                        elseif ($aStart -ne 2) {
-                            & $emit 'AzureAgent' (& $toSev $sevAzureAgentWrongStart) "$ag Start=$aStart (expected 2/Auto)" "-FixAzureGuestAgent"
+                if (& $inArea 'Connectivity') {
+                    foreach ($ag in @('WindowsAzureGuestAgent', 'RdAgent')) {
+                        $ap = "$svcRoot\$ag"
+                        if (Test-Path $ap) {
+                            $aStart = (Get-ItemProperty $ap -ErrorAction SilentlyContinue).Start
+                            if ($aStart -eq 4) {
+                                & $emit 'AzureAgent' (& $toSev $sevAzureAgentDisabled) "$ag is DISABLED (Start=4) - VM will not respond to Azure platform operations" "-FixAzureGuestAgent"
+                            }
+                            elseif ($aStart -ne 2) {
+                                & $emit 'AzureAgent' (& $toSev $sevAzureAgentWrongStart) "$ag Start=$aStart (expected 2/Auto)" "-FixAzureGuestAgent"
+                            }
+                            else {
+                                & $emit 'AzureAgent' 'OK' "$ag Start=2 (Auto)"
+                            }
                         }
                         else {
-                            & $emit 'AzureAgent' 'OK' "$ag Start=2 (Auto)"
+                            & $emit 'AzureAgent' (& $toSev $sevAzureAgentMissing) "$ag not found in registry - agent may not be installed" "-InstallAzureVMAgent"
                         }
-                    }
-                    else {
-                        & $emit 'AzureAgent' (& $toSev $sevAzureAgentMissing) "$ag not found in registry - agent may not be installed" "-InstallAzureVMAgent"
                     }
                 }
 
                 # -- Networking: BFE & TCP/IP -----------------------------------------
-                $bfeStart = (Get-ItemProperty "$svcRoot\BFE" -ErrorAction SilentlyContinue).Start
-                if ($bfeStart -eq 4) {
-                    & $emit 'Networking' (& $toSev $sevBfeDisabled) 'BFE (Base Filtering Engine) is DISABLED - Windows Firewall and IPSec/network policy will not function' "-EnableBFE"
-                }
-                elseif ($null -ne $bfeStart) {
-                    & $emit 'Networking' 'OK' "BFE Start=$bfeStart (enabled)"
-                }
-                $tcpStart = (Get-ItemProperty "$svcRoot\Tcpip" -ErrorAction SilentlyContinue).Start
-                if ($tcpStart -eq 4) {
-                    & $emit 'Networking' (& $toSev $sevTcpipDisabled) 'Tcpip service is DISABLED - no network will be available' "-ResetNetworkStack"
-                }
-
-                # nsi (Network Store Interface) - core TCP/IP dependency; if disabled, zero networking
-                $nsiStart = (Get-ItemProperty "$svcRoot\nsi" -ErrorAction SilentlyContinue).Start
-                if ($nsiStart -eq 4) {
-                    & $emit 'Networking' (& $toSev $sevNsiDisabled) "nsi (Network Store Interface) is DISABLED - TCP/IP stack is non-functional; all networking will fail" "-EnableDriverOrService nsi -DriverStartType Automatic"
-                }
-
-                # Additional networking services
-                foreach ($netSvc in @(
-                        @{ N = 'Dnscache'; Desc = 'DNS Client - name resolution will fail' }
-                        @{ N = 'NlaSvc'; Desc = 'Network Location Awareness - network profile detection will fail' }
-                        @{ N = 'Dhcp'; Desc = 'DHCP Client - automatic IP configuration will not work' }
-                        @{ N = 'LanmanWorkstation'; Desc = 'Workstation service (SMB client) - file sharing access will fail' }
-                        @{ N = 'LanmanServer'; Desc = 'Server service (SMB server) - file sharing hosting will fail' }
-                    )) {
-                    $ns = (Get-ItemProperty "$svcRoot\$($netSvc.N)" -ErrorAction SilentlyContinue).Start
-                    if ($ns -eq 4) {
-                        & $emit 'Networking' (& $toSev $sevNetSvcDisabled) "$($netSvc.N) is DISABLED - $($netSvc.Desc)" "-ResetNetworkStack"
+                if (& $inArea 'Connectivity') {
+                    $bfeStart = (Get-ItemProperty "$svcRoot\BFE" -ErrorAction SilentlyContinue).Start
+                    if ($bfeStart -eq 4) {
+                        & $emit 'Networking' (& $toSev $sevBfeDisabled) 'BFE (Base Filtering Engine) is DISABLED - Windows Firewall and IPSec/network policy will not function' "-EnableBFE"
                     }
-                }
+                    elseif ($null -ne $bfeStart) {
+                        & $emit 'Networking' 'OK' "BFE Start=$bfeStart (enabled)"
+                    }
+                    $tcpStart = (Get-ItemProperty "$svcRoot\Tcpip" -ErrorAction SilentlyContinue).Start
+                    if ($tcpStart -eq 4) {
+                        & $emit 'Networking' (& $toSev $sevTcpipDisabled) 'Tcpip service is DISABLED - no network will be available' "-ResetNetworkStack"
+                    }
 
-                # SAN policy (partmgr)
-                $sanPolicy = (Get-ItemProperty "$svcRoot\partmgr\Parameters" -ErrorAction SilentlyContinue).SanPolicy
-                if ($null -ne $sanPolicy -and $sanPolicy -ne 1 -and $sanPolicy -ne 0) {
-                    $sanDesc = switch ($sanPolicy) { 2 { 'OfflineShared - shared disks stay offline' } 3 { 'OfflineAll - all SAN disks stay offline' } 4 { 'OfflineInternal - internal SAN disks offline' } default { "Value=$sanPolicy" } }
-                    & $emit 'Networking' (& $toSev $sevSanPolicy) "SAN policy is set to $sanDesc - data disks may not come online after migration; run -FixSanPolicy to set OnlineAll" "-FixSanPolicy"
-                }
-                elseif ($null -ne $sanPolicy) {
-                    & $emit 'Networking' 'OK' "SAN policy: OnlineAll ($sanPolicy)"
+                    # nsi (Network Store Interface) - core TCP/IP dependency; if disabled, zero networking
+                    $nsiStart = (Get-ItemProperty "$svcRoot\nsi" -ErrorAction SilentlyContinue).Start
+                    if ($nsiStart -eq 4) {
+                        & $emit 'Networking' (& $toSev $sevNsiDisabled) "nsi (Network Store Interface) is DISABLED - TCP/IP stack is non-functional; all networking will fail" "-EnableDriverOrService nsi -DriverStartType Automatic"
+                    }
+
+                    # Additional networking services
+                    foreach ($netSvc in @(
+                            @{ N = 'Dnscache'; Desc = 'DNS Client - name resolution will fail' }
+                            @{ N = 'NlaSvc'; Desc = 'Network Location Awareness - network profile detection will fail' }
+                            @{ N = 'Dhcp'; Desc = 'DHCP Client - automatic IP configuration will not work' }
+                            @{ N = 'LanmanWorkstation'; Desc = 'Workstation service (SMB client) - file sharing access will fail' }
+                            @{ N = 'LanmanServer'; Desc = 'Server service (SMB server) - file sharing hosting will fail' }
+                        )) {
+                        $ns = (Get-ItemProperty "$svcRoot\$($netSvc.N)" -ErrorAction SilentlyContinue).Start
+                        if ($ns -eq 4) {
+                            & $emit 'Networking' (& $toSev $sevNetSvcDisabled) "$($netSvc.N) is DISABLED - $($netSvc.Desc)" "-ResetNetworkStack"
+                        }
+                    }
+
+                    # SAN policy (partmgr)
+                    $sanPolicy = (Get-ItemProperty "$svcRoot\partmgr\Parameters" -ErrorAction SilentlyContinue).SanPolicy
+                    if ($null -ne $sanPolicy -and $sanPolicy -ne 1 -and $sanPolicy -ne 0) {
+                        $sanDesc = switch ($sanPolicy) { 2 { 'OfflineShared - shared disks stay offline' } 3 { 'OfflineAll - all SAN disks stay offline' } 4 { 'OfflineInternal - internal SAN disks offline' } default { "Value=$sanPolicy" } }
+                        & $emit 'Networking' (& $toSev $sevSanPolicy) "SAN policy is set to $sanDesc - data disks may not come online after migration; run -FixSanPolicy to set OnlineAll" "-FixSanPolicy"
+                    }
+                    elseif ($null -ne $sanPolicy) {
+                        & $emit 'Networking' 'OK' "SAN policy: OnlineAll ($sanPolicy)"
+                    }
                 }
 
                 # -- Boot/System driver binary + trust health ---------------------------
@@ -17241,559 +17319,583 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
                 # are reported separately because they are safe and present on disk.
                 # Use -DisableThirdPartyDrivers to intentionally suppress all non-MS
                 # drivers when troubleshooting a clean-boot scenario.
-                $missingDrivers = [System.Collections.Generic.List[string]]::new()
-                $thirdPartyBootSystemDrivers = [System.Collections.Generic.List[string]]::new()
-                $badSignatureDrivers = [System.Collections.Generic.List[PSCustomObject]]::new()
-                $unverifiedDrivers = [System.Collections.Generic.List[string]]::new()
-                $trustedDriverCount = 0
-                $knownSafeBootSystemDriverNames = [string[]]@()
-                foreach ($safeDriverSpec in (Get-DeviceClassFilterSpec | Where-Object { $_.Name -in @('HDC', 'SCSIAdapter') })) {
-                    foreach ($safeDriverName in @($safeDriverSpec.SafeFilters | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
-                        if ($knownSafeBootSystemDriverNames -inotcontains $safeDriverName) {
-                            $knownSafeBootSystemDriverNames += $safeDriverName
+                if (& $inArea 'Boot', 'Security') {
+                    $missingDrivers = [System.Collections.Generic.List[string]]::new()
+                    $thirdPartyBootSystemDrivers = [System.Collections.Generic.List[string]]::new()
+                    $badSignatureDrivers = [System.Collections.Generic.List[PSCustomObject]]::new()
+                    $unverifiedDrivers = [System.Collections.Generic.List[string]]::new()
+                    $trustedDriverCount = 0
+                    $knownSafeBootSystemDriverNames = [string[]]@()
+                    foreach ($safeDriverSpec in (Get-DeviceClassFilterSpec | Where-Object { $_.Name -in @('HDC', 'SCSIAdapter') })) {
+                        foreach ($safeDriverName in @($safeDriverSpec.SafeFilters | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+                            if ($knownSafeBootSystemDriverNames -inotcontains $safeDriverName) {
+                                $knownSafeBootSystemDriverNames += $safeDriverName
+                            }
                         }
                     }
-                }
-                Get-ChildItem $svcRoot -ErrorAction SilentlyContinue | ForEach-Object {
-                    $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
-                    # Only kernel/filesystem drivers (Type 1/2) at Boot(0) or System(1) start
-                    if ($p.Type -notin @(1, 2) -or $p.Start -notin @(0, 1)) { return }
-                    $svcName = $_.PSChildName
-                    # Windows default: when ImagePath is absent the driver file is
-                    # System32\drivers\<ServiceName>.sys, so those still get checked.
-                    $imgDisplay = if ($p.ImagePath) { $p.ImagePath } else { "system32\drivers\$svcName.sys (default path)" }
-                    $imgR = if ($p.ImagePath) {
-                        Resolve-GuestImagePath $p.ImagePath
-                    }
-                    else {
-                        Join-Path $script:WinDriveLetter "Windows\System32\drivers\$svcName.sys"
-                    }
-                    # Flag if binary is missing or 0 bytes (corrupt/truncated)
-                    if (-not (Test-Path $imgR)) { $missingDrivers.Add("$svcName ($imgDisplay)") }
-                    elseif ((Get-Item -LiteralPath $imgR -ErrorAction SilentlyContinue).Length -eq 0) { $missingDrivers.Add("$svcName ($imgDisplay) [0 bytes]") }
-                    else {
-                        # Validate image trust on present boot/system drivers
-                        $drvSig = Test-MicrosoftSignature -FilePath $imgR
-                        $isKnownSafeBootSystemDriver = ($drvSig.TrustState -eq 'ValidOtherPublisher' -and
-                            $knownSafeBootSystemDriverNames -icontains $svcName -and
-                            ([IO.Path]::GetFileName($imgR) -ieq "$svcName.sys"))
-                        $driverSummary = "$svcName ($imgDisplay) [$($drvSig.Status)]"
-
-                        if ($drvSig.IsHardFailure) {
-                            $badSignatureDrivers.Add([PSCustomObject]@{
-                                    Name         = $svcName
-                                    ImagePath    = $imgDisplay
-                                    ResolvedPath = $imgR
-                                    FileName     = [IO.Path]::GetFileName($imgR)
-                                    Start        = [int]$p.Start
-                                    Type         = [int]$p.Type
-                                    ErrorControl = if ($null -ne $p.ErrorControl) { [int]$p.ErrorControl } else { 1 }
-                                    Group        = if ($p.Group) { [string]$p.Group } else { '' }
-                                    Signature    = $drvSig
-                                })
-                        }
-                        elseif ($isKnownSafeBootSystemDriver) { return }
-                        elseif ($drvSig.TrustState -eq 'ValidOtherPublisher') { $thirdPartyBootSystemDrivers.Add($driverSummary) }
-                        elseif ($drvSig.TrustState -eq 'ValidMicrosoft') { $trustedDriverCount++ }
-                        elseif ($drvSig.IsAcceptableMicrosoft) { $unverifiedDrivers.Add($driverSummary) }
-                        else { $unverifiedDrivers.Add($driverSummary) }
-                    }
-                }
-                if ($missingDrivers.Count -gt 0) {
-                    & $emit 'Drivers' (& $toSev $sevMissingDriverBinaries) "$($missingDrivers.Count) Boot/System driver(s) registered but binary MISSING or 0-byte - will BSOD on boot: $($missingDrivers -join ', ')" "-RepairSystemFile <name.sys> or -DisableThirdPartyDrivers"
-                }
-                else {
-                    # Presence and trust are different results; say which one this is.
-                    $trustSummary = "trust: $trustedDriverCount verified, $($badSignatureDrivers.Count) invalid, $($unverifiedDrivers.Count) unverified, $($thirdPartyBootSystemDrivers.Count) third-party"
-                    if ($badSignatureDrivers.Count -gt 0) {
-                        # Every path resolved, but at least one of those files will be
-                        # refused at load. Reporting that as OK reads as an all-clear,
-                        # which is the opposite of what the next line goes on to say.
-                        & $emit 'Drivers' 'WARN' "All Boot/System driver paths are present and non-zero, but $($badSignatureDrivers.Count) failed image trust validation ($trustSummary)" '-RepairSystemFile <name.sys>'
-                    }
-                    else {
-                        & $emit 'Drivers' 'OK' "All Boot/System driver paths are present and non-zero ($trustSummary)"
-                    }
-                }
-                if ($badSignatureDrivers.Count -gt 0) {
-                    # Connect the trust failure to real boot risk. A Boot/System driver with
-                    # ErrorControl=3 that the kernel refuses to load is boot-fatal and is the
-                    # exact shape of CRITICAL_SERVICE_FAILED (0x5A) / STATUS_INVALID_IMAGE_HASH.
-                    foreach ($bad in ($badSignatureDrivers | Sort-Object @{E = { $_.ErrorControl }; Descending = $true }, Name)) {
-                        $startName = if ($bad.Start -eq 0) { 'Boot' } else { 'System' }
-                        $typeName = if ($bad.Type -eq 2) { 'file-system driver' } else { 'kernel driver' }
-                        $ecName = switch ($bad.ErrorControl) { 0 { 'Ignore' } 1 { 'Normal' } 2 { 'Severe' } 3 { 'Critical' } default { "$($bad.ErrorControl)" } }
-                        $trustText = Get-TrustStateDescription -Signature $bad.Signature
-                        $impact = if ($bad.ErrorControl -ge 3) {
-                            'Windows will stop with CRITICAL_SERVICE_FAILED (0x5A, STATUS_INVALID_IMAGE_HASH 0xC0000428) during driver initialization; Safe Mode does not avoid it'
-                        }
-                        elseif ($bad.ErrorControl -eq 2) {
-                            'Windows will fail this driver and fall back to Last Known Good; boot may still fail'
+                    Get-ChildItem $svcRoot -ErrorAction SilentlyContinue | ForEach-Object {
+                        $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+                        # Only kernel/filesystem drivers (Type 1/2) at Boot(0) or System(1) start
+                        if ($p.Type -notin @(1, 2) -or $p.Start -notin @(0, 1)) { return }
+                        $svcName = $_.PSChildName
+                        # Windows default: when ImagePath is absent the driver file is
+                        # System32\drivers\<ServiceName>.sys, so those still get checked.
+                        $imgDisplay = if ($p.ImagePath) { $p.ImagePath } else { "system32\drivers\$svcName.sys (default path)" }
+                        $imgR = if ($p.ImagePath) {
+                            Resolve-GuestImagePath $p.ImagePath
                         }
                         else {
-                            'the driver will not load; dependent storage/network/security functionality will be unavailable'
+                            Join-Path $script:WinDriveLetter "Windows\System32\drivers\$svcName.sys"
                         }
-                        $severity = if ($bad.ErrorControl -ge 3) { 'CRIT' } else { & $toSev $sevBinarySignatureBad }
-                        & $emit 'Security' $severity ("$($bad.Name) is a $startName-start $typeName with ErrorControl=$ecName; $($bad.FileName) $trustText - $impact") "-RepairSystemFile $(Get-RepairSystemFileArgument -Path $bad.ResolvedPath)"
+                        # Flag if binary is missing or 0 bytes (corrupt/truncated)
+                        if (-not (Test-Path $imgR)) { $missingDrivers.Add("$svcName ($imgDisplay)") }
+                        elseif ((Get-Item -LiteralPath $imgR -ErrorAction SilentlyContinue).Length -eq 0) { $missingDrivers.Add("$svcName ($imgDisplay) [0 bytes]") }
+                        else {
+                            # Validate image trust on present boot/system drivers
+                            $drvSig = Test-MicrosoftSignature -FilePath $imgR
+                            $isKnownSafeBootSystemDriver = ($drvSig.TrustState -eq 'ValidOtherPublisher' -and
+                                $knownSafeBootSystemDriverNames -icontains $svcName -and
+                                ([IO.Path]::GetFileName($imgR) -ieq "$svcName.sys"))
+                            $driverSummary = "$svcName ($imgDisplay) [$($drvSig.Status)]"
+
+                            if ($drvSig.IsHardFailure) {
+                                $badSignatureDrivers.Add([PSCustomObject]@{
+                                        Name         = $svcName
+                                        ImagePath    = $imgDisplay
+                                        ResolvedPath = $imgR
+                                        FileName     = [IO.Path]::GetFileName($imgR)
+                                        Start        = [int]$p.Start
+                                        Type         = [int]$p.Type
+                                        ErrorControl = if ($null -ne $p.ErrorControl) { [int]$p.ErrorControl } else { 1 }
+                                        Group        = if ($p.Group) { [string]$p.Group } else { '' }
+                                        Signature    = $drvSig
+                                    })
+                            }
+                            elseif ($isKnownSafeBootSystemDriver) { return }
+                            elseif ($drvSig.TrustState -eq 'ValidOtherPublisher') { $thirdPartyBootSystemDrivers.Add($driverSummary) }
+                            elseif ($drvSig.TrustState -eq 'ValidMicrosoft') { $trustedDriverCount++ }
+                            elseif ($drvSig.IsAcceptableMicrosoft) { $unverifiedDrivers.Add($driverSummary) }
+                            else { $unverifiedDrivers.Add($driverSummary) }
+                        }
                     }
-                }
-                if ($unverifiedDrivers.Count -gt 0) {
-                    # Honest reporting: Microsoft-branded images this host cannot prove or
-                    # disprove. Grouped into one advisory so it never floods the report.
-                    & $emit 'Security' 'INFO' "$($unverifiedDrivers.Count) Boot/System driver(s) are Microsoft-branded but could not be cryptographically verified from this host ($($script:OfflineCatalogStoreSummary)): $($unverifiedDrivers -join ', ')" ''
-                }
-                if ($thirdPartyBootSystemDrivers.Count -gt 0) {
-                    & $emit 'Security' (& $toSev $sevThirdPartyBootSystemDriver) "$($thirdPartyBootSystemDrivers.Count) Boot/System driver(s) are validly signed by non-Microsoft publishers: $($thirdPartyBootSystemDrivers -join ', ')" "-GetServicesReport -IssuesOnly"
+                    if ($missingDrivers.Count -gt 0) {
+                        & $emit 'Drivers' (& $toSev $sevMissingDriverBinaries) "$($missingDrivers.Count) Boot/System driver(s) registered but binary MISSING or 0-byte - will BSOD on boot: $($missingDrivers -join ', ')" "-RepairSystemFile <name.sys> or -DisableThirdPartyDrivers"
+                    }
+                    else {
+                        # Presence and trust are different results; say which one this is.
+                        $trustSummary = "trust: $trustedDriverCount verified, $($badSignatureDrivers.Count) invalid, $($unverifiedDrivers.Count) unverified, $($thirdPartyBootSystemDrivers.Count) third-party"
+                        if ($badSignatureDrivers.Count -gt 0) {
+                            # Every path resolved, but at least one of those files will be
+                            # refused at load. Reporting that as OK reads as an all-clear,
+                            # which is the opposite of what the next line goes on to say.
+                            & $emit 'Drivers' 'WARN' "All Boot/System driver paths are present and non-zero, but $($badSignatureDrivers.Count) failed image trust validation ($trustSummary)" '-RepairSystemFile <name.sys>'
+                        }
+                        else {
+                            & $emit 'Drivers' 'OK' "All Boot/System driver paths are present and non-zero ($trustSummary)"
+                        }
+                    }
+                    if ($badSignatureDrivers.Count -gt 0) {
+                        # Connect the trust failure to real boot risk. A Boot/System driver with
+                        # ErrorControl=3 that the kernel refuses to load is boot-fatal and is the
+                        # exact shape of CRITICAL_SERVICE_FAILED (0x5A) / STATUS_INVALID_IMAGE_HASH.
+                        foreach ($bad in ($badSignatureDrivers | Sort-Object @{E = { $_.ErrorControl }; Descending = $true }, Name)) {
+                            $startName = if ($bad.Start -eq 0) { 'Boot' } else { 'System' }
+                            $typeName = if ($bad.Type -eq 2) { 'file-system driver' } else { 'kernel driver' }
+                            $ecName = switch ($bad.ErrorControl) { 0 { 'Ignore' } 1 { 'Normal' } 2 { 'Severe' } 3 { 'Critical' } default { "$($bad.ErrorControl)" } }
+                            $trustText = Get-TrustStateDescription -Signature $bad.Signature
+                            $impact = if ($bad.ErrorControl -ge 3) {
+                                'Windows will stop with CRITICAL_SERVICE_FAILED (0x5A, STATUS_INVALID_IMAGE_HASH 0xC0000428) during driver initialization; Safe Mode does not avoid it'
+                            }
+                            elseif ($bad.ErrorControl -eq 2) {
+                                'Windows will fail this driver and fall back to Last Known Good; boot may still fail'
+                            }
+                            else {
+                                'the driver will not load; dependent storage/network/security functionality will be unavailable'
+                            }
+                            $severity = if ($bad.ErrorControl -ge 3) { 'CRIT' } else { & $toSev $sevBinarySignatureBad }
+                            & $emit 'Security' $severity ("$($bad.Name) is a $startName-start $typeName with ErrorControl=$ecName; $($bad.FileName) $trustText - $impact") "-RepairSystemFile $(Get-RepairSystemFileArgument -Path $bad.ResolvedPath)"
+                        }
+                    }
+                    if ($unverifiedDrivers.Count -gt 0) {
+                        # Honest reporting: Microsoft-branded images this host cannot prove or
+                        # disprove. Grouped into one advisory so it never floods the report.
+                        & $emit 'Security' 'INFO' "$($unverifiedDrivers.Count) Boot/System driver(s) are Microsoft-branded but could not be cryptographically verified from this host ($($script:OfflineCatalogStoreSummary)): $($unverifiedDrivers -join ', ')" ''
+                    }
+                    if ($thirdPartyBootSystemDrivers.Count -gt 0) {
+                        & $emit 'Security' (& $toSev $sevThirdPartyBootSystemDriver) "$($thirdPartyBootSystemDrivers.Count) Boot/System driver(s) are validly signed by non-Microsoft publishers: $($thirdPartyBootSystemDrivers -join ', ')" "-GetServicesReport -IssuesOnly"
+                    }
                 }
 
                 # -- Device class filters ---------------------------------------------
-                $classRoot = "HKLM:\BROKENSYSTEM\$csName\Control\Class"
-                foreach ($fc in (Get-DeviceClassFilterSpec)) {
-                    $cp = "$classRoot\$($fc.GUID)"
-                    if (-not (Test-Path $cp)) { continue }
-                    $safe = [string[]]$fc.SafeFilters
-                    $filterSev = if ($fc.Risk -eq 'CRITICAL') { & $toSev $sevDeviceFiltersCrit } else { & $toSev $sevDeviceFiltersWarn }
-                    foreach ($ft in @('UpperFilters', 'LowerFilters')) {
-                        $raw = (Get-ItemProperty $cp -ErrorAction SilentlyContinue).$ft
-                        $active = @($raw | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
-                        $suspect = @($active | Where-Object { $safe -inotcontains $_ })
-                        if ($suspect.Count -gt 0) {
-                            & $emit 'DeviceFilters' $filterSev "$($fc.Name) $ft contains non-standard entries: $($suspect -join ', ')" "-FixDeviceFilters"
+                if (& $inArea 'Boot') {
+                    $classRoot = "HKLM:\BROKENSYSTEM\$csName\Control\Class"
+                    foreach ($fc in (Get-DeviceClassFilterSpec)) {
+                        $cp = "$classRoot\$($fc.GUID)"
+                        if (-not (Test-Path $cp)) { continue }
+                        $safe = [string[]]$fc.SafeFilters
+                        $filterSev = if ($fc.Risk -eq 'CRITICAL') { & $toSev $sevDeviceFiltersCrit } else { & $toSev $sevDeviceFiltersWarn }
+                        foreach ($ft in @('UpperFilters', 'LowerFilters')) {
+                            $raw = (Get-ItemProperty $cp -ErrorAction SilentlyContinue).$ft
+                            $active = @($raw | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
+                            $suspect = @($active | Where-Object { $safe -inotcontains $_ })
+                            if ($suspect.Count -gt 0) {
+                                & $emit 'DeviceFilters' $filterSev "$($fc.Name) $ft contains non-standard entries: $($suspect -join ', ')" "-FixDeviceFilters"
+                            }
                         }
                     }
-                }
 
-                $instanceFilterFindings = @(Get-BootCriticalDeviceInstanceFilterFindings -ControlSetNames @($csName))
-                foreach ($instanceFilter in $instanceFilterFindings) {
-                    & $emit 'DeviceFilters' (& $toSev $sevDeviceFiltersCrit) "$($instanceFilter.ControlSet): $($instanceFilter.Message)" $instanceFilter.Fix
+                    $instanceFilterFindings = @(Get-BootCriticalDeviceInstanceFilterFindings -ControlSetNames @($csName))
+                    foreach ($instanceFilter in $instanceFilterFindings) {
+                        & $emit 'DeviceFilters' (& $toSev $sevDeviceFiltersCrit) "$($instanceFilter.ControlSet): $($instanceFilter.Message)" $instanceFilter.Fix
+                    }
                 }
 
                 # -- Orphaned NDIS bindings --------------------------------------------
-                $orphanIds = [System.Collections.Generic.List[string]]::new()
-                $seenComp = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-                foreach ($cg in @('{4D36E973-E325-11CE-BFC1-08002BE10318}', '{4D36E974-E325-11CE-BFC1-08002BE10318}', '{4D36E975-E325-11CE-BFC1-08002BE10318}')) {
-                    $ck = "HKLM:\BROKENSYSTEM\$csName\Control\Class\$cg"
-                    if (-not (Test-Path $ck)) { continue }
-                    Get-ChildItem $ck -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^\d{4}$' } | ForEach-Object {
-                        $pp = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
-                        $cid = if ($pp.ComponentId) { $pp.ComponentId } else { $pp.ComponentID }
-                        if (-not $cid -or $cid -match '^ms_' -or -not $seenComp.Add($cid)) { return }
-                        $sn = $cid -replace '^ms_', ''
-                        $ipp = (Get-ItemProperty "$svcRoot\$sn" -ErrorAction SilentlyContinue).ImagePath
-                        if ($null -eq $ipp) { return }
-                        $ir = Resolve-GuestImagePath $ipp
-                        if (-not (Test-Path $ir) -or (Test-Path $ir) -and (Get-Item -LiteralPath $ir -ErrorAction SilentlyContinue).Length -eq 0) { $orphanIds.Add($cid) }
+                if (& $inArea 'Connectivity') {
+                    $orphanIds = [System.Collections.Generic.List[string]]::new()
+                    $seenComp = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                    foreach ($cg in @('{4D36E973-E325-11CE-BFC1-08002BE10318}', '{4D36E974-E325-11CE-BFC1-08002BE10318}', '{4D36E975-E325-11CE-BFC1-08002BE10318}')) {
+                        $ck = "HKLM:\BROKENSYSTEM\$csName\Control\Class\$cg"
+                        if (-not (Test-Path $ck)) { continue }
+                        Get-ChildItem $ck -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^\d{4}$' } | ForEach-Object {
+                            $pp = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+                            $cid = if ($pp.ComponentId) { $pp.ComponentId } else { $pp.ComponentID }
+                            if (-not $cid -or $cid -match '^ms_' -or -not $seenComp.Add($cid)) { return }
+                            $sn = $cid -replace '^ms_', ''
+                            $ipp = (Get-ItemProperty "$svcRoot\$sn" -ErrorAction SilentlyContinue).ImagePath
+                            if ($null -eq $ipp) { return }
+                            $ir = Resolve-GuestImagePath $ipp
+                            if (-not (Test-Path $ir) -or (Test-Path $ir) -and (Get-Item -LiteralPath $ir -ErrorAction SilentlyContinue).Length -eq 0) { $orphanIds.Add($cid) }
+                        }
                     }
-                }
-                if ($orphanIds.Count -gt 0) {
-                    & $emit 'Networking' (& $toSev $sevOrphanedNdis) "Orphaned NDIS binding(s) with missing binary: $($orphanIds -join ', ') - may prevent network initialisation at boot" "-FixNetBindings"
-                }
-                else {
-                    & $emit 'Networking' 'OK' 'No orphaned NDIS binding components'
+                    if ($orphanIds.Count -gt 0) {
+                        & $emit 'Networking' (& $toSev $sevOrphanedNdis) "Orphaned NDIS binding(s) with missing binary: $($orphanIds -join ', ') - may prevent network initialisation at boot" "-FixNetBindings"
+                    }
+                    else {
+                        & $emit 'Networking' 'OK' 'No orphaned NDIS binding components'
+                    }
                 }
 
                 # -- Windows Update services ------------------------------------------
-                foreach ($wu in @('wuauserv', 'UsoSvc', 'WaaSMedicSvc')) {
-                    $wuS = (Get-ItemProperty "$svcRoot\$wu" -ErrorAction SilentlyContinue).Start
-                    if ($wuS -eq 4) {
-                        & $emit 'WindowsUpdate' (& $toSev $sevUpdateWuDisabled) "$wu is disabled (Start=4) - intentionally stopped via -DisableWindowsUpdate; re-enable on the live VM with: Set-Service -Name $wu -StartupType Automatic"
+                if (& $inArea 'Update') {
+                    foreach ($wu in @('wuauserv', 'UsoSvc', 'WaaSMedicSvc')) {
+                        $wuS = (Get-ItemProperty "$svcRoot\$wu" -ErrorAction SilentlyContinue).Start
+                        if ($wuS -eq 4) {
+                            & $emit 'WindowsUpdate' (& $toSev $sevUpdateWuDisabled) "$wu is disabled (Start=4) - intentionally stopped via -DisableWindowsUpdate; re-enable on the live VM with: Set-Service -Name $wu -StartupType Automatic"
+                        }
                     }
                 }
 
                 # AppIDSvc (AppLocker enforcement service)
-                $appIdSvc = (Get-ItemProperty "$svcRoot\AppIDSvc" -ErrorAction SilentlyContinue).Start
-                $script:_sysCheckAppIdSvcStart = $appIdSvc
-                if ($null -ne $appIdSvc -and $appIdSvc -ne 4) {
-                    & $emit 'Security' (& $toSev $sevAppIdSvc) "AppIDSvc (Application Identity) Start=$appIdSvc - this service is required for AppLocker to enforce rules"
+                if (& $inArea 'Security') {
+                    $appIdSvc = (Get-ItemProperty "$svcRoot\AppIDSvc" -ErrorAction SilentlyContinue).Start
+                    $script:_sysCheckAppIdSvcStart = $appIdSvc
+                    if ($null -ne $appIdSvc -and $appIdSvc -ne 4) {
+                        & $emit 'Security' (& $toSev $sevAppIdSvc) "AppIDSvc (Application Identity) Start=$appIdSvc - this service is required for AppLocker to enforce rules"
+                    }
                 }
 
                 # -- Hyper-V ACPI device IDs -----------------------------------------
-                $enumAcpiRoot = "HKLM:\BROKENSYSTEM\$csName\Enum\ACPI"
-                $msft1000Present = Test-Path "$enumAcpiRoot\MSFT1000"
-                $msft1002Present = Test-Path "$enumAcpiRoot\MSFT1002"
-                if (-not $msft1000Present -or -not $msft1002Present) {
-                    $missing = @()
-                    if (-not $msft1000Present) { $missing += 'MSFT1000 (VMBus)' }
-                    if (-not $msft1002Present) { $missing += 'MSFT1002 (Hyper-V Gen Counter)' }
-                    & $emit 'ACPI' (& $toSev $sevACPISettings) "Hyper-V ACPI device $(if ($missing.Count -gt 1){'entries'}else{'entry'}) missing: $($missing -join ', ') - newer ACPI IDs needed for full Hyper-V synthetic device support" "-CopyACPISettings"
-                }
-                else {
-                    & $emit 'ACPI' 'OK' 'Hyper-V ACPI device entries present (MSFT1000, MSFT1002)'
+                if (& $inArea 'Boot') {
+                    $enumAcpiRoot = "HKLM:\BROKENSYSTEM\$csName\Enum\ACPI"
+                    $msft1000Present = Test-Path "$enumAcpiRoot\MSFT1000"
+                    $msft1002Present = Test-Path "$enumAcpiRoot\MSFT1002"
+                    if (-not $msft1000Present -or -not $msft1002Present) {
+                        $missing = @()
+                        if (-not $msft1000Present) { $missing += 'MSFT1000 (VMBus)' }
+                        if (-not $msft1002Present) { $missing += 'MSFT1002 (Hyper-V Gen Counter)' }
+                        & $emit 'ACPI' (& $toSev $sevACPISettings) "Hyper-V ACPI device $(if ($missing.Count -gt 1){'entries'}else{'entry'}) missing: $($missing -join ', ') - newer ACPI IDs needed for full Hyper-V synthetic device support" "-CopyACPISettings"
+                    }
+                    else {
+                        & $emit 'ACPI' 'OK' 'Hyper-V ACPI device entries present (MSFT1000, MSFT1002)'
+                    }
                 }
 
                 # -- Driver Verifier --------------------------------------------------
-                $mmPath = "$ctrlRoot\Session Manager\Memory Management"
-                if (Test-Path $mmPath) {
-                    $vDrivers = (Get-ItemProperty $mmPath -ErrorAction SilentlyContinue).VerifyDrivers
-                    $vLevel = (Get-ItemProperty $mmPath -ErrorAction SilentlyContinue).VerifyDriverLevel
-                    if ($vDrivers -or $vLevel) {
-                        $targets = if ($vDrivers -eq '*') { 'ALL drivers' } elseif ($vDrivers) { "drivers: $vDrivers" } else { "level=$vLevel" }
-                        & $emit 'Drivers' (& $toSev $sevDriverVerifier) "Driver Verifier is ENABLED ($targets) - will BSOD on any verification failure; disable with -DisableDriverVerifier" "-DisableDriverVerifier"
-                    }
-                    else {
-                        & $emit 'Drivers' 'OK' 'Driver Verifier is not configured'
+                if (& $inArea 'Boot') {
+                    $mmPath = "$ctrlRoot\Session Manager\Memory Management"
+                    if (Test-Path $mmPath) {
+                        $vDrivers = (Get-ItemProperty $mmPath -ErrorAction SilentlyContinue).VerifyDrivers
+                        $vLevel = (Get-ItemProperty $mmPath -ErrorAction SilentlyContinue).VerifyDriverLevel
+                        if ($vDrivers -or $vLevel) {
+                            $targets = if ($vDrivers -eq '*') { 'ALL drivers' } elseif ($vDrivers) { "drivers: $vDrivers" } else { "level=$vLevel" }
+                            & $emit 'Drivers' (& $toSev $sevDriverVerifier) "Driver Verifier is ENABLED ($targets) - will BSOD on any verification failure; disable with -DisableDriverVerifier" "-DisableDriverVerifier"
+                        }
+                        else {
+                            & $emit 'Drivers' 'OK' 'Driver Verifier is not configured'
+                        }
                     }
                 }
 
                 # -- Firewall state ---------------------------------------------------
-                $fwBase = "$SystemRoot\Services\SharedAccess\Parameters\FirewallPolicy"
-                $fwAllDisabled = $true
-                foreach ($fwProf in @('DomainProfile', 'StandardProfile', 'PublicProfile')) {
-                    $fwPath = "$fwBase\$fwProf"
-                    if (Test-Path $fwPath) {
-                        $fwEnabled = (Get-ItemProperty $fwPath -ErrorAction SilentlyContinue).EnableFirewall
-                        if ($fwEnabled -ne 0) { $fwAllDisabled = $false }
+                if (& $inArea 'RDP', 'Connectivity') {
+                    $fwBase = "$SystemRoot\Services\SharedAccess\Parameters\FirewallPolicy"
+                    $fwAllDisabled = $true
+                    foreach ($fwProf in @('DomainProfile', 'StandardProfile', 'PublicProfile')) {
+                        $fwPath = "$fwBase\$fwProf"
+                        if (Test-Path $fwPath) {
+                            $fwEnabled = (Get-ItemProperty $fwPath -ErrorAction SilentlyContinue).EnableFirewall
+                            if ($fwEnabled -ne 0) { $fwAllDisabled = $false }
+                        }
                     }
-                }
-                if ($fwAllDisabled) {
-                    & $emit 'Firewall' 'OK' 'Windows Firewall is disabled on all profiles'
-                }
+                    if ($fwAllDisabled) {
+                        & $emit 'Firewall' 'OK' 'Windows Firewall is disabled on all profiles'
+                    }
 
-                # Duplicate package SIDs can grow this value to hundreds of entries and
-                # leave mpssvc cycling between Starting and Stopping with error 0x45b.
-                $appCsPath = "$svcRoot\mpssvc\Parameters\AppCs"
-                $loopbackState = $null
-                try {
-                    $loopbackState = Invoke-FirewallDebugLoopbackAppsAsSystem -AppCsPath $appCsPath -Operation Inspect
-                }
-                catch {
-                    & $emit 'Firewall' (& $toSev $sevFirewallLoopbackAccess) "Unable to inspect protected mpssvc DebugedLoopbackApps as SYSTEM: $($_.Exception.Message)"
-                }
-                if ($loopbackState) {
-                    if ($loopbackState.PermissionsAdjusted) {
-                        & $emit 'Firewall' 'INFO' 'mpssvc AppCs denied access; SYSTEM temporarily took ownership and FullControl, then restored the original owner and DACL'
+                    # Duplicate package SIDs can grow this value to hundreds of entries and
+                    # leave mpssvc cycling between Starting and Stopping with error 0x45b.
+                    $appCsPath = "$svcRoot\mpssvc\Parameters\AppCs"
+                    $loopbackState = $null
+                    try {
+                        $loopbackState = Invoke-FirewallDebugLoopbackAppsAsSystem -AppCsPath $appCsPath -Operation Inspect
                     }
-                    if ($loopbackState.ActiveValueExists) {
-                        $loopbackSeverity = Get-FirewallDebugLoopbackAppsEntrySeverity -EntryCount $loopbackState.EntryCount
-                        $previewText = ''
-                        if ($loopbackSeverity -eq 'CRIT') {
-                            $duplicatePreview = @($loopbackState.DuplicateSids | Select-Object -First 5)
-                            if ($duplicatePreview.Count -gt 0) {
-                                $suffix = if ($loopbackState.DuplicateSidCount -gt $duplicatePreview.Count) { ', ...' } else { '' }
-                                $previewText = "; duplicate examples: $($duplicatePreview -join ', ')$suffix"
+                    catch {
+                        & $emit 'Firewall' (& $toSev $sevFirewallLoopbackAccess) "Unable to inspect protected mpssvc DebugedLoopbackApps as SYSTEM: $($_.Exception.Message)"
+                    }
+                    if ($loopbackState) {
+                        if ($loopbackState.PermissionsAdjusted) {
+                            & $emit 'Firewall' 'INFO' 'mpssvc AppCs denied access; SYSTEM temporarily took ownership and FullControl, then restored the original owner and DACL'
+                        }
+                        if ($loopbackState.ActiveValueExists) {
+                            $loopbackSeverity = Get-FirewallDebugLoopbackAppsEntrySeverity -EntryCount $loopbackState.EntryCount
+                            $previewText = ''
+                            if ($loopbackSeverity -eq 'CRIT') {
+                                $duplicatePreview = @($loopbackState.DuplicateSids | Select-Object -First 5)
+                                if ($duplicatePreview.Count -gt 0) {
+                                    $suffix = if ($loopbackState.DuplicateSidCount -gt $duplicatePreview.Count) { ', ...' } else { '' }
+                                    $previewText = "; duplicate examples: $($duplicatePreview -join ', ')$suffix"
+                                }
+                            }
+                            $duplicateText = if ($loopbackState.DuplicateSidCount -gt 0) {
+                                " with $($loopbackState.DuplicateSidCount) duplicated SID(s) and $($loopbackState.DuplicateEntryCount) extra duplicate occurrence(s)$previewText"
+                            }
+                            else {
+                                ' with no duplicate SIDs'
+                            }
+
+                            if ($loopbackSeverity -eq 'CRIT') {
+                                & $emit 'Firewall' 'CRIT' "mpssvc DebugedLoopbackApps contains $($loopbackState.EntryCount) entries$duplicateText, at or above the documented 683-entry failure scale - known Windows Defender Firewall start/stop loop and error 0x45b risk" "-FixFirewallDebugLoopbackApps"
+                            }
+                            elseif ($loopbackSeverity -eq 'WARN') {
+                                & $emit 'Firewall' 'WARN' "mpssvc DebugedLoopbackApps contains $($loopbackState.EntryCount) entries$duplicateText, above the 600-entry warning threshold - approaching the observed Windows Defender Firewall error 0x45b failure scale" "-FixFirewallDebugLoopbackApps"
+                            }
+                            else {
+                                & $emit 'Firewall' 'OK' "mpssvc DebugedLoopbackApps contains $($loopbackState.EntryCount) entries$duplicateText (normal; warning threshold is above 600 entries)"
                             }
                         }
-                        $duplicateText = if ($loopbackState.DuplicateSidCount -gt 0) {
-                            " with $($loopbackState.DuplicateSidCount) duplicated SID(s) and $($loopbackState.DuplicateEntryCount) extra duplicate occurrence(s)$previewText"
+                        elseif ($loopbackState.RenamedValueExists) {
+                            & $emit 'Firewall' 'CRIT' 'mpssvc DebugedLoopbackApps_ archive exists but the required empty DebugedLoopbackApps value is missing; mpssvc may fail to start' '-FixFirewallDebugLoopbackApps'
                         }
                         else {
-                            ' with no duplicate SIDs'
+                            & $emit 'Firewall' 'OK' 'mpssvc DebugedLoopbackApps value not present'
                         }
+                    }
 
-                        if ($loopbackSeverity -eq 'CRIT') {
-                            & $emit 'Firewall' 'CRIT' "mpssvc DebugedLoopbackApps contains $($loopbackState.EntryCount) entries$duplicateText, at or above the documented 683-entry failure scale - known Windows Defender Firewall start/stop loop and error 0x45b risk" "-FixFirewallDebugLoopbackApps"
-                        }
-                        elseif ($loopbackSeverity -eq 'WARN') {
-                            & $emit 'Firewall' 'WARN' "mpssvc DebugedLoopbackApps contains $($loopbackState.EntryCount) entries$duplicateText, above the 600-entry warning threshold - approaching the observed Windows Defender Firewall error 0x45b failure scale" "-FixFirewallDebugLoopbackApps"
-                        }
-                        else {
-                            & $emit 'Firewall' 'OK' "mpssvc DebugedLoopbackApps contains $($loopbackState.EntryCount) entries$duplicateText (normal; warning threshold is above 600 entries)"
-                        }
-                    }
-                    elseif ($loopbackState.RenamedValueExists) {
-                        & $emit 'Firewall' 'CRIT' 'mpssvc DebugedLoopbackApps_ archive exists but the required empty DebugedLoopbackApps value is missing; mpssvc may fail to start' '-FixFirewallDebugLoopbackApps'
-                    }
-                    else {
-                        & $emit 'Firewall' 'OK' 'mpssvc DebugedLoopbackApps value not present'
-                    }
+                    # An IPsec connection security rule that requires inbound security drops
+                    # unsecured inbound SYNs inside WFP, so RDP times out while the listener,
+                    # the service state and the inbound firewall rules all look correct.
+                    $conSecState = Get-ConSecRuleStoreState `
+                        -StorePath "$svcRoot\SharedAccess\Parameters\FirewallPolicy\ConSecRules" `
+                        -StoreLabel 'local store' -RdpPort $script:_sysCheckRdpPort
+                    & $emitConSec $conSecState $sevConSecRdpBlocked $sevConSecRdpConditional '-FixWFPRules'
                 }
-
-                # An IPsec connection security rule that requires inbound security drops
-                # unsecured inbound SYNs inside WFP, so RDP times out while the listener,
-                # the service state and the inbound firewall rules all look correct.
-                $conSecState = Get-ConSecRuleStoreState `
-                    -StorePath "$svcRoot\SharedAccess\Parameters\FirewallPolicy\ConSecRules" `
-                    -StoreLabel 'local store' -RdpPort $script:_sysCheckRdpPort
-                & $emitConSec $conSecState $sevConSecRdpBlocked $sevConSecRdpConditional '-FixWFPRules'
 
                 # -- Gen2 UEFI / Trusted Launch security (registry-based) ------------
-                if ($script:VMGen -eq 2) {
-                    Write-Host "--- Gen2 UEFI / Trusted Launch Security" -ForegroundColor DarkGray
+                if (& $inArea 'Boot', 'Security') {
+                    if ($script:VMGen -eq 2) {
+                        Write-Host "--- Gen2 UEFI / Trusted Launch Security" -ForegroundColor DarkGray
 
-                    # Secure Boot state: did the guest OS previously boot with Secure Boot?
-                    $sbStatePath = "$ctrlRoot\SecureBoot\State"
-                    $sbEnabled = $null
-                    if (Test-Path $sbStatePath) {
-                        $sbEnabled = (Get-ItemProperty $sbStatePath -ErrorAction SilentlyContinue).UEFISecureBootEnabled
-                    }
-                    if ($sbEnabled -eq 1) {
-                        & $emit 'UEFI' (& $toSev $sevSecureBootState) 'Guest was previously running with Secure Boot enabled (UEFISecureBootEnabled=1)'
-                        # Cross-reference: testsigning or nointegritychecks in BCD would be fatal
-                        try {
-                            $bcdPathSb = Get-BcdStorePath -Generation $script:VMGen -BootDrive $script:BootDriveLetter.TrimEnd('\')
-                            if (Test-Path $bcdPathSb) {
-                                $bcdSbText = (& bcdedit.exe /store "$bcdPathSb" /enum all 2>&1) | Out-String
-                                if ($bcdSbText -match 'testsigning\s+yes') {
-                                    & $emit 'UEFI' (& $toSev $sevSecureBootConflict) 'CONFLICT: Test signing is ON but guest had Secure Boot enabled - VM will fail to boot with Secure Boot; disable test signing first' "-DisableTestSigning"
-                                }
-                                if ($bcdSbText -match 'nointegritychecks\s+yes') {
-                                    & $emit 'UEFI' (& $toSev $sevSecureBootConflict) 'CONFLICT: nointegritychecks is ON but guest had Secure Boot enabled - VM will fail to boot with Secure Boot' "-FixBoot"
-                                }
-                            }
+                        # Secure Boot state: did the guest OS previously boot with Secure Boot?
+                        $sbStatePath = "$ctrlRoot\SecureBoot\State"
+                        $sbEnabled = $null
+                        if (Test-Path $sbStatePath) {
+                            $sbEnabled = (Get-ItemProperty $sbStatePath -ErrorAction SilentlyContinue).UEFISecureBootEnabled
                         }
-                        catch { <# BCD already checked above; non-fatal here #> }
-                    }
-                    elseif ($null -ne $sbEnabled) {
-                        & $emit 'UEFI' 'OK' 'Secure Boot was not active on guest (UEFISecureBootEnabled=0)'
-                    }
-                    else {
-                        & $emit 'UEFI' 'INFO' 'SecureBoot\\State key not found - guest may not have booted with UEFI Secure Boot awareness'
-                    }
-
-                    # Secure Boot 2023 certificate update status (registry snapshot from last boot on real firmware)
-                    $sbServicingPath = "$ctrlRoot\SecureBoot\Servicing"
-                    $sbMainPath = "$ctrlRoot\SecureBoot"
-                    $hvCaveat = '(Note: these registry values reflect the last boot environment; if this VM was previously booted as nested on Hyper-V, these values may reflect Hyper-V firmware, not the original Azure VM)'
-                    if ($sbEnabled -eq 1) {
-                        # UEFICA2023Status
-                        if (Test-Path $sbServicingPath) {
-                            $sbServProps = Get-ItemProperty $sbServicingPath -ErrorAction SilentlyContinue
-                            $certStatus = $sbServProps.UEFICA2023Status
-                            if ($certStatus -eq 'Updated') {
-                                & $emit 'UEFI' 'INFO' 'Secure Boot 2023 certificates were applied (UEFICA2023Status=Updated)'
+                        if ($sbEnabled -eq 1) {
+                            & $emit 'UEFI' (& $toSev $sevSecureBootState) 'Guest was previously running with Secure Boot enabled (UEFISecureBootEnabled=1)'
+                            # Cross-reference: testsigning or nointegritychecks in BCD would be fatal
+                            try {
+                                $bcdPathSb = Get-BcdStorePath -Generation $script:VMGen -BootDrive $script:BootDriveLetter.TrimEnd('\')
+                                if (Test-Path $bcdPathSb) {
+                                    $bcdSbText = (& bcdedit.exe /store "$bcdPathSb" /enum all 2>&1) | Out-String
+                                    if ($bcdSbText -match 'testsigning\s+yes') {
+                                        & $emit 'UEFI' (& $toSev $sevSecureBootConflict) 'CONFLICT: Test signing is ON but guest had Secure Boot enabled - VM will fail to boot with Secure Boot; disable test signing first' "-DisableTestSigning"
+                                    }
+                                    if ($bcdSbText -match 'nointegritychecks\s+yes') {
+                                        & $emit 'UEFI' (& $toSev $sevSecureBootConflict) 'CONFLICT: nointegritychecks is ON but guest had Secure Boot enabled - VM will fail to boot with Secure Boot' "-FixBoot"
+                                    }
+                                }
                             }
-                            elseif ($null -ne $certStatus) {
-                                & $emit 'UEFI' (& $toSev $sevSecureBootCertNotUpdated) "Secure Boot 2023 certificates not yet applied (UEFICA2023Status=$certStatus) - certificates expire Jun-Oct 2026. $hvCaveat"
-                            }
-                            else {
-                                & $emit 'UEFI' (& $toSev $sevSecureBootCertNotUpdated) "Secure Boot enabled but UEFICA2023Status not set - 2023 certificate update may not have started. $hvCaveat"
-                            }
-                            # UEFICA2023Error
-                            $certError = $sbServProps.UEFICA2023Error
-                            if ($null -ne $certError) {
-                                $certErrorEvent = $sbServProps.UEFICA2023ErrorEvent
-                                $errorDetail = "Secure Boot certificate update error detected (UEFICA2023Error=$certError)"
-                                if ($null -ne $certErrorEvent) { $errorDetail += " (ErrorEvent=$certErrorEvent)" }
-                                $errorDetail += ". $hvCaveat"
-                                & $emit 'UEFI' (& $toSev $sevSecureBootCertError) $errorDetail
-                            }
+                            catch { <# BCD already checked above; non-fatal here #> }
+                        }
+                        elseif ($null -ne $sbEnabled) {
+                            & $emit 'UEFI' 'OK' 'Secure Boot was not active on guest (UEFISecureBootEnabled=0)'
                         }
                         else {
-                            & $emit 'UEFI' (& $toSev $sevSecureBootCertNotUpdated) "Secure Boot enabled but SecureBoot\Servicing key absent - 2023 certificate update status unknown. $hvCaveat"
+                            & $emit 'UEFI' 'INFO' 'SecureBoot\\State key not found - guest may not have booted with UEFI Secure Boot awareness'
                         }
-                        # AvailableUpdates bitmask (informational)
-                        if (Test-Path $sbMainPath) {
-                            $availUpdates = (Get-ItemProperty $sbMainPath -ErrorAction SilentlyContinue).AvailableUpdates
-                            if ($null -ne $availUpdates) {
-                                $availHex = '0x{0:X}' -f [int]$availUpdates
-                                if ($availUpdates -eq 0 -or $availUpdates -eq 0x4000) {
-                                    & $emit 'UEFI' 'INFO' "Secure Boot AvailableUpdates=$availHex - all certificate update steps completed"
+
+                        # Secure Boot 2023 certificate update status (registry snapshot from last boot on real firmware)
+                        $sbServicingPath = "$ctrlRoot\SecureBoot\Servicing"
+                        $sbMainPath = "$ctrlRoot\SecureBoot"
+                        $hvCaveat = '(Note: these registry values reflect the last boot environment; if this VM was previously booted as nested on Hyper-V, these values may reflect Hyper-V firmware, not the original Azure VM)'
+                        if ($sbEnabled -eq 1) {
+                            # UEFICA2023Status
+                            if (Test-Path $sbServicingPath) {
+                                $sbServProps = Get-ItemProperty $sbServicingPath -ErrorAction SilentlyContinue
+                                $certStatus = $sbServProps.UEFICA2023Status
+                                if ($certStatus -eq 'Updated') {
+                                    & $emit 'UEFI' 'INFO' 'Secure Boot 2023 certificates were applied (UEFICA2023Status=Updated)'
+                                }
+                                elseif ($null -ne $certStatus) {
+                                    & $emit 'UEFI' (& $toSev $sevSecureBootCertNotUpdated) "Secure Boot 2023 certificates not yet applied (UEFICA2023Status=$certStatus) - certificates expire Jun-Oct 2026. $hvCaveat"
                                 }
                                 else {
-                                    & $emit 'UEFI' 'INFO' "Secure Boot AvailableUpdates=$availHex - certificate update steps still pending (0x40=DB, 0x800/0x1000=3P certs, 0x4=KEK, 0x100=boot mgr)"
+                                    & $emit 'UEFI' (& $toSev $sevSecureBootCertNotUpdated) "Secure Boot enabled but UEFICA2023Status not set - 2023 certificate update may not have started. $hvCaveat"
+                                }
+                                # UEFICA2023Error
+                                $certError = $sbServProps.UEFICA2023Error
+                                if ($null -ne $certError) {
+                                    $certErrorEvent = $sbServProps.UEFICA2023ErrorEvent
+                                    $errorDetail = "Secure Boot certificate update error detected (UEFICA2023Error=$certError)"
+                                    if ($null -ne $certErrorEvent) { $errorDetail += " (ErrorEvent=$certErrorEvent)" }
+                                    $errorDetail += ". $hvCaveat"
+                                    & $emit 'UEFI' (& $toSev $sevSecureBootCertError) $errorDetail
+                                }
+                            }
+                            else {
+                                & $emit 'UEFI' (& $toSev $sevSecureBootCertNotUpdated) "Secure Boot enabled but SecureBoot\Servicing key absent - 2023 certificate update status unknown. $hvCaveat"
+                            }
+                            # AvailableUpdates bitmask (informational)
+                            if (Test-Path $sbMainPath) {
+                                $availUpdates = (Get-ItemProperty $sbMainPath -ErrorAction SilentlyContinue).AvailableUpdates
+                                if ($null -ne $availUpdates) {
+                                    $availHex = '0x{0:X}' -f [int]$availUpdates
+                                    if ($availUpdates -eq 0 -or $availUpdates -eq 0x4000) {
+                                        & $emit 'UEFI' 'INFO' "Secure Boot AvailableUpdates=$availHex - all certificate update steps completed"
+                                    }
+                                    else {
+                                        & $emit 'UEFI' 'INFO' "Secure Boot AvailableUpdates=$availHex - certificate update steps still pending (0x40=DB, 0x800/0x1000=3P certs, 0x4=KEK, 0x100=boot mgr)"
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    # VBS / DeviceGuard configuration
-                    $dgPath = "$ctrlRoot\DeviceGuard"
-                    if (Test-Path $dgPath) {
-                        $dgProps = Get-ItemProperty $dgPath -ErrorAction SilentlyContinue
-                        $vbsEnabled = $dgProps.EnableVirtualizationBasedSecurity
-                        if ($vbsEnabled -eq 1) {
-                            & $emit 'UEFI' (& $toSev $sevDeviceGuardVbs) 'Virtualization-Based Security (VBS) is enabled in DeviceGuard registry'
-                        }
-                        $platReq = $dgProps.RequirePlatformSecurityFeatures
-                        if ($null -ne $platReq -and $platReq -ge 3) {
-                            & $emit 'UEFI' (& $toSev $sevDeviceGuardPlatReq) "DeviceGuard RequirePlatformSecurityFeatures=$platReq (requires Secure Boot + DMA protection) - not all Azure VM sizes support DMA protection; may prevent VBS from starting"
-                        }
-                        elseif ($null -ne $platReq -and $platReq -ge 1) {
-                            & $emit 'UEFI' 'OK' "DeviceGuard RequirePlatformSecurityFeatures=$platReq (Secure Boot only)"
-                        }
-                    }
-
-                    # HVCI (Hypervisor-enforced Code Integrity)
-                    $hvciPath = "$ctrlRoot\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity"
-                    if (Test-Path $hvciPath) {
-                        $hvciEnabled = (Get-ItemProperty $hvciPath -ErrorAction SilentlyContinue).Enabled
-                        if ($hvciEnabled -eq 1) {
-                            & $emit 'UEFI' (& $toSev $sevHvciEnabled) 'HVCI (Hypervisor-enforced Code Integrity) is enabled - unsigned kernel drivers will be blocked at runtime'
-                        }
-                    }
-
-                    # Early Launch Anti-Malware driver load policy
-                    $elamPath = "$ctrlRoot\EarlyLaunch"
-                    if (Test-Path $elamPath) {
-                        $driverLoadPolicy = (Get-ItemProperty $elamPath -ErrorAction SilentlyContinue).DriverLoadPolicy
-                        if ($null -ne $driverLoadPolicy) {
-                            $policyDesc = switch ([int]$driverLoadPolicy) {
-                                1 { 'Good only - unknown/bad boot drivers will be blocked' }
-                                3 { 'Good and unknown' }
-                                7 { 'Good, unknown, and bad (but not malicious)' }
-                                8 { 'All drivers allowed' }
-                                default { "Value=$driverLoadPolicy" }
+                        # VBS / DeviceGuard configuration
+                        $dgPath = "$ctrlRoot\DeviceGuard"
+                        if (Test-Path $dgPath) {
+                            $dgProps = Get-ItemProperty $dgPath -ErrorAction SilentlyContinue
+                            $vbsEnabled = $dgProps.EnableVirtualizationBasedSecurity
+                            if ($vbsEnabled -eq 1) {
+                                & $emit 'UEFI' (& $toSev $sevDeviceGuardVbs) 'Virtualization-Based Security (VBS) is enabled in DeviceGuard registry'
                             }
-                            if ([int]$driverLoadPolicy -eq 1) {
-                                & $emit 'UEFI' (& $toSev $sevEarlyLaunchPolicy) "EarlyLaunch DriverLoadPolicy=$driverLoadPolicy ($policyDesc) - restrictive policy may block third-party boot drivers"
+                            $platReq = $dgProps.RequirePlatformSecurityFeatures
+                            if ($null -ne $platReq -and $platReq -ge 3) {
+                                & $emit 'UEFI' (& $toSev $sevDeviceGuardPlatReq) "DeviceGuard RequirePlatformSecurityFeatures=$platReq (requires Secure Boot + DMA protection) - not all Azure VM sizes support DMA protection; may prevent VBS from starting"
                             }
-                            else {
-                                & $emit 'UEFI' 'OK' "EarlyLaunch DriverLoadPolicy=$driverLoadPolicy ($policyDesc)"
+                            elseif ($null -ne $platReq -and $platReq -ge 1) {
+                                & $emit 'UEFI' 'OK' "DeviceGuard RequirePlatformSecurityFeatures=$platReq (Secure Boot only)"
                             }
                         }
-                    }
 
-                    # TPM driver state (relevant for vTPM-dependent features)
-                    $tpmSvcPath = "$svcRoot\TPM"
-                    if (Test-Path $tpmSvcPath) {
-                        $tpmStart = (Get-ItemProperty $tpmSvcPath -ErrorAction SilentlyContinue).Start
-                        if ($tpmStart -eq 4) {
-                            & $emit 'UEFI' (& $toSev $sevTpmDriverDisabled) 'TPM service is DISABLED (Start=4) - vTPM-dependent features (BitLocker auto-unlock, Windows Hello, attestation) will not function'
+                        # HVCI (Hypervisor-enforced Code Integrity)
+                        $hvciPath = "$ctrlRoot\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity"
+                        if (Test-Path $hvciPath) {
+                            $hvciEnabled = (Get-ItemProperty $hvciPath -ErrorAction SilentlyContinue).Enabled
+                            if ($hvciEnabled -eq 1) {
+                                & $emit 'UEFI' (& $toSev $sevHvciEnabled) 'HVCI (Hypervisor-enforced Code Integrity) is enabled - unsigned kernel drivers will be blocked at runtime'
+                            }
+                        }
+
+                        # Early Launch Anti-Malware driver load policy
+                        $elamPath = "$ctrlRoot\EarlyLaunch"
+                        if (Test-Path $elamPath) {
+                            $driverLoadPolicy = (Get-ItemProperty $elamPath -ErrorAction SilentlyContinue).DriverLoadPolicy
+                            if ($null -ne $driverLoadPolicy) {
+                                $policyDesc = switch ([int]$driverLoadPolicy) {
+                                    1 { 'Good only - unknown/bad boot drivers will be blocked' }
+                                    3 { 'Good and unknown' }
+                                    7 { 'Good, unknown, and bad (but not malicious)' }
+                                    8 { 'All drivers allowed' }
+                                    default { "Value=$driverLoadPolicy" }
+                                }
+                                if ([int]$driverLoadPolicy -eq 1) {
+                                    & $emit 'UEFI' (& $toSev $sevEarlyLaunchPolicy) "EarlyLaunch DriverLoadPolicy=$driverLoadPolicy ($policyDesc) - restrictive policy may block third-party boot drivers"
+                                }
+                                else {
+                                    & $emit 'UEFI' 'OK' "EarlyLaunch DriverLoadPolicy=$driverLoadPolicy ($policyDesc)"
+                                }
+                            }
+                        }
+
+                        # TPM driver state (relevant for vTPM-dependent features)
+                        $tpmSvcPath = "$svcRoot\TPM"
+                        if (Test-Path $tpmSvcPath) {
+                            $tpmStart = (Get-ItemProperty $tpmSvcPath -ErrorAction SilentlyContinue).Start
+                            if ($tpmStart -eq 4) {
+                                & $emit 'UEFI' (& $toSev $sevTpmDriverDisabled) 'TPM service is DISABLED (Start=4) - vTPM-dependent features (BitLocker auto-unlock, Windows Hello, attestation) will not function'
+                            }
                         }
                     }
                 }
 
                 # -- Session Manager (BootExecute / SetupExecute) -----------------
-                $smPath = "$ctrlRoot\Session Manager"
-                if (Test-Path $smPath) {
-                    $smProps = Get-ItemProperty $smPath -ErrorAction SilentlyContinue
-                    $sys32Path = Join-Path $script:WinDriveLetter 'Windows\System32'
+                if (& $inArea 'Boot', 'Security') {
+                    $smPath = "$ctrlRoot\Session Manager"
+                    if (Test-Path $smPath) {
+                        $smProps = Get-ItemProperty $smPath -ErrorAction SilentlyContinue
+                        $sys32Path = Join-Path $script:WinDriveLetter 'Windows\System32'
 
-                    # BootExecute
-                    $bootExec = @($smProps.BootExecute | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
-                    $danglingBoot = @()
-                    $thirdPartyBoot = @()
-                    foreach ($entry in $bootExec) {
-                        if ($entry -match '^autocheck\s+autochk') { continue }
-                        $nativeName = ($entry -split '\s+', 2)[0]
-                        $nativePath = Join-Path $sys32Path "$nativeName.exe"
-                        if (-not (Test-Path $nativePath) -or (Test-Path $nativePath) -and (Get-Item -LiteralPath $nativePath -ErrorAction SilentlyContinue).Length -eq 0) {
-                            $danglingBoot += $entry
-                        }
-                        else {
-                            $thirdPartyBoot += $entry
-                        }
-                    }
-                    # Signature check on third-party BootExecute entries
-                    $unsignedBoot = @()
-                    foreach ($entry in $thirdPartyBoot) {
-                        $tpName = ($entry -split '\s+', 2)[0]
-                        $tpPath = Join-Path $sys32Path "$tpName.exe"
-                        $tpSig = Test-MicrosoftSignature -FilePath $tpPath
-                        if (-not $tpSig.IsAcceptableMicrosoft) { $unsignedBoot += $entry }
-                    }
-                    if ($danglingBoot.Count -gt 0) {
-                        & $emit 'Boot' (& $toSev $sevBootExecDangling) "BootExecute has $($danglingBoot.Count) entry/entries with missing binaries (will hang boot at black screen): $($danglingBoot -join '; ')" "-FixSessionManager"
-                    }
-                    elseif ($unsignedBoot.Count -gt 0) {
-                        & $emit 'Security' (& $toSev $sevBinarySignatureBad) "BootExecute has $($unsignedBoot.Count) non-Microsoft-signed entry/entries (possible tampering): $($unsignedBoot -join '; ')" "-FixSessionManager"
-                    }
-                    elseif ($thirdPartyBoot.Count -gt 0) {
-                        & $emit 'Boot' (& $toSev $sevBootExecThirdParty) "BootExecute has $($thirdPartyBoot.Count) third-party entry/entries (binaries present): $($thirdPartyBoot -join '; ')" "-FixSessionManager"
-                    }
-                    else {
-                        & $emit 'Boot' 'OK' 'BootExecute: default (autocheck autochk *)'
-                    }
-
-                    # SetupExecute
-                    $setupExec = @($smProps.SetupExecute | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
-                    if ($setupExec.Count -gt 0) {
-                        $danglingSetup = @()
-                        $unsignedSetup = @()
-                        foreach ($entry in $setupExec) {
+                        # BootExecute
+                        $bootExec = @($smProps.BootExecute | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
+                        $danglingBoot = @()
+                        $thirdPartyBoot = @()
+                        foreach ($entry in $bootExec) {
+                            if ($entry -match '^autocheck\s+autochk') { continue }
                             $nativeName = ($entry -split '\s+', 2)[0]
                             $nativePath = Join-Path $sys32Path "$nativeName.exe"
                             if (-not (Test-Path $nativePath) -or (Test-Path $nativePath) -and (Get-Item -LiteralPath $nativePath -ErrorAction SilentlyContinue).Length -eq 0) {
-                                $danglingSetup += $entry
+                                $danglingBoot += $entry
                             }
                             else {
-                                $seSig = Test-MicrosoftSignature -FilePath $nativePath
-                                if (-not $seSig.IsAcceptableMicrosoft) { $unsignedSetup += $entry }
+                                $thirdPartyBoot += $entry
                             }
                         }
-                        if ($danglingSetup.Count -gt 0) {
-                            & $emit 'Boot' (& $toSev $sevSetupExecDangling) "SetupExecute has $($danglingSetup.Count) entry/entries with missing binaries (will hang boot): $($danglingSetup -join '; ')" "-FixSessionManager"
+                        # Signature check on third-party BootExecute entries
+                        $unsignedBoot = @()
+                        foreach ($entry in $thirdPartyBoot) {
+                            $tpName = ($entry -split '\s+', 2)[0]
+                            $tpPath = Join-Path $sys32Path "$tpName.exe"
+                            $tpSig = Test-MicrosoftSignature -FilePath $tpPath
+                            if (-not $tpSig.IsAcceptableMicrosoft) { $unsignedBoot += $entry }
                         }
-                        elseif ($unsignedSetup.Count -gt 0) {
-                            & $emit 'Security' (& $toSev $sevBinarySignatureBad) "SetupExecute has $($unsignedSetup.Count) non-Microsoft-signed entry/entries (possible tampering): $($unsignedSetup -join '; ')" "-FixSessionManager"
+                        if ($danglingBoot.Count -gt 0) {
+                            & $emit 'Boot' (& $toSev $sevBootExecDangling) "BootExecute has $($danglingBoot.Count) entry/entries with missing binaries (will hang boot at black screen): $($danglingBoot -join '; ')" "-FixSessionManager"
+                        }
+                        elseif ($unsignedBoot.Count -gt 0) {
+                            & $emit 'Security' (& $toSev $sevBinarySignatureBad) "BootExecute has $($unsignedBoot.Count) non-Microsoft-signed entry/entries (possible tampering): $($unsignedBoot -join '; ')" "-FixSessionManager"
+                        }
+                        elseif ($thirdPartyBoot.Count -gt 0) {
+                            & $emit 'Boot' (& $toSev $sevBootExecThirdParty) "BootExecute has $($thirdPartyBoot.Count) third-party entry/entries (binaries present): $($thirdPartyBoot -join '; ')" "-FixSessionManager"
                         }
                         else {
-                            & $emit 'Boot' (& $toSev $sevSetupExecPresent) "SetupExecute is non-empty ($($setupExec.Count) entries) - unusual outside servicing: $($setupExec -join '; ')" "-FixSessionManager"
+                            & $emit 'Boot' 'OK' 'BootExecute: default (autocheck autochk *)'
                         }
-                    }
 
-                    # ExcludeFromKnownDlls
-                    $knownDllExcl = @($smProps.ExcludeFromKnownDlls | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
-                    if ($knownDllExcl.Count -gt 0) {
-                        & $emit 'Security' (& $toSev $sevKnownDllExclude) "ExcludeFromKnownDlls has $($knownDllExcl.Count) entry/entries (app compat or DLL hijack vector): $($knownDllExcl -join ', ')"
-                    }
-
-                    # -- SubSystems ---------------------------------------------------
-                    # Smss.exe starts the Win32 subsystem from the command line held in
-                    # SubSystems\Windows, and Kmode names its kernel-mode half. These are
-                    # registry pointers, so an intact, signed csrss.exe sitting in System32
-                    # proves nothing: if the value names a path that does not resolve, smss
-                    # cannot start the subsystem and the guest bugchecks with STOP
-                    # 0xC000021A before anything reaches the event log. Only the first token
-                    # is a file - the rest is SharedSection sizes and the ServerDll list.
-                    $subsysPath = Join-Path $smPath 'SubSystems'
-                    if (Test-Path $subsysPath) {
-                        $ssProps = Get-ItemProperty $subsysPath -ErrorAction SilentlyContinue
-                        $ssDangling = @()
-                        $ssUnsigned = @()
-                        $ssUnsignedFix = @()
-                        $ssChecked = 0
-                        foreach ($ssName in @('Windows', 'Kmode')) {
-                            $ssValue = [string]$ssProps.$ssName
-                            # An empty Debug/Optional value is normal, and Required lists
-                            # 'Debug' on a healthy server, so absence is never a finding.
-                            if ([string]::IsNullOrWhiteSpace($ssValue)) { continue }
-                            $ssRef = Get-SubsystemImageReference -Value $ssValue
-                            if ([string]::IsNullOrWhiteSpace($ssRef.ResolvedPath)) { continue }
-                            $ssChecked++
-                            if (-not $ssRef.Exists) {
-                                $ssDangling += "$ssName -> $($ssRef.Token)"
-                            }
-                            else {
-                                $ssSig = Test-MicrosoftSignature -FilePath $ssRef.ResolvedPath
-                                if (-not $ssSig.IsAcceptableMicrosoft) {
-                                    $ssUnsigned += "$ssName -> $($ssRef.Token) ($(Get-TrustStateDescription -Signature $ssSig))"
-                                    $ssUnsignedFix += Get-RepairSystemFileArgument -Path $ssRef.ResolvedPath
+                        # SetupExecute
+                        $setupExec = @($smProps.SetupExecute | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
+                        if ($setupExec.Count -gt 0) {
+                            $danglingSetup = @()
+                            $unsignedSetup = @()
+                            foreach ($entry in $setupExec) {
+                                $nativeName = ($entry -split '\s+', 2)[0]
+                                $nativePath = Join-Path $sys32Path "$nativeName.exe"
+                                if (-not (Test-Path $nativePath) -or (Test-Path $nativePath) -and (Get-Item -LiteralPath $nativePath -ErrorAction SilentlyContinue).Length -eq 0) {
+                                    $danglingSetup += $entry
+                                }
+                                else {
+                                    $seSig = Test-MicrosoftSignature -FilePath $nativePath
+                                    if (-not $seSig.IsAcceptableMicrosoft) { $unsignedSetup += $entry }
                                 }
                             }
+                            if ($danglingSetup.Count -gt 0) {
+                                & $emit 'Boot' (& $toSev $sevSetupExecDangling) "SetupExecute has $($danglingSetup.Count) entry/entries with missing binaries (will hang boot): $($danglingSetup -join '; ')" "-FixSessionManager"
+                            }
+                            elseif ($unsignedSetup.Count -gt 0) {
+                                & $emit 'Security' (& $toSev $sevBinarySignatureBad) "SetupExecute has $($unsignedSetup.Count) non-Microsoft-signed entry/entries (possible tampering): $($unsignedSetup -join '; ')" "-FixSessionManager"
+                            }
+                            else {
+                                & $emit 'Boot' (& $toSev $sevSetupExecPresent) "SetupExecute is non-empty ($($setupExec.Count) entries) - unusual outside servicing: $($setupExec -join '; ')" "-FixSessionManager"
+                            }
                         }
-                        if ($ssDangling.Count -gt 0) {
-                            & $emit 'Boot' (& $toSev $sevSubsystemDangling) "Session Manager SubSystems names $($ssDangling.Count) image(s) that are missing or 0 bytes - smss.exe cannot start the subsystem and the guest bugchecks with STOP 0xC000021A: $($ssDangling -join '; ')" "-FixSessionManager"
+
+                        # ExcludeFromKnownDlls
+                        $knownDllExcl = @($smProps.ExcludeFromKnownDlls | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
+                        if ($knownDllExcl.Count -gt 0) {
+                            & $emit 'Security' (& $toSev $sevKnownDllExclude) "ExcludeFromKnownDlls has $($knownDllExcl.Count) entry/entries (app compat or DLL hijack vector): $($knownDllExcl -join ', ')"
                         }
-                        elseif ($ssUnsigned.Count -gt 0) {
-                            # The value resolves; the file it names is what is damaged, so
-                            # repointing the value (-FixSessionManager) cannot help.
-                            & $emit 'Security' (& $toSev $sevBinarySignatureBad) "Session Manager SubSystems names $($ssUnsigned.Count) image(s) that failed trust validation (corrupt, tampered or missing catalog - STOP 0xC000021A / 0xC0000428 when smss loads it): $($ssUnsigned -join '; ')" "-RepairSystemFile $(($ssUnsignedFix | Select-Object -Unique) -join ',')"
-                        }
-                        elseif ($ssChecked -gt 0) {
-                            & $emit 'Boot' 'OK' "Session Manager SubSystems images resolve and are Microsoft-signed ($ssChecked checked)"
+
+                        # -- SubSystems ---------------------------------------------------
+                        # Smss.exe starts the Win32 subsystem from the command line held in
+                        # SubSystems\Windows, and Kmode names its kernel-mode half. These are
+                        # registry pointers, so an intact, signed csrss.exe sitting in System32
+                        # proves nothing: if the value names a path that does not resolve, smss
+                        # cannot start the subsystem and the guest bugchecks with STOP
+                        # 0xC000021A before anything reaches the event log. Only the first token
+                        # is a file - the rest is SharedSection sizes and the ServerDll list.
+                        $subsysPath = Join-Path $smPath 'SubSystems'
+                        if (Test-Path $subsysPath) {
+                            $ssProps = Get-ItemProperty $subsysPath -ErrorAction SilentlyContinue
+                            $ssDangling = @()
+                            $ssUnsigned = @()
+                            $ssUnsignedFix = @()
+                            $ssChecked = 0
+                            foreach ($ssName in @('Windows', 'Kmode')) {
+                                $ssValue = [string]$ssProps.$ssName
+                                # An empty Debug/Optional value is normal, and Required lists
+                                # 'Debug' on a healthy server, so absence is never a finding.
+                                if ([string]::IsNullOrWhiteSpace($ssValue)) { continue }
+                                $ssRef = Get-SubsystemImageReference -Value $ssValue
+                                if ([string]::IsNullOrWhiteSpace($ssRef.ResolvedPath)) { continue }
+                                $ssChecked++
+                                if (-not $ssRef.Exists) {
+                                    $ssDangling += "$ssName -> $($ssRef.Token)"
+                                }
+                                else {
+                                    $ssSig = Test-MicrosoftSignature -FilePath $ssRef.ResolvedPath
+                                    if (-not $ssSig.IsAcceptableMicrosoft) {
+                                        $ssUnsigned += "$ssName -> $($ssRef.Token) ($(Get-TrustStateDescription -Signature $ssSig))"
+                                        $ssUnsignedFix += Get-RepairSystemFileArgument -Path $ssRef.ResolvedPath
+                                    }
+                                }
+                            }
+                            if ($ssDangling.Count -gt 0) {
+                                & $emit 'Boot' (& $toSev $sevSubsystemDangling) "Session Manager SubSystems names $($ssDangling.Count) image(s) that are missing or 0 bytes - smss.exe cannot start the subsystem and the guest bugchecks with STOP 0xC000021A: $($ssDangling -join '; ')" "-FixSessionManager"
+                            }
+                            elseif ($ssUnsigned.Count -gt 0) {
+                                # The value resolves; the file it names is what is damaged, so
+                                # repointing the value (-FixSessionManager) cannot help.
+                                & $emit 'Security' (& $toSev $sevBinarySignatureBad) "Session Manager SubSystems names $($ssUnsigned.Count) image(s) that failed trust validation (corrupt, tampered or missing catalog - STOP 0xC000021A / 0xC0000428 when smss loads it): $($ssUnsigned -join '; ')" "-RepairSystemFile $(($ssUnsignedFix | Select-Object -Unique) -join ',')"
+                            }
+                            elseif ($ssChecked -gt 0) {
+                                & $emit 'Boot' 'OK' "Session Manager SubSystems images resolve and are Microsoft-signed ($ssChecked checked)"
+                            }
                         }
                     }
                 }
 
                 # -- Static DNS -------------------------------------------------------
-                $ifBase = "$SystemRoot\Services\Tcpip\Parameters\Interfaces"
-                if (Test-Path $ifBase) {
-                    $staticDns = [System.Collections.Generic.List[string]]::new()
-                    Get-ChildItem $ifBase -ErrorAction SilentlyContinue | ForEach-Object {
-                        $ns = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).NameServer
-                        if ($ns) { $staticDns.Add("$($_.PSChildName): $ns") }
-                    }
-                    $globalNs = (Get-ItemProperty "$SystemRoot\Services\Tcpip\Parameters" -ErrorAction SilentlyContinue).NameServer
-                    if ($globalNs) { $staticDns.Add("Global: $globalNs") }
-                    if ($staticDns.Count -gt 0) {
-                        & $emit 'Networking' (& $toSev $sevStaticDns) "Static DNS server(s) configured on $($staticDns.Count) interface(s) - may not resolve after migration; -ResetNetworkStack clears them" "-ResetNetworkStack"
+                if (& $inArea 'Connectivity') {
+                    $ifBase = "$SystemRoot\Services\Tcpip\Parameters\Interfaces"
+                    if (Test-Path $ifBase) {
+                        $staticDns = [System.Collections.Generic.List[string]]::new()
+                        Get-ChildItem $ifBase -ErrorAction SilentlyContinue | ForEach-Object {
+                            $ns = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).NameServer
+                            if ($ns) { $staticDns.Add("$($_.PSChildName): $ns") }
+                        }
+                        $globalNs = (Get-ItemProperty "$SystemRoot\Services\Tcpip\Parameters" -ErrorAction SilentlyContinue).NameServer
+                        if ($globalNs) { $staticDns.Add("Global: $globalNs") }
+                        if ($staticDns.Count -gt 0) {
+                            & $emit 'Networking' (& $toSev $sevStaticDns) "Static DNS server(s) configured on $($staticDns.Count) interface(s) - may not resolve after migration; -ResetNetworkStack clears them" "-ResetNetworkStack"
+                        }
                     }
                 }
 
                 # -- Static IP / DHCP disabled ----------------------------------------
                 # Azure requires DHCP for IP assignment. EnableDHCP=0 means the VM
                 # keeps a stale on-prem IP and gets zero Azure connectivity.
-                if (Test-Path $ifBase) {
-                    $staticIpIfs = [System.Collections.Generic.List[string]]::new()
-                    Get-ChildItem $ifBase -ErrorAction SilentlyContinue | ForEach-Object {
-                        $dhcpVal = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).EnableDHCP
-                        if ($null -ne $dhcpVal -and $dhcpVal -eq 0) {
-                            $staticIpIfs.Add($_.PSChildName)
+                if (& $inArea 'Connectivity') {
+                    if (Test-Path $ifBase) {
+                        $staticIpIfs = [System.Collections.Generic.List[string]]::new()
+                        Get-ChildItem $ifBase -ErrorAction SilentlyContinue | ForEach-Object {
+                            $dhcpVal = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).EnableDHCP
+                            if ($null -ne $dhcpVal -and $dhcpVal -eq 0) {
+                                $staticIpIfs.Add($_.PSChildName)
+                            }
                         }
-                    }
-                    if ($staticIpIfs.Count -gt 0) {
-                        & $emit 'Networking' (& $toSev $sevStaticIpNoAzureDhcp) "EnableDHCP=0 on $($staticIpIfs.Count) interface(s) - Azure requires DHCP for IP assignment; VM will have NO connectivity; run -ResetInterfacesToDHCP" "-ResetInterfacesToDHCP"
+                        if ($staticIpIfs.Count -gt 0) {
+                            & $emit 'Networking' (& $toSev $sevStaticIpNoAzureDhcp) "EnableDHCP=0 on $($staticIpIfs.Count) interface(s) - Azure requires DHCP for IP assignment; VM will have NO connectivity; run -ResetInterfacesToDHCP" "-ResetInterfacesToDHCP"
+                        }
                     }
                 }
 
@@ -17802,33 +17904,35 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
                 # ("Please wait..."). Common after uninstalling VPN or remote-access software.
                 # ProviderPath is read raw: Get-ItemProperty would expand %SystemRoot% and
                 # %ProgramFiles% against the rescue VM, not the guest.
-                $npOrderPath = "$ctrlRoot\NetworkProvider\Order"
-                if (Test-Path $npOrderPath) {
-                    $providerOrder = (Get-ItemProperty $npOrderPath -ErrorAction SilentlyContinue).ProviderOrder
-                    if ($providerOrder) {
-                        $providers = $providerOrder -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-                        $orphanedProviders = [System.Collections.Generic.List[string]]::new()
-                        foreach ($prov in $providers) {
-                            $provSvcPath = "$svcRoot\$prov\NetworkProvider"
-                            if (-not (Test-Path $provSvcPath)) {
-                                $orphanedProviders.Add("$prov (service key missing)")
-                                continue
+                if (& $inArea 'RDP', 'Connectivity') {
+                    $npOrderPath = "$ctrlRoot\NetworkProvider\Order"
+                    if (Test-Path $npOrderPath) {
+                        $providerOrder = (Get-ItemProperty $npOrderPath -ErrorAction SilentlyContinue).ProviderOrder
+                        if ($providerOrder) {
+                            $providers = $providerOrder -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+                            $orphanedProviders = [System.Collections.Generic.List[string]]::new()
+                            foreach ($prov in $providers) {
+                                $provSvcPath = "$svcRoot\$prov\NetworkProvider"
+                                if (-not (Test-Path $provSvcPath)) {
+                                    $orphanedProviders.Add("$prov (service key missing)")
+                                    continue
+                                }
+                                $provDllRaw = $null
+                                $provKey = Get-Item -LiteralPath $provSvcPath -ErrorAction SilentlyContinue
+                                if ($provKey) {
+                                    try { $provDllRaw = $provKey.GetValue('ProviderPath', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
+                                    finally { $provKey.Close() }
+                                }
+                                if ($provDllRaw -isnot [string] -or -not $provDllRaw.Trim()) { continue }
+                                $provDll = Resolve-NetworkProviderDllPath $provDllRaw
+                                if (-not $provDll) { continue }
+                                if (-not (Test-Path -LiteralPath $provDll -PathType Leaf)) {
+                                    $orphanedProviders.Add("$prov ($provDllRaw -> $provDll not found)")
+                                }
                             }
-                            $provDllRaw = $null
-                            $provKey = Get-Item -LiteralPath $provSvcPath -ErrorAction SilentlyContinue
-                            if ($provKey) {
-                                try { $provDllRaw = $provKey.GetValue('ProviderPath', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
-                                finally { $provKey.Close() }
+                            if ($orphanedProviders.Count -gt 0) {
+                                & $emit 'Networking' (& $toSev $sevNetProviderOrphaned) "NetworkProvider\Order lists $($orphanedProviders.Count) provider(s) with missing DLL - logon can stall at 'Please wait': $($orphanedProviders -join '; ')" "Manual: remove the listed name(s) from Control\NetworkProvider\Order ProviderOrder (and HwOrder) in the offline SYSTEM hive, after confirming the software is really uninstalled"
                             }
-                            if ($provDllRaw -isnot [string] -or -not $provDllRaw.Trim()) { continue }
-                            $provDll = Resolve-NetworkProviderDllPath $provDllRaw
-                            if (-not $provDll) { continue }
-                            if (-not (Test-Path -LiteralPath $provDll -PathType Leaf)) {
-                                $orphanedProviders.Add("$prov ($provDllRaw -> $provDll not found)")
-                            }
-                        }
-                        if ($orphanedProviders.Count -gt 0) {
-                            & $emit 'Networking' (& $toSev $sevNetProviderOrphaned) "NetworkProvider\Order lists $($orphanedProviders.Count) provider(s) with missing DLL - logon can stall at 'Please wait': $($orphanedProviders -join '; ')" "Manual: remove the listed name(s) from Control\NetworkProvider\Order ProviderOrder (and HwOrder) in the offline SYSTEM hive, after confirming the software is really uninstalled"
                         }
                     }
                 }
@@ -17839,19 +17943,21 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
         }
 
         # EMS / Serial Console check (reads BCD store; no hive needed)
-        try {
-            $bcdPathEms = Get-BcdStorePath -Generation $script:VMGen -BootDrive $script:BootDriveLetter.TrimEnd('\')
-            if (Test-Path $bcdPathEms) {
-                $emsOut = & bcdedit.exe /store $bcdPathEms /enum "{emssettings}" 2>&1 | Out-String
-                if ($emsOut -notmatch 'emsport' -and $emsOut -notmatch 'emsbaudrate') {
-                    & $emit 'Boot' (& $toSev $sevEmsDisabled) 'EMS/Serial Console is not configured - enable with -EnableSerialConsole for Azure Serial Console access' "-EnableSerialConsole"
-                }
-                else {
-                    & $emit 'Boot' 'OK' 'EMS/Serial Console is configured'
+        if (& $inArea 'Boot') {
+            try {
+                $bcdPathEms = Get-BcdStorePath -Generation $script:VMGen -BootDrive $script:BootDriveLetter.TrimEnd('\')
+                if (Test-Path $bcdPathEms) {
+                    $emsOut = & bcdedit.exe /store $bcdPathEms /enum "{emssettings}" 2>&1 | Out-String
+                    if ($emsOut -notmatch 'emsport' -and $emsOut -notmatch 'emsbaudrate') {
+                        & $emit 'Boot' (& $toSev $sevEmsDisabled) 'EMS/Serial Console is not configured - enable with -EnableSerialConsole for Azure Serial Console access' "-EnableSerialConsole"
+                    }
+                    else {
+                        & $emit 'Boot' 'OK' 'EMS/Serial Console is configured'
+                    }
                 }
             }
+            catch { <# non-critical #> }
         }
-        catch { <# non-critical #> }
 
         # -- 5. SOFTWARE hive -----------------------------------------------------
         Write-Host "--- Registry (SOFTWARE hive)" -ForegroundColor DarkGray
@@ -17867,67 +17973,73 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
                 }
 
                 # CredSSP AllowEncryptionOracle
-                $credSsp = (Get-ItemProperty 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\CredSSP\Parameters' -ErrorAction SilentlyContinue).AllowEncryptionOracle
-                if ($null -ne $credSsp -and $credSsp -ne 2) {
-                    $oDesc = switch ($credSsp) { 0 { 'Force Updated Clients (most restrictive)' } 1 { 'Mitigated' } default { "Value=$credSsp" } }
-                    & $emit 'RDP' (& $toSev $sevCredSspOracle) "CredSSP AllowEncryptionOracle=$credSsp ($oDesc) - may block RDP from clients without latest patches" "-FixRDPAuth"
+                if (& $inArea 'RDP') {
+                    $credSsp = (Get-ItemProperty 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\CredSSP\Parameters' -ErrorAction SilentlyContinue).AllowEncryptionOracle
+                    if ($null -ne $credSsp -and $credSsp -ne 2) {
+                        $oDesc = switch ($credSsp) { 0 { 'Force Updated Clients (most restrictive)' } 1 { 'Mitigated' } default { "Value=$credSsp" } }
+                        & $emit 'RDP' (& $toSev $sevCredSspOracle) "CredSSP AllowEncryptionOracle=$credSsp ($oDesc) - may block RDP from clients without latest patches" "-FixRDPAuth"
+                    }
                 }
 
                 # -- Gen2: BitLocker / FVE policy (SOFTWARE hive side) ----------------
-                if ($script:VMGen -eq 2) {
-                    $fvePath = 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\FVE'
-                    if (Test-Path $fvePath) {
-                        $fveProps = Get-ItemProperty $fvePath -ErrorAction SilentlyContinue
-                        $useTPM = $fveProps.UseTPM
-                        $useTPMPIN = $fveProps.UseTPMPIN
-                        $useTPMKey = $fveProps.UseTPMKey
-                        $fveDetail = [System.Collections.Generic.List[string]]::new()
-                        if ($null -ne $useTPM) { $fveDetail.Add("UseTPM=$useTPM") }
-                        if ($null -ne $useTPMPIN) { $fveDetail.Add("UseTPMPIN=$useTPMPIN") }
-                        if ($null -ne $useTPMKey) { $fveDetail.Add("UseTPMKey=$useTPMKey") }
-                        if ($fveDetail.Count -gt 0) {
-                            & $emit 'UEFI' (& $toSev $sevBitLockerActive) "BitLocker FVE policy configured ($($fveDetail -join ', ')) - if BitLocker is active with TPM protector, the disk CANNOT auto-unlock on a different VM; a recovery key is required"
+                if (& $inArea 'Boot', 'Security') {
+                    if ($script:VMGen -eq 2) {
+                        $fvePath = 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\FVE'
+                        if (Test-Path $fvePath) {
+                            $fveProps = Get-ItemProperty $fvePath -ErrorAction SilentlyContinue
+                            $useTPM = $fveProps.UseTPM
+                            $useTPMPIN = $fveProps.UseTPMPIN
+                            $useTPMKey = $fveProps.UseTPMKey
+                            $fveDetail = [System.Collections.Generic.List[string]]::new()
+                            if ($null -ne $useTPM) { $fveDetail.Add("UseTPM=$useTPM") }
+                            if ($null -ne $useTPMPIN) { $fveDetail.Add("UseTPMPIN=$useTPMPIN") }
+                            if ($null -ne $useTPMKey) { $fveDetail.Add("UseTPMKey=$useTPMKey") }
+                            if ($fveDetail.Count -gt 0) {
+                                & $emit 'UEFI' (& $toSev $sevBitLockerActive) "BitLocker FVE policy configured ($($fveDetail -join ', ')) - if BitLocker is active with TPM protector, the disk CANNOT auto-unlock on a different VM; a recovery key is required"
+                            }
                         }
+                        # Note: HKLM\SOFTWARE\Microsoft\BitLocker is intentionally NOT checked here.
+                        # That key exists by default on virtually every Windows install regardless of
+                        # whether any volume is actually encrypted, so testing for its presence would
+                        # fire on nearly every Gen2 VM. The FVE policy check above is gated on real
+                        # configured policy values and is the meaningful BitLocker signal.
                     }
-                    # Note: HKLM\SOFTWARE\Microsoft\BitLocker is intentionally NOT checked here.
-                    # That key exists by default on virtually every Windows install regardless of
-                    # whether any volume is actually encrypted, so testing for its presence would
-                    # fire on nearly every Gen2 VM. The FVE policy check above is gated on real
-                    # configured policy values and is the meaningful BitLocker signal.
                 }
 
                 # AppLocker enforced collections
-                $srpBase = 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\Windows\SrpV2'
-                $enforcedCols   = @()  # collections with EnforcementMode != 0
-                $colsWithRules  = @()  # subset that also contain GUID rule subkeys
-                foreach ($col in @('Exe', 'Dll', 'Script', 'Msi', 'Appx')) {
-                    $colPath = "$srpBase\$col"
-                    if (-not (Test-Path $colPath)) { continue }
-                    $mode = (Get-ItemProperty $colPath -ErrorAction SilentlyContinue).EnforcementMode
-                    if ($null -eq $mode -or $mode -eq 0) { continue }
-                    $enforcedCols += $col
-                    # Check for GUID subkeys (each AppLocker rule is stored as a GUID-named subkey)
-                    $ruleKeys = @(Get-ChildItem $colPath -ErrorAction SilentlyContinue |
-                        Where-Object { $_.PSChildName -match '^\{[0-9a-f-]{36}\}$' })
-                    if ($ruleKeys.Count -gt 0) { $colsWithRules += $col }
-                }
-                $appIdAutoStart = ($script:_sysCheckAppIdSvcStart -eq 2)
-                if ($enforcedCols.Count -gt 0) {
-                    if ($appIdAutoStart -and $colsWithRules.Count -gt 0) {
-                        # CRIT: enforcement configured + service will auto-start + rules exist
-                        & $emit 'Security' (& $toSev $sevAppLockerActive) "AppLocker ACTIVE for: $($colsWithRules -join ', ') - EnforcementMode on, AppIDSvc=Auto, rules present - will block processes" "-DisableAppLocker"
+                if (& $inArea 'Security') {
+                    $srpBase = 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\Windows\SrpV2'
+                    $enforcedCols   = @()  # collections with EnforcementMode != 0
+                    $colsWithRules  = @()  # subset that also contain GUID rule subkeys
+                    foreach ($col in @('Exe', 'Dll', 'Script', 'Msi', 'Appx')) {
+                        $colPath = "$srpBase\$col"
+                        if (-not (Test-Path $colPath)) { continue }
+                        $mode = (Get-ItemProperty $colPath -ErrorAction SilentlyContinue).EnforcementMode
+                        if ($null -eq $mode -or $mode -eq 0) { continue }
+                        $enforcedCols += $col
+                        # Check for GUID subkeys (each AppLocker rule is stored as a GUID-named subkey)
+                        $ruleKeys = @(Get-ChildItem $colPath -ErrorAction SilentlyContinue |
+                            Where-Object { $_.PSChildName -match '^\{[0-9a-f-]{36}\}$' })
+                        if ($ruleKeys.Count -gt 0) { $colsWithRules += $col }
                     }
-                    elseif ($appIdAutoStart) {
-                        # WARN: enforcement configured + service will auto-start (but no rule subkeys found)
-                        & $emit 'Security' (& $toSev $sevAppLockerEnforcing) "AppLocker enforcement configured for: $($enforcedCols -join ', ') with AppIDSvc=Auto, but no rule subkeys found - may still enforce default-deny" "-DisableAppLocker"
+                    $appIdAutoStart = ($script:_sysCheckAppIdSvcStart -eq 2)
+                    if ($enforcedCols.Count -gt 0) {
+                        if ($appIdAutoStart -and $colsWithRules.Count -gt 0) {
+                            # CRIT: enforcement configured + service will auto-start + rules exist
+                            & $emit 'Security' (& $toSev $sevAppLockerActive) "AppLocker ACTIVE for: $($colsWithRules -join ', ') - EnforcementMode on, AppIDSvc=Auto, rules present - will block processes" "-DisableAppLocker"
+                        }
+                        elseif ($appIdAutoStart) {
+                            # WARN: enforcement configured + service will auto-start (but no rule subkeys found)
+                            & $emit 'Security' (& $toSev $sevAppLockerEnforcing) "AppLocker enforcement configured for: $($enforcedCols -join ', ') with AppIDSvc=Auto, but no rule subkeys found - may still enforce default-deny" "-DisableAppLocker"
+                        }
+                        else {
+                            # OK/INFO: enforcement configured but AppIDSvc is not auto-start
+                            & $emit 'Security' (& $toSev $sevAppLockerConfigured) "AppLocker EnforcementMode set for: $($enforcedCols -join ', ') but AppIDSvc is not auto-start (Start=$($script:_sysCheckAppIdSvcStart)) - rules will not be enforced at runtime"
+                        }
                     }
                     else {
-                        # OK/INFO: enforcement configured but AppIDSvc is not auto-start
-                        & $emit 'Security' (& $toSev $sevAppLockerConfigured) "AppLocker EnforcementMode set for: $($enforcedCols -join ', ') but AppIDSvc is not auto-start (Start=$($script:_sysCheckAppIdSvcStart)) - rules will not be enforced at runtime"
+                        & $emit 'Security' 'OK' 'AppLocker is not enforcing any rule collections'
                     }
-                }
-                else {
-                    & $emit 'Security' 'OK' 'AppLocker is not enforcing any rule collections'
                 }
 
                 # AppIDSvc - if enforcing above, check service state
@@ -17936,27 +18048,31 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
                 # Group Policy can deliver its own connection security rules. These are
                 # enforced exactly like the local ones, but a local edit only survives
                 # until the next policy refresh rewrites the cached copy.
-                $conSecGpoState = Get-ConSecRuleStoreState `
-                    -StorePath 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\WindowsFirewall\ConSecRules' `
-                    -StoreLabel 'Group Policy store' -RdpPort $script:_sysCheckRdpPort
-                & $emitConSec $conSecGpoState $sevConSecGpoRdpBlocked $sevConSecRdpConditional '-FixWFPRules' `
-                    '. This rule is delivered by Group Policy, so neutralising it offline gets the VM back but it returns at the next policy refresh - the durable fix is in the GPO'
+                if (& $inArea 'RDP', 'Connectivity') {
+                    $conSecGpoState = Get-ConSecRuleStoreState `
+                        -StorePath 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\WindowsFirewall\ConSecRules' `
+                        -StoreLabel 'Group Policy store' -RdpPort $script:_sysCheckRdpPort
+                    & $emitConSec $conSecGpoState $sevConSecGpoRdpBlocked $sevConSecRdpConditional '-FixWFPRules' `
+                        '. This rule is delivered by Group Policy, so neutralising it offline gets the VM back but it returns at the next policy refresh - the durable fix is in the GPO'
+                }
 
                 # NLA policy via Group Policy / TS Policy path (SOFTWARE side)
-                $tsPolicyBase = 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
-                if (Test-Path $tsPolicyBase) {
-                    $tsPol = Get-ItemProperty $tsPolicyBase -ErrorAction SilentlyContinue
-                    if ($null -ne $tsPol.fDenyTSConnections -and $tsPol.fDenyTSConnections -eq 1) {
-                        & $emit 'RDP' (& $toSev $sevGpRdpBlocked) 'Group Policy is BLOCKING RDP: Software\Policies\...\Terminal Services fDenyTSConnections=1 - -FixRDP clears this' "-FixRDP"
-                    }
-                    if ($null -ne $tsPol.UserAuthentication -and $tsPol.UserAuthentication -eq 0) {
-                        & $emit 'RDP' (& $toSev $sevGpNlaDisabled) 'Group Policy has disabled NLA (Software\Policies UserAuthentication=0) - this overrides the listener setting'
-                    }
-                    $sslFuncPath = 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\Cryptography\Configuration\SSL\00010002'
-                    if (Test-Path $sslFuncPath) {
-                        $sslFunc = (Get-ItemProperty $sslFuncPath -ErrorAction SilentlyContinue).Functions
-                        if ($null -ne $sslFunc) {
-                            & $emit 'RDP' (& $toSev $sevSslCipherPolicy) "SSL cipher suite policy (SSL\00010002 Functions) is configured - may restrict TLS cipher suites available to RDP; run -FixRDP to clear" "-FixRDP"
+                if (& $inArea 'RDP') {
+                    $tsPolicyBase = 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+                    if (Test-Path $tsPolicyBase) {
+                        $tsPol = Get-ItemProperty $tsPolicyBase -ErrorAction SilentlyContinue
+                        if ($null -ne $tsPol.fDenyTSConnections -and $tsPol.fDenyTSConnections -eq 1) {
+                            & $emit 'RDP' (& $toSev $sevGpRdpBlocked) 'Group Policy is BLOCKING RDP: Software\Policies\...\Terminal Services fDenyTSConnections=1 - -FixRDP clears this' "-FixRDP"
+                        }
+                        if ($null -ne $tsPol.UserAuthentication -and $tsPol.UserAuthentication -eq 0) {
+                            & $emit 'RDP' (& $toSev $sevGpNlaDisabled) 'Group Policy has disabled NLA (Software\Policies UserAuthentication=0) - this overrides the listener setting'
+                        }
+                        $sslFuncPath = 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\Cryptography\Configuration\SSL\00010002'
+                        if (Test-Path $sslFuncPath) {
+                            $sslFunc = (Get-ItemProperty $sslFuncPath -ErrorAction SilentlyContinue).Functions
+                            if ($null -ne $sslFunc) {
+                                & $emit 'RDP' (& $toSev $sevSslCipherPolicy) "SSL cipher suite policy (SSL\00010002 Functions) is configured - may restrict TLS cipher suites available to RDP; run -FixRDP to clear" "-FixRDP"
+                            }
                         }
                     }
                 }
@@ -17969,106 +18085,112 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
                 # it, so flagging "Exclusive != 0" alone produces false positives on healthy,
                 # fully-serviced VMs. We therefore classify each session and correlate it with the
                 # authoritative pending.xml marker before deciding WARN vs INFO.
-                $cbsBase = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing'
-                $cbsPendingXml = Test-Path -LiteralPath (Join-Path $script:WinDriveLetter 'Windows\WinSxS\pending.xml')
-                $cbsIssues = [System.Collections.Generic.List[string]]::new()
-                $cbsInfos = [System.Collections.Generic.List[string]]::new()
-                $cbsPendingKeyFound = $false
-                foreach ($cbsKey in @('RebootPending', 'PackagesPending', 'SessionsPending')) {
-                    $cbsKeyPath = "$cbsBase\$cbsKey"
-                    if (-not (Test-Path $cbsKeyPath)) { continue }
-                    $cbsPendingKeyFound = $true
+                if (& $inArea 'Boot', 'Update') {
+                    $cbsBase = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing'
+                    $cbsPendingXml = Test-Path -LiteralPath (Join-Path $script:WinDriveLetter 'Windows\WinSxS\pending.xml')
+                    $cbsIssues = [System.Collections.Generic.List[string]]::new()
+                    $cbsInfos = [System.Collections.Generic.List[string]]::new()
+                    $cbsPendingKeyFound = $false
+                    foreach ($cbsKey in @('RebootPending', 'PackagesPending', 'SessionsPending')) {
+                        $cbsKeyPath = "$cbsBase\$cbsKey"
+                        if (-not (Test-Path $cbsKeyPath)) { continue }
+                        $cbsPendingKeyFound = $true
 
-                    # Collect detail: subkey names + any values on the key itself
-                    $subkeys = @(Get-ChildItem $cbsKeyPath -ErrorAction SilentlyContinue | Select-Object -ExpandProperty PSChildName)
-                    $vals = Get-ItemProperty $cbsKeyPath -ErrorAction SilentlyContinue
-                    $valNames = @($vals.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' } | Select-Object -ExpandProperty Name)
+                        # Collect detail: subkey names + any values on the key itself
+                        $subkeys = @(Get-ChildItem $cbsKeyPath -ErrorAction SilentlyContinue | Select-Object -ExpandProperty PSChildName)
+                        $vals = Get-ItemProperty $cbsKeyPath -ErrorAction SilentlyContinue
+                        $valNames = @($vals.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' } | Select-Object -ExpandProperty Name)
 
-                    switch ($cbsKey) {
-                        'RebootPending' {
-                            # Values here are package names pending reboot - a genuine pending marker.
-                            $rp = if ($valNames.Count -gt 0) { "pending package(s): $($valNames[0..([Math]::Min(2,$valNames.Count-1))] -join ', ')$(if ($valNames.Count -gt 3){ " (+$($valNames.Count-3) more)" })" } else { 'key exists (no values)' }
-                            $cbsIssues.Add("RebootPending ($rp) - may cause 'Configuring Windows Updates' boot loop")
-                        }
-                        'PackagesPending' {
-                            # Subkeys are package names queued for install - a genuine pending marker.
-                            $pp = if ($subkeys.Count -gt 0) { "$($subkeys.Count) package(s) pending: $($subkeys[0..([Math]::Min(1,$subkeys.Count-1))] -join ', ')$(if ($subkeys.Count -gt 2){ " (+$($subkeys.Count-2) more)" })" } else { 'key exists (no subkeys)' }
-                            $cbsIssues.Add("PackagesPending ($pp) - may cause 'Configuring Windows Updates' boot loop")
-                        }
-                        'SessionsPending' {
-                            # Classify each session record. An exclusive session that did NOT finish
-                            # is "interrupted"; one CBS has marked finished is completed history.
-                            # Finished is signalled by Complete=1 (Server 2012 R2 / 2016 servicing
-                            # stack) or Successful=1 (newer stacks). Only an interrupted exclusive
-                            # session combined with a queued pending.xml is a real boot-loop candidate.
-                            # Sessions with no Exclusive value are non-exclusive history and ignored.
-                            $interrupted = [System.Collections.Generic.List[string]]::new()
-                            $completed = [System.Collections.Generic.List[string]]::new()
-                            foreach ($s in $subkeys) {
-                                $sp = Get-ItemProperty "$cbsKeyPath\$s" -ErrorAction SilentlyContinue
-                                if ($null -eq $sp -or $null -eq $sp.Exclusive -or [int]$sp.Exclusive -eq 0) { continue }
-                                $sessionDone = ($null -ne $sp.Complete -and [int]$sp.Complete -eq 1) -or ($null -ne $sp.Successful -and [int]$sp.Successful -eq 1)
-                                if ($sessionDone) { $completed.Add($s) }
-                                else { $interrupted.Add($s) }
+                        switch ($cbsKey) {
+                            'RebootPending' {
+                                # Values here are package names pending reboot - a genuine pending marker.
+                                $rp = if ($valNames.Count -gt 0) { "pending package(s): $($valNames[0..([Math]::Min(2,$valNames.Count-1))] -join ', ')$(if ($valNames.Count -gt 3){ " (+$($valNames.Count-3) more)" })" } else { 'key exists (no values)' }
+                                $cbsIssues.Add("RebootPending ($rp) - may cause 'Configuring Windows Updates' boot loop")
                             }
-                            if ($interrupted.Count -gt 0 -and $cbsPendingXml) {
-                                $cbsIssues.Add("SessionsPending (EXCLUSIVE session interrupted mid-flight AND a queued WinSxS\pending.xml is present - genuine 'Configuring Windows Updates' boot-loop risk; session ID(s): $($interrupted -join ', '))")
+                            'PackagesPending' {
+                                # Subkeys are package names queued for install - a genuine pending marker.
+                                $pp = if ($subkeys.Count -gt 0) { "$($subkeys.Count) package(s) pending: $($subkeys[0..([Math]::Min(1,$subkeys.Count-1))] -join ', ')$(if ($subkeys.Count -gt 2){ " (+$($subkeys.Count-2) more)" })" } else { 'key exists (no subkeys)' }
+                                $cbsIssues.Add("PackagesPending ($pp) - may cause 'Configuring Windows Updates' boot loop")
                             }
-                            elseif ($interrupted.Count -gt 0) {
-                                $cbsInfos.Add("CBS SessionsPending: stale exclusive session ($($interrupted -join ', ')), no pending.xml - not a boot-loop risk")
+                            'SessionsPending' {
+                                # Classify each session record. An exclusive session that did NOT finish
+                                # is "interrupted"; one CBS has marked finished is completed history.
+                                # Finished is signalled by Complete=1 (Server 2012 R2 / 2016 servicing
+                                # stack) or Successful=1 (newer stacks). Only an interrupted exclusive
+                                # session combined with a queued pending.xml is a real boot-loop candidate.
+                                # Sessions with no Exclusive value are non-exclusive history and ignored.
+                                $interrupted = [System.Collections.Generic.List[string]]::new()
+                                $completed = [System.Collections.Generic.List[string]]::new()
+                                foreach ($s in $subkeys) {
+                                    $sp = Get-ItemProperty "$cbsKeyPath\$s" -ErrorAction SilentlyContinue
+                                    if ($null -eq $sp -or $null -eq $sp.Exclusive -or [int]$sp.Exclusive -eq 0) { continue }
+                                    $sessionDone = ($null -ne $sp.Complete -and [int]$sp.Complete -eq 1) -or ($null -ne $sp.Successful -and [int]$sp.Successful -eq 1)
+                                    if ($sessionDone) { $completed.Add($s) }
+                                    else { $interrupted.Add($s) }
+                                }
+                                if ($interrupted.Count -gt 0 -and $cbsPendingXml) {
+                                    $cbsIssues.Add("SessionsPending (EXCLUSIVE session interrupted mid-flight AND a queued WinSxS\pending.xml is present - genuine 'Configuring Windows Updates' boot-loop risk; session ID(s): $($interrupted -join ', '))")
+                                }
+                                elseif ($interrupted.Count -gt 0) {
+                                    $cbsInfos.Add("CBS SessionsPending: stale exclusive session ($($interrupted -join ', ')), no pending.xml - not a boot-loop risk")
+                                }
+                                elseif ($completed.Count -gt 0) {
+                                    $cbsInfos.Add("CBS SessionsPending: completed session history ($($completed -join ', ')) - normal, not pending")
+                                }
+                                # else: only non-exclusive session entries -> stale history, suppress entirely
                             }
-                            elseif ($completed.Count -gt 0) {
-                                $cbsInfos.Add("CBS SessionsPending: completed session history ($($completed -join ', ')) - normal, not pending")
-                            }
-                            # else: only non-exclusive session entries -> stale history, suppress entirely
                         }
                     }
-                }
-                foreach ($issue in $cbsIssues) {
-                    & $emit 'WindowsUpdate' (& $toSev $sevCbsPendingWarn) "CBS pending state: $issue" '-FixPendingUpdates'
-                }
-                foreach ($info in $cbsInfos) {
-                    & $emit 'WindowsUpdate' 'INFO' $info
-                }
-                if ($cbsIssues.Count -eq 0 -and $cbsInfos.Count -eq 0) {
-                    if (-not $cbsPendingKeyFound) {
-                        & $emit 'WindowsUpdate' 'OK' 'No CBS pending state keys detected'
+                    foreach ($issue in $cbsIssues) {
+                        & $emit 'WindowsUpdate' (& $toSev $sevCbsPendingWarn) "CBS pending state: $issue" '-FixPendingUpdates'
                     }
-                    else {
-                        & $emit 'WindowsUpdate' 'OK' 'CBS pending keys exist but contain only stale, non-actionable session history'
+                    foreach ($info in $cbsInfos) {
+                        & $emit 'WindowsUpdate' 'INFO' $info
+                    }
+                    if ($cbsIssues.Count -eq 0 -and $cbsInfos.Count -eq 0) {
+                        if (-not $cbsPendingKeyFound) {
+                            & $emit 'WindowsUpdate' 'OK' 'No CBS pending state keys detected'
+                        }
+                        else {
+                            & $emit 'WindowsUpdate' 'OK' 'CBS pending keys exist but contain only stale, non-actionable session history'
+                        }
                     }
                 }
 
                 # -- Winlogon Shell / Userinit ----------------------------------------
-                $wlPath = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
-                if (Test-Path $wlPath) {
-                    $wlProps = Get-ItemProperty $wlPath -ErrorAction SilentlyContinue
-                    $wlShell = $wlProps.Shell
-                    $wlUserinit = $wlProps.Userinit
-                    if ($wlShell -and $wlShell -ne 'explorer.exe') {
-                        & $emit 'Security' (& $toSev $sevWinlogonShell) "Winlogon Shell is '$wlShell' (expected 'explorer.exe') - will cause black screen or wrong shell on logon" "-FixWinlogon"
-                    }
-                    $expectedUi = 'C:\Windows\system32\userinit.exe,'
-                    if ($wlUserinit -and $wlUserinit -ne $expectedUi -and $wlUserinit -ne 'C:\Windows\system32\userinit.exe') {
-                        & $emit 'Security' (& $toSev $sevWinlogonUserinit) "Winlogon Userinit is '$wlUserinit' (expected default) - may cause logon failure or malware execution" "-FixWinlogon"
+                if (& $inArea 'Boot', 'RDP', 'Security') {
+                    $wlPath = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+                    if (Test-Path $wlPath) {
+                        $wlProps = Get-ItemProperty $wlPath -ErrorAction SilentlyContinue
+                        $wlShell = $wlProps.Shell
+                        $wlUserinit = $wlProps.Userinit
+                        if ($wlShell -and $wlShell -ne 'explorer.exe') {
+                            & $emit 'Security' (& $toSev $sevWinlogonShell) "Winlogon Shell is '$wlShell' (expected 'explorer.exe') - will cause black screen or wrong shell on logon" "-FixWinlogon"
+                        }
+                        $expectedUi = 'C:\Windows\system32\userinit.exe,'
+                        if ($wlUserinit -and $wlUserinit -ne $expectedUi -and $wlUserinit -ne 'C:\Windows\system32\userinit.exe') {
+                            & $emit 'Security' (& $toSev $sevWinlogonUserinit) "Winlogon Userinit is '$wlUserinit' (expected default) - may cause logon failure or malware execution" "-FixWinlogon"
+                        }
                     }
                 }
 
                 # -- User Profile List ------------------------------------------------
-                $plBase = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
-                if (Test-Path $plBase) {
-                    $profEntries = Get-ChildItem $plBase -ErrorAction SilentlyContinue
-                    foreach ($pf in $profEntries) {
-                        $sid = $pf.PSChildName
-                        if ($sid -notmatch '^S-1-5-21-') { continue }
-                        $bakProfPath = "$plBase\$sid.bak"
-                        if (Test-Path $bakProfPath) {
-                            $pfPath = (Get-ItemProperty $pf.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
-                            & $emit 'UserProfile' (& $toSev $sevProfileBak) "Profile SID $sid has .bak duplicate (path: $pfPath) - user will get 'The User Profile Service failed the sign-in' error" "-FixProfileLoad"
-                        }
-                        $pfState = (Get-ItemProperty $pf.PSPath -ErrorAction SilentlyContinue).State
-                        if ($null -ne $pfState -and ($pfState -band 0x8)) {
-                            & $emit 'UserProfile' (& $toSev $sevProfileTempFlag) "Profile SID $sid has temporary profile flag (State=$pfState) - user gets temporary profile on each logon" "-FixProfileLoad"
+                if (& $inArea 'RDP') {
+                    $plBase = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+                    if (Test-Path $plBase) {
+                        $profEntries = Get-ChildItem $plBase -ErrorAction SilentlyContinue
+                        foreach ($pf in $profEntries) {
+                            $sid = $pf.PSChildName
+                            if ($sid -notmatch '^S-1-5-21-') { continue }
+                            $bakProfPath = "$plBase\$sid.bak"
+                            if (Test-Path $bakProfPath) {
+                                $pfPath = (Get-ItemProperty $pf.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
+                                & $emit 'UserProfile' (& $toSev $sevProfileBak) "Profile SID $sid has .bak duplicate (path: $pfPath) - user will get 'The User Profile Service failed the sign-in' error" "-FixProfileLoad"
+                            }
+                            $pfState = (Get-ItemProperty $pf.PSPath -ErrorAction SilentlyContinue).State
+                            if ($null -ne $pfState -and ($pfState -band 0x8)) {
+                                & $emit 'UserProfile' (& $toSev $sevProfileTempFlag) "Profile SID $sid has temporary profile flag (State=$pfState) - user gets temporary profile on each logon" "-FixProfileLoad"
+                            }
                         }
                     }
                 }
@@ -18083,190 +18205,200 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
                 #                  0x00000040 = validate all heap (extreme slowdown -> SCM timeout)
                 #   MitigationOptions - forces DEP/ASLR/CFG/SEHOP on binaries that may not
                 #                  be compiled for them, causing access violations.
-                $ifeoRoot = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'
-                if (Test-Path $ifeoRoot) {
-                    # Critical executables whose IFEO entries would prevent boot or core services
-                    $ifeoCriticalExes = @(
-                        'svchost.exe', 'services.exe', 'lsass.exe', 'smss.exe', 'csrss.exe',
-                        'wininit.exe', 'winlogon.exe', 'logonui.exe', 'dwm.exe',
-                        'spoolsv.exe', 'lsm.exe', 'userinit.exe', 'explorer.exe',
-                        'rdpclip.exe', 'rdpinit.exe', 'mstsc.exe', 'termsrv.dll',
-                        'WaAppAgent.exe', 'WindowsAzureGuestAgent.exe',
-                        'WaSecAgentProv.exe'
-                    )
-                    # GlobalFlag bits that are known to crash or OOM services
-                    $dangerousGFlags = @(
-                        @{ Mask = 0x02000000; Name = 'FLG_HEAP_PAGE_ALLOCS (page heap)'; Risk = 'massive memory overhead - causes OOM on constrained services' }
-                        @{ Mask = 0x00000100; Name = 'FLG_APPLICATION_VERIFIER'; Risk = 'crashes if Application Verifier provider DLLs are missing' }
-                        @{ Mask = 0x00000040; Name = 'FLG_HEAP_VALIDATE_ALL'; Risk = 'validates every heap operation - extreme slowdown causes SCM timeout' }
-                        @{ Mask = 0x00001000; Name = 'FLG_USER_STACK_TRACE_DB'; Risk = 'stack trace database - significant memory overhead' }
-                    )
-                    $ifeoCount = 0
-                    foreach ($ifeoKey in (Get-ChildItem $ifeoRoot -ErrorAction SilentlyContinue)) {
-                        $ifeoProps = Get-ItemProperty $ifeoKey.PSPath -ErrorAction SilentlyContinue
-                        $exeName = $ifeoKey.PSChildName
-                        $isCritical = $ifeoCriticalExes -contains $exeName
+                if (& $inArea 'Boot', 'Security') {
+                    $ifeoRoot = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'
+                    if (Test-Path $ifeoRoot) {
+                        # Critical executables whose IFEO entries would prevent boot or core services
+                        $ifeoCriticalExes = @(
+                            'svchost.exe', 'services.exe', 'lsass.exe', 'smss.exe', 'csrss.exe',
+                            'wininit.exe', 'winlogon.exe', 'logonui.exe', 'dwm.exe',
+                            'spoolsv.exe', 'lsm.exe', 'userinit.exe', 'explorer.exe',
+                            'rdpclip.exe', 'rdpinit.exe', 'mstsc.exe', 'termsrv.dll',
+                            'WaAppAgent.exe', 'WindowsAzureGuestAgent.exe',
+                            'WaSecAgentProv.exe'
+                        )
+                        # GlobalFlag bits that are known to crash or OOM services
+                        $dangerousGFlags = @(
+                            @{ Mask = 0x02000000; Name = 'FLG_HEAP_PAGE_ALLOCS (page heap)'; Risk = 'massive memory overhead - causes OOM on constrained services' }
+                            @{ Mask = 0x00000100; Name = 'FLG_APPLICATION_VERIFIER'; Risk = 'crashes if Application Verifier provider DLLs are missing' }
+                            @{ Mask = 0x00000040; Name = 'FLG_HEAP_VALIDATE_ALL'; Risk = 'validates every heap operation - extreme slowdown causes SCM timeout' }
+                            @{ Mask = 0x00001000; Name = 'FLG_USER_STACK_TRACE_DB'; Risk = 'stack trace database - significant memory overhead' }
+                        )
+                        $ifeoCount = 0
+                        foreach ($ifeoKey in (Get-ChildItem $ifeoRoot -ErrorAction SilentlyContinue)) {
+                            $ifeoProps = Get-ItemProperty $ifeoKey.PSPath -ErrorAction SilentlyContinue
+                            $exeName = $ifeoKey.PSChildName
+                            $isCritical = $ifeoCriticalExes -contains $exeName
 
-                        # 1. Debugger redirect (most severe - process never runs)
-                        $ifeoDebugger = $ifeoProps.Debugger
-                        if ($ifeoDebugger) {
-                            $dbgBin = ($ifeoDebugger -split '\s+', 2)[0].Trim('"')
-                            $dbgResolved = if ($dbgBin -match '^[A-Z]:\\') {
-                                $dbgBin -replace '^[A-Z]:\\', "$($script:WinDriveLetter)"
-                            } else { $null }
-                            $dbgExists = $dbgResolved -and (Test-Path -LiteralPath $dbgResolved)
-                            $existsTag = if ($dbgResolved) { if ($dbgExists) { 'binary exists' } else { 'BINARY MISSING' } } else { 'path not resolvable' }
-                            $sev = if ($isCritical) { (& $toSev $sevIFEODebugger) } else { (& $toSev $sevIFEODebuggerNonCritical) }
-                            $impact = if ($isCritical) { 'CRITICAL - service/process will not start' } else { 'process will launch debugger instead of running normally' }
-                            & $emit 'IFEO' $sev "IFEO Debugger on $exeName -> '$ifeoDebugger' ($existsTag) - $impact"
-                            $ifeoCount++
-                        }
-
-                        # 2. GlobalFlag (second most common - gflags/page heap/app verifier leftovers)
-                        $gfValue = $ifeoProps.GlobalFlag
-                        if ($null -ne $gfValue -and [int]$gfValue -ne 0) {
-                            $gfInt = [int]$gfValue
-                            $gfHex = '0x{0:X8}' -f $gfInt
-                            $hitFlags = @()
-                            foreach ($df in $dangerousGFlags) {
-                                if ($gfInt -band $df.Mask) { $hitFlags += "$($df.Name) - $($df.Risk)" }
-                            }
-                            if ($hitFlags.Count -gt 0) {
-                                $sev = if ($isCritical) { (& $toSev $sevIFEOGlobalFlag) } else { (& $toSev $sevIFEOGlobalFlagNonCritical) }
-                                foreach ($hf in $hitFlags) {
-                                    & $emit 'IFEO' $sev "IFEO GlobalFlag on $exeName ($gfHex): $hf"
-                                }
+                            # 1. Debugger redirect (most severe - process never runs)
+                            $ifeoDebugger = $ifeoProps.Debugger
+                            if ($ifeoDebugger) {
+                                $dbgBin = ($ifeoDebugger -split '\s+', 2)[0].Trim('"')
+                                $dbgResolved = if ($dbgBin -match '^[A-Z]:\\') {
+                                    $dbgBin -replace '^[A-Z]:\\', "$($script:WinDriveLetter)"
+                                } else { $null }
+                                $dbgExists = $dbgResolved -and (Test-Path -LiteralPath $dbgResolved)
+                                $existsTag = if ($dbgResolved) { if ($dbgExists) { 'binary exists' } else { 'BINARY MISSING' } } else { 'path not resolvable' }
+                                $sev = if ($isCritical) { (& $toSev $sevIFEODebugger) } else { (& $toSev $sevIFEODebuggerNonCritical) }
+                                $impact = if ($isCritical) { 'CRITICAL - service/process will not start' } else { 'process will launch debugger instead of running normally' }
+                                & $emit 'IFEO' $sev "IFEO Debugger on $exeName -> '$ifeoDebugger' ($existsTag) - $impact"
                                 $ifeoCount++
                             }
-                        }
 
-                    }
-                    if ($ifeoCount -eq 0) {
-                        & $emit 'IFEO' 'OK' 'No IFEO debugger redirects or GlobalFlag overrides found'
+                            # 2. GlobalFlag (second most common - gflags/page heap/app verifier leftovers)
+                            $gfValue = $ifeoProps.GlobalFlag
+                            if ($null -ne $gfValue -and [int]$gfValue -ne 0) {
+                                $gfInt = [int]$gfValue
+                                $gfHex = '0x{0:X8}' -f $gfInt
+                                $hitFlags = @()
+                                foreach ($df in $dangerousGFlags) {
+                                    if ($gfInt -band $df.Mask) { $hitFlags += "$($df.Name) - $($df.Risk)" }
+                                }
+                                if ($hitFlags.Count -gt 0) {
+                                    $sev = if ($isCritical) { (& $toSev $sevIFEOGlobalFlag) } else { (& $toSev $sevIFEOGlobalFlagNonCritical) }
+                                    foreach ($hf in $hitFlags) {
+                                        & $emit 'IFEO' $sev "IFEO GlobalFlag on $exeName ($gfHex): $hf"
+                                    }
+                                    $ifeoCount++
+                                }
+                            }
+
+                        }
+                        if ($ifeoCount -eq 0) {
+                            & $emit 'IFEO' 'OK' 'No IFEO debugger redirects or GlobalFlag overrides found'
+                        }
                     }
                 }
 
                 # -- Startup Programs (Run/RunOnce) -----------------------------------
-                $runPaths = @(
-                    'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Run'
-                    'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce'
-                )
-                $startupEntries = [System.Collections.Generic.List[string]]::new()
-                foreach ($rp in $runPaths) {
-                    if (-not (Test-Path $rp)) { continue }
-                    $rpProps = Get-ItemProperty $rp -ErrorAction SilentlyContinue
-                    foreach ($rpv in ($rpProps.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' })) {
-                        $startupEntries.Add("$($rpv.Name)")
+                if (& $inArea 'Security') {
+                    $runPaths = @(
+                        'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Run'
+                        'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce'
+                    )
+                    $startupEntries = [System.Collections.Generic.List[string]]::new()
+                    foreach ($rp in $runPaths) {
+                        if (-not (Test-Path $rp)) { continue }
+                        $rpProps = Get-ItemProperty $rp -ErrorAction SilentlyContinue
+                        foreach ($rpv in ($rpProps.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' })) {
+                            $startupEntries.Add("$($rpv.Name)")
+                        }
                     }
-                }
-                if ($startupEntries.Count -gt 0) {
-                    & $emit 'Startup' (& $toSev $sevStartupPrograms) "$($startupEntries.Count) auto-start entry(s) in HKLM Run/RunOnce: $($startupEntries -join ', ') - use -ListStartupPrograms to review" "-ListStartupPrograms"
+                    if ($startupEntries.Count -gt 0) {
+                        & $emit 'Startup' (& $toSev $sevStartupPrograms) "$($startupEntries.Count) auto-start entry(s) in HKLM Run/RunOnce: $($startupEntries -join ', ') - use -ListStartupPrograms to review" "-ListStartupPrograms"
+                    }
                 }
 
                 # -- Machine proxy/PAC ------------------------------------------------
-                $inetPath = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings'
-                if (Test-Path $inetPath) {
-                    $inetProps = Get-ItemProperty $inetPath -ErrorAction SilentlyContinue
-                    if ($inetProps.ProxyEnable -eq 1 -or $inetProps.ProxyServer -or $inetProps.AutoConfigURL) {
-                        $proxyDetail = @()
-                        if ($inetProps.ProxyServer) { $proxyDetail += "ProxyServer='$($inetProps.ProxyServer)'" }
-                        if ($inetProps.AutoConfigURL) { $proxyDetail += "AutoConfigURL='$($inetProps.AutoConfigURL)'" }
-                        if ($inetProps.ProxyEnable -eq 1) { $proxyDetail += 'ProxyEnable=1' }
-                        & $emit 'Networking' (& $toSev $sevProxyConfigured) "Machine-level proxy configured: $($proxyDetail -join ', ') - may block Azure agent and remote management" "-ClearProxyState"
+                if (& $inArea 'Connectivity') {
+                    $inetPath = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings'
+                    if (Test-Path $inetPath) {
+                        $inetProps = Get-ItemProperty $inetPath -ErrorAction SilentlyContinue
+                        if ($inetProps.ProxyEnable -eq 1 -or $inetProps.ProxyServer -or $inetProps.AutoConfigURL) {
+                            $proxyDetail = @()
+                            if ($inetProps.ProxyServer) { $proxyDetail += "ProxyServer='$($inetProps.ProxyServer)'" }
+                            if ($inetProps.AutoConfigURL) { $proxyDetail += "AutoConfigURL='$($inetProps.AutoConfigURL)'" }
+                            if ($inetProps.ProxyEnable -eq 1) { $proxyDetail += 'ProxyEnable=1' }
+                            & $emit 'Networking' (& $toSev $sevProxyConfigured) "Machine-level proxy configured: $($proxyDetail -join ', ') - may block Azure agent and remote management" "-ClearProxyState"
+                        }
                     }
                 }
             } # end & { } child scope - all registry variables die here
         }
 
         # -- 6. Azure Agent binaries on disk --------------------------------------
-        Write-Host "--- Azure VM Agent" -ForegroundColor DarkGray
-        $azureDir = Join-Path $script:WinDriveLetter 'WindowsAzure'
-        if (Test-Path $azureDir) {
-            $gaDirs = @(Get-ChildItem $azureDir -Filter 'GuestAgent_*' -Directory -ErrorAction SilentlyContinue)
-            if ($gaDirs.Count -gt 0) {
-                & $emit 'AzureAgent' 'OK' "Agent binaries present: $($gaDirs[-1].Name)"
+        if (& $inArea 'Connectivity') {
+            Write-Host "--- Azure VM Agent" -ForegroundColor DarkGray
+            $azureDir = Join-Path $script:WinDriveLetter 'WindowsAzure'
+            if (Test-Path $azureDir) {
+                $gaDirs = @(Get-ChildItem $azureDir -Filter 'GuestAgent_*' -Directory -ErrorAction SilentlyContinue)
+                if ($gaDirs.Count -gt 0) {
+                    & $emit 'AzureAgent' 'OK' "Agent binaries present: $($gaDirs[-1].Name)"
+                }
+                else {
+                    & $emit 'AzureAgent' (& $toSev $sevAzureAgentMissing) 'WindowsAzure folder exists but no GuestAgent_* subfolder found' "-InstallAzureVMAgent"
+                }
             }
             else {
-                & $emit 'AzureAgent' (& $toSev $sevAzureAgentMissing) 'WindowsAzure folder exists but no GuestAgent_* subfolder found' "-InstallAzureVMAgent"
+                & $emit 'AzureAgent' (& $toSev $sevAzureAgentMissing) "WindowsAzure folder not found on $script:WinDriveLetter - VM Agent may not be installed" "-InstallAzureVMAgent"
             }
-        }
-        else {
-            & $emit 'AzureAgent' (& $toSev $sevAzureAgentMissing) "WindowsAzure folder not found on $script:WinDriveLetter - VM Agent may not be installed" "-InstallAzureVMAgent"
         }
 
         # -- 7. RDP private key / MachineKeys -------------------------------------
-        Write-Host "--- RDP Certificate & MachineKeys" -ForegroundColor DarkGray
-        $machineKeysPath = Join-Path $script:WinDriveLetter 'ProgramData\Microsoft\Crypto\RSA\MachineKeys'
-        if (Test-Path $machineKeysPath) {
-            # The RDP private key file has a well-known name prefix f686aace6942fb7f7ceb231212eef4a4
-            $rdpKeyFiles = @(Get-ChildItem $machineKeysPath -Filter 'f686aace6942fb7f7ceb231212eef4a4*' -ErrorAction SilentlyContinue)
-            if ($rdpKeyFiles.Count -gt 0) {
-                & $emit 'RDP' 'OK' "RDP private key file present ($($rdpKeyFiles[0].Name))"
+        if (& $inArea 'RDP') {
+            Write-Host "--- RDP Certificate & MachineKeys" -ForegroundColor DarkGray
+            $machineKeysPath = Join-Path $script:WinDriveLetter 'ProgramData\Microsoft\Crypto\RSA\MachineKeys'
+            if (Test-Path $machineKeysPath) {
+                # The RDP private key file has a well-known name prefix f686aace6942fb7f7ceb231212eef4a4
+                $rdpKeyFiles = @(Get-ChildItem $machineKeysPath -Filter 'f686aace6942fb7f7ceb231212eef4a4*' -ErrorAction SilentlyContinue)
+                if ($rdpKeyFiles.Count -gt 0) {
+                    & $emit 'RDP' 'OK' "RDP private key file present ($($rdpKeyFiles[0].Name))"
 
-                # Check ACLs on the key file. Required principals (matched by well-known SID):
-                #   S-1-5-18  = NT AUTHORITY\SYSTEM        -> needs FullControl
-                #   S-1-5-20  = NT AUTHORITY\NETWORK SERVICE -> needs at least Read (TermService runs as this)
-                #   S-1-5-80-* matching SessionEnv service  -> needs FullControl (checked by display name)
-                try {
-                    $keyAcl = Get-Acl -Path $rdpKeyFiles[0].FullName -ErrorAction Stop
-                    $rules = $keyAcl.Access
+                    # Check ACLs on the key file. Required principals (matched by well-known SID):
+                    #   S-1-5-18  = NT AUTHORITY\SYSTEM        -> needs FullControl
+                    #   S-1-5-20  = NT AUTHORITY\NETWORK SERVICE -> needs at least Read (TermService runs as this)
+                    #   S-1-5-80-* matching SessionEnv service  -> needs FullControl (checked by display name)
+                    try {
+                        $keyAcl = Get-Acl -Path $rdpKeyFiles[0].FullName -ErrorAction Stop
+                        $rules = $keyAcl.Access
 
-                    $sidSystem = [System.Security.Principal.SecurityIdentifier]'S-1-5-18'
-                    $sidNetSvc = [System.Security.Principal.SecurityIdentifier]'S-1-5-20'
+                        $sidSystem = [System.Security.Principal.SecurityIdentifier]'S-1-5-18'
+                        $sidNetSvc = [System.Security.Principal.SecurityIdentifier]'S-1-5-20'
 
-                    $systemOk = $rules | Where-Object {
-                        try { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]) -eq $sidSystem } catch { $false }
-                    } | Where-Object { $_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl }
+                        $systemOk = $rules | Where-Object {
+                            try { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]) -eq $sidSystem } catch { $false }
+                        } | Where-Object { $_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl }
 
-                    $netSvcOk = $rules | Where-Object {
-                        try { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]) -eq $sidNetSvc } catch { $false }
-                    } | Where-Object { $_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Read }
+                        $netSvcOk = $rules | Where-Object {
+                            try { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]) -eq $sidNetSvc } catch { $false }
+                        } | Where-Object { $_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Read }
 
-                    # SessionEnv runs as NT Service\SessionEnv - no fixed SID, match by identity string.
-                    # This ACE is only part of the shipped Windows default on Server 2019 and later.
-                    # Measured on real installations:
-                    #   2012 R2 (9600)  : SYSTEM:F, NETWORK SERVICE:R, Administrators:R  - no SessionEnv
-                    #   2016    (14393) : SYSTEM:F, NETWORK SERVICE:R, Administrators:R  - no SessionEnv
-                    #   2019    (17763) : SYSTEM:F, NETWORK SERVICE:R, SessionEnv:F
-                    #   2022    (20348) : SYSTEM:F, NETWORK SERVICE:R, SessionEnv:F
-                    #   2025    (26100) : SYSTEM:F, NETWORK SERVICE:R, SessionEnv:F
-                    # On 2016 and older its absence is the normal configuration, so reporting it there
-                    # would be a false positive. Only evaluate it where it is known to be standard.
-                    $rdpKeyGuestBuild = 0
-                    [void][int]::TryParse((Get-GuestCurrentVersion).CurrentBuildNumber, [ref]$rdpKeyGuestBuild)
-                    $sessionEnvExpected = ($rdpKeyGuestBuild -ge 17763)
-                    $sessionEnvOk = $rules | Where-Object {
-                        $_.IdentityReference.Value -match 'SessionEnv'
-                    } | Where-Object { $_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl }
+                        # SessionEnv runs as NT Service\SessionEnv - no fixed SID, match by identity string.
+                        # This ACE is only part of the shipped Windows default on Server 2019 and later.
+                        # Measured on real installations:
+                        #   2012 R2 (9600)  : SYSTEM:F, NETWORK SERVICE:R, Administrators:R  - no SessionEnv
+                        #   2016    (14393) : SYSTEM:F, NETWORK SERVICE:R, Administrators:R  - no SessionEnv
+                        #   2019    (17763) : SYSTEM:F, NETWORK SERVICE:R, SessionEnv:F
+                        #   2022    (20348) : SYSTEM:F, NETWORK SERVICE:R, SessionEnv:F
+                        #   2025    (26100) : SYSTEM:F, NETWORK SERVICE:R, SessionEnv:F
+                        # On 2016 and older its absence is the normal configuration, so reporting it there
+                        # would be a false positive. Only evaluate it where it is known to be standard.
+                        $rdpKeyGuestBuild = 0
+                        [void][int]::TryParse((Get-GuestCurrentVersion).CurrentBuildNumber, [ref]$rdpKeyGuestBuild)
+                        $sessionEnvExpected = ($rdpKeyGuestBuild -ge 17763)
+                        $sessionEnvOk = $rules | Where-Object {
+                            $_.IdentityReference.Value -match 'SessionEnv'
+                        } | Where-Object { $_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl }
 
-                    if (-not $systemOk) {
-                        & $emit 'RDP' (& $toSev $sevRdpKeySystemAcl) "RDP private key: NT AUTHORITY\SYSTEM does not have FullControl - RDP service may fail to use the certificate" "-FixRDPPermissions"
+                        if (-not $systemOk) {
+                            & $emit 'RDP' (& $toSev $sevRdpKeySystemAcl) "RDP private key: NT AUTHORITY\SYSTEM does not have FullControl - RDP service may fail to use the certificate" "-FixRDPPermissions"
+                        }
+                        if (-not $netSvcOk) {
+                            & $emit 'RDP' (& $toSev $sevRdpKeyNetSvcAcl) "RDP private key: NT AUTHORITY\NETWORK SERVICE does not have Read access - TermService will fail to load the RDP certificate" "-FixRDPPermissions"
+                        }
+                        else {
+                            & $emit 'RDP' 'OK' 'RDP private key ACLs: SYSTEM and NETWORK SERVICE have required permissions'
+                        }
+                        if ($sessionEnvExpected -and -not $sessionEnvOk) {
+                            & $emit 'RDP' (& $toSev $sevRdpKeySessionEnvAcl) "RDP private key: NT Service\SessionEnv FullControl not found - expected on build $rdpKeyGuestBuild (Server 2019 and later); SessionEnv manages the self-signed RDP certificate" "-FixRDPPermissions"
+                        }
                     }
-                    if (-not $netSvcOk) {
-                        & $emit 'RDP' (& $toSev $sevRdpKeyNetSvcAcl) "RDP private key: NT AUTHORITY\NETWORK SERVICE does not have Read access - TermService will fail to load the RDP certificate" "-FixRDPPermissions"
-                    }
-                    else {
-                        & $emit 'RDP' 'OK' 'RDP private key ACLs: SYSTEM and NETWORK SERVICE have required permissions'
-                    }
-                    if ($sessionEnvExpected -and -not $sessionEnvOk) {
-                        & $emit 'RDP' (& $toSev $sevRdpKeySessionEnvAcl) "RDP private key: NT Service\SessionEnv FullControl not found - expected on build $rdpKeyGuestBuild (Server 2019 and later); SessionEnv manages the self-signed RDP certificate" "-FixRDPPermissions"
+                    catch {
+                        & $emit 'RDP' 'INFO' "Could not read ACLs on RDP private key file: $_"
                     }
                 }
-                catch {
-                    & $emit 'RDP' 'INFO' "Could not read ACLs on RDP private key file: $_"
+                else {
+                    & $emit 'RDP' (& $toSev $sevRdpKeyFileMissing) 'RDP private key file (f686aace...) not found in MachineKeys - RDP certificate will need to be regenerated' "-FixRDPCert"
+                }
+                # Check for zero-length or suspiciously small key files (corrupted)
+                $emptyKeys = @(Get-ChildItem $machineKeysPath -ErrorAction SilentlyContinue | Where-Object { $_.Length -eq 0 })
+                if ($emptyKeys.Count -gt 0) {
+                    & $emit 'RDP' (& $toSev $sevRdpKeyZeroLength) "$($emptyKeys.Count) zero-length file(s) found in MachineKeys - may indicate corrupted key store; run -FixRDPPermissions" "-FixRDPPermissions"
                 }
             }
             else {
-                & $emit 'RDP' (& $toSev $sevRdpKeyFileMissing) 'RDP private key file (f686aace...) not found in MachineKeys - RDP certificate will need to be regenerated' "-FixRDPCert"
+                & $emit 'RDP' (& $toSev $sevMachineKeysMissing) 'MachineKeys folder missing - RDP certificate operations will fail on boot' "-FixRDPPermissions"
             }
-            # Check for zero-length or suspiciously small key files (corrupted)
-            $emptyKeys = @(Get-ChildItem $machineKeysPath -ErrorAction SilentlyContinue | Where-Object { $_.Length -eq 0 })
-            if ($emptyKeys.Count -gt 0) {
-                & $emit 'RDP' (& $toSev $sevRdpKeyZeroLength) "$($emptyKeys.Count) zero-length file(s) found in MachineKeys - may indicate corrupted key store; run -FixRDPPermissions" "-FixRDPPermissions"
-            }
-        }
-        else {
-            & $emit 'RDP' (& $toSev $sevMachineKeysMissing) 'MachineKeys folder missing - RDP certificate operations will fail on boot' "-FixRDPPermissions"
         }
 
         # -- 7b. Remote Desktop certificate store (SOFTWARE hive) ------------------
@@ -18275,33 +18407,35 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
         # for SYSTEM here stops Windows creating one at all - the client reports "An
         # internal error has occurred" and Schannel logs 36870, with the key permissions
         # above perfectly healthy. Checking only the file system would call that VM clean.
-        Write-Host "--- RDP Certificate Store (registry)" -ForegroundColor DarkGray
-        Invoke-WithHive 'SOFTWARE' {
-            # Child scope: registry data dies here, releasing .NET RegistryKey handles
-            # before the finally block calls UnmountOffHive.
-            & {
-                foreach ($storeKey in (Get-RdpCertificateStoreDenyState)) {
-                    if (-not $storeKey.Exists) {
-                        # Not a fault. Windows recreates the store, the Certificates key
-                        # and the certificate in it on the next start.
-                        & $emit 'RDP' 'INFO' "Remote Desktop certificate store key '$($storeKey.Label)' is not present - Windows recreates it on the next start"
-                        continue
+        if (& $inArea 'RDP') {
+            Write-Host "--- RDP Certificate Store (registry)" -ForegroundColor DarkGray
+            Invoke-WithHive 'SOFTWARE' {
+                # Child scope: registry data dies here, releasing .NET RegistryKey handles
+                # before the finally block calls UnmountOffHive.
+                & {
+                    foreach ($storeKey in (Get-RdpCertificateStoreDenyState)) {
+                        if (-not $storeKey.Exists) {
+                            # Not a fault. Windows recreates the store, the Certificates key
+                            # and the certificate in it on the next start.
+                            & $emit 'RDP' 'INFO' "Remote Desktop certificate store key '$($storeKey.Label)' is not present - Windows recreates it on the next start"
+                            continue
+                        }
+                        if (-not $storeKey.Sddl) {
+                            & $emit 'RDP' (& $toSev $sevRdpCertStoreUnreadable) "Remote Desktop certificate store key '$($storeKey.Label)' exists but its security descriptor could not be read, so whether Windows can create a listener certificate there is unknown"
+                            continue
+                        }
+                        if (-not $storeKey.Denied) {
+                            & $emit 'RDP' 'OK' "Remote Desktop certificate store key '$($storeKey.Label)': NT AUTHORITY\SYSTEM is not denied"
+                            continue
+                        }
+                        if (-not $storeKey.Explicit) {
+                            & $emit 'RDP' (& $toSev $sevRdpCertStoreDeniedInherited) "Remote Desktop certificate store key '$($storeKey.Label)': NT AUTHORITY\SYSTEM is denied write access, but the deny is INHERITED from a parent key (HKLM\SOFTWARE\Microsoft\SystemCertificates or higher) rather than written here - that key is shared by every machine certificate store on this VM, so remove it there by hand"
+                            continue
+                        }
+                        & $emit 'RDP' (& $toSev $sevRdpCertStoreDenied) "Remote Desktop certificate store key '$($storeKey.Label)': NT AUTHORITY\SYSTEM is explicitly DENIED write access - Windows cannot create the self-signed listener certificate, so RDP fails with 'An internal error has occurred' even when the private key permissions are correct" "-FixRDPPermissions"
                     }
-                    if (-not $storeKey.Sddl) {
-                        & $emit 'RDP' (& $toSev $sevRdpCertStoreUnreadable) "Remote Desktop certificate store key '$($storeKey.Label)' exists but its security descriptor could not be read, so whether Windows can create a listener certificate there is unknown"
-                        continue
-                    }
-                    if (-not $storeKey.Denied) {
-                        & $emit 'RDP' 'OK' "Remote Desktop certificate store key '$($storeKey.Label)': NT AUTHORITY\SYSTEM is not denied"
-                        continue
-                    }
-                    if (-not $storeKey.Explicit) {
-                        & $emit 'RDP' (& $toSev $sevRdpCertStoreDeniedInherited) "Remote Desktop certificate store key '$($storeKey.Label)': NT AUTHORITY\SYSTEM is denied write access, but the deny is INHERITED from a parent key (HKLM\SOFTWARE\Microsoft\SystemCertificates or higher) rather than written here - that key is shared by every machine certificate store on this VM, so remove it there by hand"
-                        continue
-                    }
-                    & $emit 'RDP' (& $toSev $sevRdpCertStoreDenied) "Remote Desktop certificate store key '$($storeKey.Label)': NT AUTHORITY\SYSTEM is explicitly DENIED write access - Windows cannot create the self-signed listener certificate, so RDP fails with 'An internal error has occurred' even when the private key permissions are correct" "-FixRDPPermissions"
-                }
-            } # end & { } child scope - registry handles die here
+                } # end & { } child scope - registry handles die here
+            }
         }
 
         # -- Summary --------------------------------------------------------------
@@ -18312,6 +18446,9 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
 
         Write-Host "`n===================================================================" -ForegroundColor Cyan
         Write-Host "  System Check Summary  -  $($crits.Count) critical  /  $($warns.Count) warnings  /  $($infos.Count) info  /  $($oks.Count) ok" -ForegroundColor Cyan
+        if ($areaLabel) {
+            Write-Host "  Filtered to: $(@($script:SysCheckAreas) -join ', ') - other areas were not checked" -ForegroundColor Cyan
+        }
         Write-Host "===================================================================" -ForegroundColor Cyan
 
         # Echo back the same target form the user invoked with (-VMName <name> or
@@ -18354,6 +18491,7 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
         Write-ActionLog -Event 'RunSystemCheck' -Details @{
             Critical = $crits.Count
             Warnings = $warns.Count
+            Areas    = if ($areaLabel) { @($script:SysCheckAreas) -join ',' } else { 'All' }
             Findings = ($findings | ForEach-Object { "$($_.Severity)[$($_.Category)] $($_.Description)" }) -join ' | '
         }
     }
@@ -26546,6 +26684,12 @@ No destructive file or registry cleanup is performed.
             [switch]$IncludeHealthy,
             [switch]$IncludeServices,
             [switch]$IssuesOnly,
+            [switch]$BootOnly,
+            [switch]$RDPOnly,
+            [switch]$ConnectivityOnly,
+            [switch]$UpdateOnly,
+            [switch]$SecurityOnly,
+            [switch]$SaveOutput,
             [string[]]$DisableDriverOrService = @(),
             [string[]]$EnableDriverOrService = @(),
             [ValidateSet('Boot', 'System', 'Automatic', 'Manual', 'Disabled')][string]$DriverStartType,
@@ -26672,6 +26816,14 @@ PARAMETERS:
   -ScanNetBindings       Report third-party network binding components (non-ms_ ComponentId)
   -SysCheck              Full offline diagnostic scan: BCD, services, device filters, RDP, networking,
                            Azure Agent, security settings, crash artefacts - with fix suggestions
+    -BootOnly              (sub-option) check only boot: BCD, ESP/UEFI, hives, boot files and drivers
+    -RDPOnly               (sub-option) check only RDP: listener, NLA/CredSSP, certificate, firewall
+    -ConnectivityOnly      (sub-option) check only networking: TCP/IP, bindings, DNS, proxy, agent
+    -UpdateOnly            (sub-option) check only servicing: pending operations, Windows Update
+    -SecurityOnly          (sub-option) check only security: signatures, Secure Boot, LSA, AppLocker
+                             Area switches combine (e.g. -BootOnly -RDPOnly); other areas are skipped
+    -SaveOutput            (sub-option) also write the output to Repair-AzVMDisk_SysCheck.txt next to
+                             the script (overwritten on each run)
 
 --- BOOT & BCD ----------------------------------------------------------------
     -DisableStartupRepair  Suppress BCD-driven startup repair only (does not remove WinRE files/registration)
@@ -26905,7 +27057,7 @@ AVAILABLE DISKS:
         # Initialize logging and target (resolve VM/disk, bring disk online, detect partitions)
         # Determine if any write/repair action was requested (exclude pure read-only switches)
         $readOnlySwitches = @('SysCheck', 'CheckDiskHealth', 'ScanNetBindings', 'CheckRDPPolicies', 'CollectEventLogs', 'CollectCrashDumps', 'ShowLastSession', 'GetServicesReport', 'GetCatalogStoreReport', 'GetAppLockerReport', 'ListInstalledUpdates', 'ListStartupPrograms', 'AnalyzeCriticalBootFiles', 'AnalyzeSyntheticDrivers', 'AnalyzeProxyState', 'GetBootPathReport', 'AnalyzeBcdConsistency', 'AnalyzeComponentStore', 'AnalyzeServicingState',         'AnalyzeRecentChanges', 'AnalyzeDomainTrustState', 'GetUefiBootEntry')
-                $hasRepairAction = $PSBoundParameters.Keys | Where-Object { $readOnlySwitches -notcontains $_ -and $_ -notin @('VMName', 'DiskNumber', 'Force', 'LeaveDiskOnline', 'DriveLetter', 'RepairSource', 'CodeIntegrityPolicySourcePath', 'EspGuid', 'EspSlot', 'RepairSystemFileSource', 'SkipOfflineSfc', 'RepairSystemFileDonorDisk', 'RepairSystemFileMsu', 'SkipMsuDownload', 'AllowSystemFileDowngrade', 'IncludeServices', 'IssuesOnly', 'KeepDefaultFilters', 'DriverStartType', 'RecentChangeDays', 'LoadHive', 'UnloadHive', 'TransactionLogScope') }
+                $hasRepairAction = $PSBoundParameters.Keys | Where-Object { $readOnlySwitches -notcontains $_ -and $_ -notin @('VMName', 'DiskNumber', 'Force', 'LeaveDiskOnline', 'DriveLetter', 'RepairSource', 'CodeIntegrityPolicySourcePath', 'EspGuid', 'EspSlot', 'RepairSystemFileSource', 'SkipOfflineSfc', 'RepairSystemFileDonorDisk', 'RepairSystemFileMsu', 'SkipMsuDownload', 'AllowSystemFileDowngrade', 'IncludeServices', 'IssuesOnly', 'BootOnly', 'RDPOnly', 'ConnectivityOnly', 'UpdateOnly', 'SecurityOnly', 'SaveOutput', 'KeepDefaultFilters', 'DriverStartType', 'RecentChangeDays', 'LoadHive', 'UnloadHive', 'TransactionLogScope') }
         if ($hasRepairAction) {
             Write-Host "  Tip: if you haven't already, a VM snapshot or disk backup before making changes is always a safe starting point." -ForegroundColor DarkGray
             Write-Host ""
@@ -26995,7 +27147,16 @@ AVAILABLE DISKS:
             if ($CopyACPISettings) { CopyACPISettings }
             if ($ScanNetBindings) { ScanNetAdapterBindings }
             if ($FixNetBindings) { RemoveOrphanedNetBindings }
-            if ($SysCheck) { RunSystemCheck }
+            if ($SysCheck) {
+                $script:SysCheckAreas = @(
+                    if ($BootOnly) { 'Boot' }
+                    if ($RDPOnly) { 'RDP' }
+                    if ($ConnectivityOnly) { 'Connectivity' }
+                    if ($UpdateOnly) { 'Update' }
+                    if ($SecurityOnly) { 'Security' }
+                )
+                RunSystemCheck
+            }
             if ($ResetNetworkStack) { ResetNetworkStack }
             if ($EnableTestSigning) { SetTestSigning -Enable $true }
             if ($DisableTestSigning) { SetTestSigning -Enable $false }
@@ -27117,6 +27278,19 @@ AVAILABLE DISKS:
     }
 
     # Invoke consolidated helper with script-bound parameters
+    $sysCheckTranscript = $null
+    if ($PSBoundParameters.ContainsKey('SysCheck') -and $PSBoundParameters.ContainsKey('SaveOutput') -and [bool]$PSBoundParameters['SaveOutput']) {
+        $sysCheckOutputPath = Join-Path $PSScriptRoot 'Repair-AzVMDisk_SysCheck.txt'
+        try {
+            $transcriptArgs = @{ Path = $sysCheckOutputPath; Force = $true; ErrorAction = 'Stop' }
+            if ((Get-Command Start-Transcript).Parameters.ContainsKey('UseMinimalHeader')) { $transcriptArgs['UseMinimalHeader'] = $true }
+            Start-Transcript @transcriptArgs | Out-Null
+            $sysCheckTranscript = $sysCheckOutputPath
+        }
+        catch {
+            Write-Warning "Could not save the output to '$sysCheckOutputPath': $($_.Exception.Message). Continuing without -SaveOutput."
+        }
+    }
     try {
         Repair-OfflineDisk @PSBoundParameters
     }
@@ -27124,5 +27298,17 @@ AVAILABLE DISKS:
         # User-facing pre-flight errors are already printed cleanly; suppress the redundant
         # unhandled-exception trace that PowerShell would otherwise show at the prompt.
         if (-not $script:_userFacingError) { throw }
+    }
+    finally {
+        if ($sysCheckTranscript) {
+            try { Stop-Transcript | Out-Null } catch { }
+            # Windows PowerShell 5.1 accepts some unwritable paths without an error, so confirm the file.
+            if (Test-Path -LiteralPath $sysCheckTranscript -PathType Leaf) {
+                Write-Host "SysCheck output saved to: $sysCheckTranscript" -ForegroundColor Cyan
+            }
+            else {
+                Write-Warning "Could not save the output to '$sysCheckTranscript'."
+            }
+        }
     }
 } # end
