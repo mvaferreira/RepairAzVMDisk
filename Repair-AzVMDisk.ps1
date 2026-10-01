@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 #Requires -RunAsAdministrator
 <#
     Disclaimer
@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.9.1
+        Version: 0.9.3
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -240,6 +240,15 @@
         PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixSecureBootCodeIntegrity
 
     .EXAMPLE
+        # Gen2 VM still fails after its ESP was recreated ("boot loader did not load an operating system"
+        # or winload 0xc000000e): the firmware boot entry points at the old ESP GUID or GPT slot, or a stray
+        # \EFI folder on another partition is loaded first. Inspect, then restore the GUID and slot the
+        # firmware expects.
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -GetUefiBootEntry
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixUefiBootEntry
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixUefiBootEntry -EspGuid 11111111-2222-3333-4444-555555555555 -EspSlot 3
+
+    .EXAMPLE
         # Repair Code Integrity policy payloads from a known-good Windows\System32\CodeIntegrity folder
         PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixSecureBootCodeIntegrity -CodeIntegrityPolicySourcePath C:\Temp\KnownGood\CodeIntegrity
 
@@ -285,6 +294,8 @@ param (
     [Parameter(ParameterSetName = 'Repair')][string]$BootsectPath = '',
     [Parameter(ParameterSetName = 'Repair')][switch]$FixBootStorageDrivers,
     [Parameter(ParameterSetName = 'Repair')][switch]$RecreateBootPartition,
+    [Parameter(ParameterSetName = 'Repair')][switch]$GetUefiBootEntry,
+    [Parameter(ParameterSetName = 'Repair')][switch]$FixUefiBootEntry,
     [Parameter(ParameterSetName = 'Repair')][switch]$RepairComponentStore,
     [Parameter(ParameterSetName = 'Repair')][switch]$AnalyzeComponentStore,
     [Parameter(ParameterSetName = 'Repair')][Alias('TryLGKC')][switch]$TryLKGC,
@@ -423,6 +434,7 @@ dynamicparam {
         'FixFileSystem',
         'FixNtfsAttributeList',
         'FixSecureBootCodeIntegrity',
+        'FixUefiBootEntry',
         'RepairComponentStore',
         'GetServicesReport',
         'GetCatalogStoreReport',
@@ -473,6 +485,11 @@ dynamicparam {
     # -CodeIntegrityPolicySourcePath: sub-option of -FixSecureBootCodeIntegrity
     if ($PSBoundParameters.ContainsKey('FixSecureBootCodeIntegrity')) {
         & $addParam 'CodeIntegrityPolicySourcePath' ([string]) 'Repair' ''
+    }
+    # -EspGuid, -EspSlot: sub-options of -FixUefiBootEntry
+    if ($PSBoundParameters.ContainsKey('FixUefiBootEntry')) {
+        & $addParam 'EspGuid' ([string]) 'Repair' ''
+        & $addParam 'EspSlot' ([int]) 'Repair' 0
     }
     # -RepairSystemFileSource, -SkipOfflineSfc, -RepairSystemFileDonorDisk, -RepairSystemFileMsu,
     # -SkipMsuDownload, -AllowSystemFileDowngrade: sub-options of -RepairSystemFile
@@ -1765,23 +1782,27 @@ $($htmlRows -join "`n")
         )
     
         $role = @()
-    
+
+        # Plain string paths: Join-Path throws DriveNotFound on PS 5.1 for a lettered RAW
+        # partition (no PSDrive exists for it), which aborted the whole mount step.
+        $root = $AccessPath.TrimEnd('\') + '\'
+
         # Check for Windows partition
-        $winPath = Join-Path $AccessPath "Windows\System32\ntdll.dll"
-        if (Test-Path $winPath) {
+        $winPath = $root + "Windows\System32\ntdll.dll"
+        if (Test-Path -LiteralPath $winPath) {
             $role += "Windows"
         }
     
         # Check for UEFI/GPT Boot partition.
         # Primary check: BCD file present. Secondary: GPT System partition with EFI folder tree
         # (covers the case where BCD was deleted but the partition structure is intact).
-        $efiPathBcd = Join-Path $AccessPath "EFI\Microsoft\Boot\BCD"
-        $efiPathDir = Join-Path $AccessPath "EFI\Microsoft\Boot"
+        $efiPathBcd = $root + "EFI\Microsoft\Boot\BCD"
+        $efiPathDir = $root + "EFI\Microsoft\Boot"
         $isEfiPartition = $PartitionInfo.Type -eq 'System'
         if ($isEfiPartition -and (Test-BcdStorePath -StorePath $efiPathBcd)) {
             $role += "Boot (UEFI)"
         }
-        elseif ($isEfiPartition -and (Test-Path $efiPathDir)) {
+        elseif ($isEfiPartition -and (Test-Path -LiteralPath $efiPathDir)) {
             $role += "Boot (UEFI - BCD missing)"
         }
         elseif ($isEfiPartition) {
@@ -1789,13 +1810,13 @@ $($htmlRows -join "`n")
         }
     
         # Check for BIOS/MBR Boot partition
-        $biosPathBcd = Join-Path $AccessPath "Boot\BCD"
-        $biosPathDir = Join-Path $AccessPath "Boot"
+        $biosPathBcd = $root + "Boot\BCD"
+        $biosPathDir = $root + "Boot"
         $isActivePartition = $PartitionInfo.IsActive
         if ($isActivePartition -and (Test-BcdStorePath -StorePath $biosPathBcd)) {
             $role += "Boot (BIOS)"
         }
-        elseif ($isActivePartition -and (Test-Path $biosPathDir)) {
+        elseif ($isActivePartition -and (Test-Path -LiteralPath $biosPathDir)) {
             $role += "Boot (BIOS - BCD missing)"
         }
         elseif ($isActivePartition) {
@@ -2333,16 +2354,42 @@ exit `$exitCode
 
     # Resolves an offline guest ImagePath (\SystemRoot\, %SystemRoot%, system32\, C:\, etc.)
     # to a local path on the attached drive letter. Strips the trailing extension match too.
+    # Pass the raw REG_EXPAND_SZ value: anything already expanded by the registry provider was
+    # expanded against the rescue VM's environment, not the guest's.
     function Resolve-GuestImagePath {
         param([string]$ImagePath)
         $drive = $script:WinDriveLetter.TrimEnd('\')
         $resolved = $ImagePath `
             -replace '(?i)\\SystemRoot\\', "$drive\Windows\" `
             -replace '(?i)%SystemRoot%', "$drive\Windows" `
+            -replace '(?i)%windir%', "$drive\Windows" `
+            -replace '(?i)%ProgramFiles\(x86\)%', "$drive\Program Files (x86)" `
+            -replace '(?i)%(?:ProgramFiles|ProgramW6432)%', "$drive\Program Files" `
+            -replace '(?i)%CommonProgramFiles\(x86\)%', "$drive\Program Files (x86)\Common Files" `
+            -replace '(?i)%(?:CommonProgramFiles|CommonProgramW6432)%', "$drive\Program Files\Common Files" `
+            -replace '(?i)%ProgramData%', "$drive\ProgramData" `
+            -replace '(?i)%SystemDrive%', $drive `
             -replace '(?i)\\\?\?\\', '' `
             -replace '(?i)^system32\\', "$drive\Windows\System32\" `
             -replace '(?i)^"?[A-Z]:\\', "$drive\"
         if ($resolved -match '^(.+?\.(?:sys|exe|dll))') { $resolved = $Matches[1] }
+        return $resolved
+    }
+
+    # Resolves a raw (unexpanded) NetworkProvider ProviderPath to a path on the attached
+    # offline disk. MPR loads the provider with LoadLibrary, so a bare file name resolves
+    # from System32. Returns $null when the value still holds an environment variable the
+    # guest defines but this script cannot map (for example a per-user variable): such a
+    # path cannot be verified offline, so it must not be reported as missing.
+    function Resolve-NetworkProviderDllPath {
+        param([string]$ProviderPath)
+        if ([string]::IsNullOrWhiteSpace($ProviderPath)) { return $null }
+        $raw = $ProviderPath.Trim().Trim('"')
+        if ($raw -notmatch '[\\/%]') {
+            return ($script:WinDriveLetter.TrimEnd('\') + "\Windows\System32\$raw")
+        }
+        $resolved = Resolve-GuestImagePath $raw
+        if ($resolved -match '%[^%\\]+%') { return $null }
         return $resolved
     }
 
@@ -7346,6 +7393,1159 @@ dependencies on the Windows partition.
         Write-Host "If Secure Boot was disabled as a workaround, shut down the VM, re-enable Secure Boot, then test boot." -ForegroundColor Yellow
     }
 
+    # ======================================================================
+    # UEFI boot entry helpers (-FixUefiBootEntry / -GetUefiBootEntry)
+    #
+    # Hyper-V and Azure Gen2 firmware match the "Windows Boot Manager" load option
+    # HD(n,GPT,<guid>,...) on the partition GUID and GPT entry slot n. A recreated
+    # ESP gets a new GUID, so a VM whose UEFI variables persist (Trusted Launch,
+    # Confidential VM) keeps pointing at the deleted ESP. Restoring the old GUID
+    # on the new ESP, and moving the ESP back to GPT slot n, makes the saved
+    # entry match again without resetting the VM guest state (which would also
+    # discard the vTPM).
+    # ======================================================================
+    function Initialize-GptDiskType {
+        if ('RepairAzVMDisk.GptDisk' -as [type]) { return }
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+namespace RepairAzVMDisk {
+    public static class GptDisk {
+        const uint IOCTL_DISK_GET_DRIVE_LAYOUT_EX = 0x70050;
+        const uint IOCTL_DISK_SET_DRIVE_LAYOUT_EX = 0x7C054;
+        const uint IOCTL_DISK_UPDATE_PROPERTIES = 0x70140;
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool DeviceIoControl(SafeFileHandle h, uint code, byte[] inBuf, int inSize, byte[] outBuf, int outSize, out int returned, IntPtr overlapped);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool SetFilePointerEx(SafeFileHandle h, long distance, out long newPosition, uint method);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool ReadFile(SafeFileHandle h, byte[] buffer, int count, out int read, IntPtr overlapped);
+
+        static SafeFileHandle Open(int disk, bool write) {
+            SafeFileHandle h = CreateFile(@"\\.\PhysicalDrive" + disk, 0x80000000u | (write ? 0x40000000u : 0u), 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
+            if (h.IsInvalid) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+            return h;
+        }
+        public static byte[] GetLayout(int disk) {
+            using (SafeFileHandle h = Open(disk, false)) {
+                int size = 48 + 128 * 144;
+                while (true) {
+                    byte[] buf = new byte[size];
+                    int ret;
+                    if (DeviceIoControl(h, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, null, 0, buf, size, out ret, IntPtr.Zero)) {
+                        byte[] r = new byte[ret];
+                        Array.Copy(buf, r, ret);
+                        return r;
+                    }
+                    int err = Marshal.GetLastWin32Error();
+                    if (err == 122 && size <= 1048576) { size *= 2; continue; }
+                    throw new Win32Exception(err);
+                }
+            }
+        }
+        public static void SetLayout(int disk, byte[] layout) {
+            using (SafeFileHandle h = Open(disk, true)) {
+                int ret;
+                if (!DeviceIoControl(h, IOCTL_DISK_SET_DRIVE_LAYOUT_EX, layout, layout.Length, null, 0, out ret, IntPtr.Zero)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+                DeviceIoControl(h, IOCTL_DISK_UPDATE_PROPERTIES, null, 0, null, 0, out ret, IntPtr.Zero);
+            }
+        }
+        public static byte[] ReadBytes(int disk, long offset, int count) {
+            using (SafeFileHandle h = Open(disk, false)) {
+                long pos;
+                if (!SetFilePointerEx(h, offset, out pos, 0)) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+                byte[] buf = new byte[count];
+                int read;
+                if (!ReadFile(h, buf, count, out read, IntPtr.Zero)) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+                if (read == count) { return buf; }
+                byte[] r = new byte[read];
+                Array.Copy(buf, r, read);
+                return r;
+            }
+        }
+    }
+}
+'@
+    }
+
+    function New-UefiGuidFromBytes {
+        param([byte[]]$Bytes, [int]$Offset)
+        $slice = New-Object byte[] 16
+        [Array]::Copy($Bytes, $Offset, $slice, 0, 16)
+        return (New-Object Guid (, $slice))
+    }
+
+    function Get-GptTypeName {
+        param([guid]$Type)
+        switch ($Type.ToString()) {
+            'c12a7328-f81f-11d2-ba4b-00a0c93ec93b' { return 'ESP' }
+            'e3c9e316-0b5c-4db8-817d-f92df00215ae' { return 'MSR' }
+            'ebd0a0a2-b9e5-4433-87c0-68b6b72699c7' { return 'Basic' }
+            'de94bba4-06d1-4d40-a16a-bfd50179d6ac' { return 'Recovery' }
+            default { return $Type.ToString() }
+        }
+    }
+
+    # Partition table as Windows reports it (IOCTL_DISK_GET_DRIVE_LAYOUT_EX).
+    function Read-UefiGptLayout {
+        param([int]$DiskNumber)
+        Initialize-GptDiskType
+        $raw = [RepairAzVMDisk.GptDisk]::GetLayout($DiskNumber)
+        $style = [BitConverter]::ToUInt32($raw, 0)
+        if ($style -ne 1) { throw "Disk $DiskNumber is not a GPT disk (layout style $style)." }
+        $count = [int][BitConverter]::ToUInt32($raw, 4)
+        $entries = @()
+        for ($i = 0; $i -lt $count; $i++) {
+            $o = 48 + $i * 144
+            if ($o + 144 -gt $raw.Length) { break }
+            $len = [BitConverter]::ToInt64($raw, $o + 16)
+            if ($len -eq 0) { continue }
+            $type = New-UefiGuidFromBytes -Bytes $raw -Offset ($o + 32)
+            $entries += [pscustomobject]@{
+                Index      = $i
+                Number     = [int][BitConverter]::ToUInt32($raw, $o + 24)
+                Offset     = [BitConverter]::ToInt64($raw, $o + 8)
+                Length     = $len
+                Type       = $type
+                TypeName   = Get-GptTypeName -Type $type
+                Guid       = New-UefiGuidFromBytes -Bytes $raw -Offset ($o + 48)
+                Attributes = [BitConverter]::ToUInt64($raw, $o + 64)
+                Name       = [Text.Encoding]::Unicode.GetString($raw, $o + 72, 72).TrimEnd([char]0)
+                Fields     = ([BitConverter]::ToString($raw, $o + 8, 20) + '|' + [BitConverter]::ToString($raw, $o + 32, 16) + '|' + [BitConverter]::ToString($raw, $o + 64, 80))
+            }
+        }
+        return [pscustomobject]@{
+            DiskNumber = $DiskNumber
+            Raw        = $raw
+            Count      = $count
+            DiskGuid   = New-UefiGuidFromBytes -Bytes $raw -Offset 8
+            Entries    = $entries
+        }
+    }
+
+    # GPT entry slots as stored on disk (LBA1 header + entry array). The firmware's
+    # HD(n,...) node refers to this 1-based slot, not to the Windows partition number.
+    function Get-GptSlotMap {
+        param([int]$DiskNumber)
+        Initialize-GptDiskType
+        $sector = [int](Get-Disk -Number $DiskNumber).LogicalSectorSize
+        if ($sector -le 0) { $sector = 512 }
+        $hdr = [RepairAzVMDisk.GptDisk]::ReadBytes($DiskNumber, [long]$sector, $sector)
+        if ($hdr.Length -lt 92 -or [Text.Encoding]::ASCII.GetString($hdr, 0, 8) -ne 'EFI PART') {
+            throw "No GPT header at LBA 1 on disk $DiskNumber."
+        }
+        $entryLba = [BitConverter]::ToInt64($hdr, 72)
+        $n = [int][BitConverter]::ToUInt32($hdr, 80)
+        $size = [int][BitConverter]::ToUInt32($hdr, 84)
+        if ($n -le 0 -or $n -gt 1024 -or $size -lt 128 -or $size -gt 1024) { throw "Unexpected GPT header on disk $DiskNumber (entries $n, entry size $size)." }
+        $len = [int]([math]::Ceiling(($n * $size) / $sector) * $sector)
+        $arr = [RepairAzVMDisk.GptDisk]::ReadBytes($DiskNumber, $entryLba * $sector, $len)
+        $slots = @()
+        for ($i = 0; $i -lt $n; $i++) {
+            $o = $i * $size
+            if ($o + 128 -gt $arr.Length) { break }
+            $type = New-UefiGuidFromBytes -Bytes $arr -Offset $o
+            if ($type -eq [guid]::Empty) { continue }
+            $slots += [pscustomobject]@{
+                Slot     = $i + 1
+                Type     = $type
+                TypeName = Get-GptTypeName -Type $type
+                Guid     = New-UefiGuidFromBytes -Bytes $arr -Offset ($o + 16)
+                FirstLba = [BitConverter]::ToInt64($arr, $o + 32)
+                LastLba  = [BitConverter]::ToInt64($arr, $o + 40)
+            }
+        }
+        return $slots
+    }
+
+    # Change one partition's GPT unique GUID in place. Every other byte of the
+    # partition table is verified unchanged afterwards.
+    function Set-GptPartitionGuid {
+        param(
+            [Parameter(Mandatory = $true)][int]$DiskNumber,
+            [Parameter(Mandatory = $true)][int]$PartitionNumber,
+            [Parameter(Mandatory = $true)][guid]$NewGuid
+        )
+        if ($NewGuid -eq [guid]::Empty) { throw 'Refusing to set an empty partition GUID.' }
+        $disk = Get-Disk -Number $DiskNumber
+        if ($disk.IsBoot -or $disk.IsSystem) { throw "Disk $DiskNumber is this machine's boot/system disk; refusing to change its partition table." }
+        if ($disk.IsReadOnly) { throw "Disk $DiskNumber is read-only." }
+
+        $before = Read-UefiGptLayout -DiskNumber $DiskNumber
+        $target = @($before.Entries | Where-Object { $_.Number -eq $PartitionNumber })
+        if ($target.Count -ne 1) { throw "Partition $PartitionNumber not found in the partition table of disk $DiskNumber." }
+        $target = $target[0]
+        if ($target.Guid -eq $NewGuid) {
+            Write-Host "Partition $PartitionNumber already has GUID $NewGuid." -ForegroundColor Green
+            return [pscustomobject]@{ Changed = $false; OldGuid = $target.Guid; NewGuid = $NewGuid }
+        }
+        if (@($before.Entries | Where-Object { $_.Guid -eq $NewGuid }).Count -gt 0) {
+            throw "GUID $NewGuid is already used by another partition on disk $DiskNumber."
+        }
+        foreach ($other in @(Get-Disk | Where-Object { $_.Number -ne $DiskNumber -and $_.PartitionStyle -eq 'GPT' })) {
+            foreach ($p in @(Get-Partition -DiskNumber $other.Number -ErrorAction SilentlyContinue)) {
+                if ($p.Guid -and ([guid]$p.Guid) -eq $NewGuid) {
+                    throw "GUID $NewGuid is already used by disk $($other.Number) partition $($p.PartitionNumber). Detach that disk first; duplicate partition GUIDs confuse Windows and the firmware."
+                }
+            }
+        }
+
+        $slotsBefore = $null
+        try { $slotsBefore = @(Get-GptSlotMap -DiskNumber $DiskNumber) } catch { }
+
+        $size = 48 + $before.Count * 144
+        $layout = New-Object byte[] $size
+        [Array]::Copy($before.Raw, $layout, $size)
+        for ($i = 0; $i -lt $before.Count; $i++) { $layout[48 + $i * 144 + 28] = 1 }
+        [Array]::Copy($NewGuid.ToByteArray(), 0, $layout, 48 + $target.Index * 144 + 48, 16)
+
+        $wasOnline = -not $disk.IsOffline
+        if ($wasOnline) {
+            foreach ($p in @(Get-Partition -DiskNumber $DiskNumber -ErrorAction SilentlyContinue)) {
+                $v = $p | Get-Volume -ErrorAction SilentlyContinue
+                if ($v -and $v.FileSystem) { try { $v | Write-VolumeCache -ErrorAction Stop } catch { } }
+            }
+            Set-Disk -Number $DiskNumber -IsOffline $true
+        }
+        try {
+            Write-ActionLog -Event 'SetGptPartitionGuid' -Details @{
+                DiskNumber      = $DiskNumber
+                PartitionNumber = $PartitionNumber
+                OldGuid         = $target.Guid.ToString()
+                NewGuid         = $NewGuid.ToString()
+            }
+            [RepairAzVMDisk.GptDisk]::SetLayout($DiskNumber, $layout)
+        }
+        finally {
+            if ($wasOnline) { Set-Disk -Number $DiskNumber -IsOffline $false -ErrorAction Continue }
+            Update-HostStorageCache -ErrorAction SilentlyContinue
+        }
+
+        $after = Read-UefiGptLayout -DiskNumber $DiskNumber
+        if ($after.DiskGuid -ne $before.DiskGuid -or @($after.Entries).Count -ne @($before.Entries).Count) {
+            throw "Disk GUID or partition count changed after the update. Undo with -FixUefiBootEntry -EspGuid $($target.Guid)."
+        }
+        foreach ($e in $before.Entries) {
+            $a = @($after.Entries | Where-Object { $_.Number -eq $e.Number })
+            if ($a.Count -ne 1 -or $a[0].Fields -ne $e.Fields) { throw "Partition $($e.Number) layout changed unexpectedly after the update." }
+            $expected = if ($e.Number -eq $PartitionNumber) { $NewGuid } else { $e.Guid }
+            if ($a[0].Guid -ne $expected) { throw "Partition $($e.Number) has GUID $($a[0].Guid), expected $expected." }
+        }
+        if ($slotsBefore) {
+            try {
+                $slotsAfter = @(Get-GptSlotMap -DiskNumber $DiskNumber)
+                foreach ($s in $slotsBefore) {
+                    $g = if ($s.Guid -eq $target.Guid) { $NewGuid } else { $s.Guid }
+                    $now = @($slotsAfter | Where-Object { $_.Guid -eq $g })
+                    if ($now.Count -ne 1 -or $now[0].Slot -ne $s.Slot) {
+                        Write-Warning "GPT slot of partition $g moved (was slot $($s.Slot)). The firmware entry may need the slot too."
+                    }
+                }
+            }
+            catch { Write-Warning "Could not re-read the on-disk GPT slots: $($_.Exception.Message)" }
+        }
+        Write-Host "Partition $PartitionNumber GUID changed: $($target.Guid) -> $NewGuid" -ForegroundColor Green
+        return [pscustomobject]@{ Changed = $true; OldGuid = $target.Guid; NewGuid = $NewGuid }
+    }
+
+    # GPT CRC32 (IEEE 802.3). C# because Windows PowerShell 5.1 treats hex
+    # literals >= 0x80000000 as negative Int32 values.
+    function Initialize-GptCrc32Type {
+        if ('RepairAzVMDisk.GptCrc32' -as [type]) { return }
+        Add-Type -TypeDefinition @'
+namespace RepairAzVMDisk {
+    public static class GptCrc32 {
+        static readonly uint[] T = Build();
+        static uint[] Build() {
+            uint[] t = new uint[256];
+            for (uint i = 0; i < 256; i++) {
+                uint c = i;
+                for (int k = 0; k < 8; k++) { c = ((c & 1) != 0) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1); }
+                t[i] = c;
+            }
+            return t;
+        }
+        public static uint Compute(byte[] b, int offset, int length) {
+            uint c = 0xFFFFFFFFu;
+            for (int i = offset; i < offset + length; i++) { c = T[(c ^ b[i]) & 0xFF] ^ (c >> 8); }
+            return c ^ 0xFFFFFFFFu;
+        }
+    }
+}
+'@
+    }
+
+    # Parse one GPT copy (header sector + entry array bytes) and check both CRCs.
+    function Get-GptCopyInfo {
+        param([Parameter(Mandatory = $true)][byte[]]$Header, [Parameter(Mandatory = $true)][byte[]]$Entries)
+        Initialize-GptCrc32Type
+        if ($Header.Length -lt 92 -or [Text.Encoding]::ASCII.GetString($Header, 0, 8) -ne 'EFI PART') { throw 'Not a GPT header.' }
+        $hdrSize = [int][BitConverter]::ToUInt32($Header, 12)
+        $count = [int][BitConverter]::ToUInt32($Header, 80)
+        $entSize = [int][BitConverter]::ToUInt32($Header, 84)
+        if ($hdrSize -lt 92 -or $hdrSize -gt $Header.Length) { throw "Unexpected GPT header size $hdrSize." }
+        if ($count -le 0 -or $count -gt 1024 -or $entSize -lt 128 -or $entSize -gt 1024) { throw "Unexpected GPT header (entries $count, entry size $entSize)." }
+        if ($Entries.Length -lt $count * $entSize) { throw 'GPT entry array is shorter than the header declares.' }
+        $hc = [byte[]]$Header.Clone()
+        [Array]::Clear($hc, 16, 4)
+        $slots = @()
+        for ($i = 0; $i -lt $count; $i++) {
+            $o = $i * $entSize
+            $type = New-UefiGuidFromBytes -Bytes $Entries -Offset $o
+            if ($type -eq [guid]::Empty) { continue }
+            $slots += [pscustomobject]@{
+                Slot     = $i + 1
+                Type     = $type
+                TypeName = Get-GptTypeName -Type $type
+                Guid     = New-UefiGuidFromBytes -Bytes $Entries -Offset ($o + 16)
+                FirstLba = [BitConverter]::ToInt64($Entries, $o + 32)
+                LastLba  = [BitConverter]::ToInt64($Entries, $o + 40)
+                Name     = [Text.Encoding]::Unicode.GetString($Entries, $o + 56, 72).TrimEnd([char]0)
+            }
+        }
+        return [pscustomobject]@{
+            HeaderSize = $hdrSize
+            MyLba      = [BitConverter]::ToInt64($Header, 24)
+            AltLba     = [BitConverter]::ToInt64($Header, 32)
+            EntryLba   = [BitConverter]::ToInt64($Header, 72)
+            Count      = $count
+            EntrySize  = $entSize
+            HeaderCrcOk  = ([RepairAzVMDisk.GptCrc32]::Compute($hc, 0, $hdrSize) -eq [BitConverter]::ToUInt32($Header, 16))
+            EntriesCrcOk = ([RepairAzVMDisk.GptCrc32]::Compute($Entries, 0, $count * $entSize) -eq [BitConverter]::ToUInt32($Header, 88))
+            Slots      = $slots
+        }
+    }
+
+    # Swap two GPT entry slots in one GPT copy (in place) and recompute the entry
+    # array CRC and then the header CRC. Pure byte-array operation.
+    function Switch-GptEntrySlot {
+        param(
+            [Parameter(Mandatory = $true)][byte[]]$Header,
+            [Parameter(Mandatory = $true)][byte[]]$Entries,
+            [Parameter(Mandatory = $true)][int]$FromSlot,
+            [Parameter(Mandatory = $true)][int]$ToSlot
+        )
+        Initialize-GptCrc32Type
+        $info = Get-GptCopyInfo -Header $Header -Entries $Entries
+        foreach ($s in $FromSlot, $ToSlot) { if ($s -lt 1 -or $s -gt $info.Count) { throw "GPT slot $s is outside 1..$($info.Count)." } }
+        if ($FromSlot -eq $ToSlot) { return }
+        $es = $info.EntrySize
+        $a = ($FromSlot - 1) * $es
+        $b = ($ToSlot - 1) * $es
+        $tmp = New-Object byte[] $es
+        [Array]::Copy($Entries, $a, $tmp, 0, $es)
+        [Array]::Copy($Entries, $b, $Entries, $a, $es)
+        [Array]::Copy($tmp, 0, $Entries, $b, $es)
+        $entCrc = [RepairAzVMDisk.GptCrc32]::Compute($Entries, 0, $info.Count * $es)
+        [Array]::Copy([BitConverter]::GetBytes([uint32]$entCrc), 0, $Header, 88, 4)
+        [Array]::Clear($Header, 16, 4)
+        $hdrCrc = [RepairAzVMDisk.GptCrc32]::Compute($Header, 0, $info.HeaderSize)
+        [Array]::Copy([BitConverter]::GetBytes([uint32]$hdrCrc), 0, $Header, 16, 4)
+    }
+
+    function Read-GptDiskSectors {
+        param([int]$DiskNumber, [int]$SectorSize, [long]$Lba, [int]$Count)
+        $fs = New-Object System.IO.FileStream("\\.\PhysicalDrive$DiskNumber", [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite, 1)
+        try {
+            $fs.Position = $Lba * $SectorSize
+            $buf = New-Object byte[] ($Count * $SectorSize)
+            $read = 0
+            while ($read -lt $buf.Length) {
+                $n = $fs.Read($buf, $read, $buf.Length - $read)
+                if ($n -le 0) { throw "Short read at LBA $Lba on disk $DiskNumber." }
+                $read += $n
+            }
+            return , $buf
+        }
+        finally { $fs.Close() }
+    }
+
+    function Write-GptDiskSectors {
+        param([int]$DiskNumber, [int]$SectorSize, [long]$Lba, [byte[]]$Bytes)
+        if ($Bytes.Length % $SectorSize -ne 0) { throw 'Write length is not a whole number of sectors.' }
+        $fs = New-Object System.IO.FileStream("\\.\PhysicalDrive$DiskNumber", [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite, 1)
+        try { $fs.Position = $Lba * $SectorSize; $fs.Write($Bytes, 0, $Bytes.Length); $fs.Flush() }
+        finally { $fs.Close() }
+    }
+
+    function Read-GptDiskCopy {
+        param([int]$DiskNumber, [int]$SectorSize, [long]$HeaderLba)
+        $hdr = Read-GptDiskSectors -DiskNumber $DiskNumber -SectorSize $SectorSize -Lba $HeaderLba -Count 1
+        if ([Text.Encoding]::ASCII.GetString($hdr, 0, 8) -ne 'EFI PART') { throw "No GPT header at LBA $HeaderLba on disk $DiskNumber." }
+        $entLba = [BitConverter]::ToInt64($hdr, 72)
+        $count = [int][BitConverter]::ToUInt32($hdr, 80)
+        $entSize = [int][BitConverter]::ToUInt32($hdr, 84)
+        if ($count -le 0 -or $count -gt 1024 -or $entSize -lt 128 -or $entSize -gt 1024) { throw "Unexpected GPT header at LBA $HeaderLba (entries $count, entry size $entSize)." }
+        $sectors = [int][math]::Ceiling(($count * $entSize) / $SectorSize)
+        $ent = Read-GptDiskSectors -DiskNumber $DiskNumber -SectorSize $SectorSize -Lba $entLba -Count $sectors
+        $info = Get-GptCopyInfo -Header $hdr -Entries $ent
+        return [pscustomobject]@{ HeaderLba = $HeaderLba; Header = $hdr; Entries = $ent; Info = $info }
+    }
+
+    # Move the ESP's GPT entry to -TargetSlot by swapping it with whatever entry
+    # occupies that slot (both primary and backup GPT). Partition GUIDs, offsets,
+    # sizes and data are unchanged; only the order of the entries changes. Trusted
+    # Launch / CVM firmware matches the saved HD(slot,GPT,guid,...) entry on both
+    # the GUID and the slot, so a recreated ESP in a different slot does not boot.
+    function Move-GptEspSlot {
+        param(
+            [Parameter(Mandatory = $true)][int]$DiskNumber,
+            [Parameter(Mandatory = $true)][guid]$EspGuid,
+            [Parameter(Mandatory = $true)][ValidateRange(1, 128)][int]$TargetSlot,
+            [string]$BackupFolder
+        )
+        $espType = [guid]'c12a7328-f81f-11d2-ba4b-00a0c93ec93b'
+        $disk = Get-Disk -Number $DiskNumber
+        if ($disk.IsBoot -or $disk.IsSystem) { throw "Disk $DiskNumber is this machine's boot/system disk; refusing to change its partition table." }
+        if ($disk.IsReadOnly) { throw "Disk $DiskNumber is read-only." }
+        if ($disk.PartitionStyle -ne 'GPT') { throw "Disk $DiskNumber is $($disk.PartitionStyle), not GPT." }
+        $ss = [int]$disk.LogicalSectorSize
+        if ($ss -le 0) { $ss = 512 }
+
+        $pri = Read-GptDiskCopy -DiskNumber $DiskNumber -SectorSize $ss -HeaderLba 1
+        $altLba = $pri.Info.AltLba
+        $bak = Read-GptDiskCopy -DiskNumber $DiskNumber -SectorSize $ss -HeaderLba $altLba
+        if (-not ($pri.Info.HeaderCrcOk -and $pri.Info.EntriesCrcOk -and $bak.Info.HeaderCrcOk -and $bak.Info.EntriesCrcOk)) {
+            throw "A GPT copy on disk $DiskNumber fails its CRC check (primary header/entries $($pri.Info.HeaderCrcOk)/$($pri.Info.EntriesCrcOk), backup $($bak.Info.HeaderCrcOk)/$($bak.Info.EntriesCrcOk)); not moving the ESP."
+        }
+        $len = $pri.Info.Count * $pri.Info.EntrySize
+        if ($pri.Info.Count -ne $bak.Info.Count -or $pri.Info.EntrySize -ne $bak.Info.EntrySize -or
+            [Convert]::ToBase64String($pri.Entries, 0, $len) -ne [Convert]::ToBase64String($bak.Entries, 0, $len)) {
+            throw "The primary and backup GPT entry arrays on disk $DiskNumber differ; not moving the ESP."
+        }
+        if ($TargetSlot -gt $pri.Info.Count) { throw "GPT slot $TargetSlot exceeds the entry count ($($pri.Info.Count))." }
+        $esp = @($pri.Info.Slots | Where-Object { $_.Guid -eq $EspGuid })
+        if ($esp.Count -ne 1 -or $esp[0].Type -ne $espType) { throw "No EFI System Partition with GUID $EspGuid in the GPT of disk $DiskNumber." }
+        $esp = $esp[0]
+        if ($esp.Slot -eq $TargetSlot) {
+            Write-Host "The ESP ($EspGuid) is already in GPT slot $TargetSlot." -ForegroundColor Green
+            return [pscustomobject]@{ Changed = $false; OldSlot = $esp.Slot; NewSlot = $TargetSlot; Partner = $null; BackupFiles = @() }
+        }
+        $partner = @($pri.Info.Slots | Where-Object { $_.Slot -eq $TargetSlot }) | Select-Object -First 1
+        $partnerText = if ($partner) { "$($partner.TypeName) partition $($partner.Guid)$(if ($partner.Name) { " '$($partner.Name)'" })" } else { 'empty slot' }
+
+        if (-not $BackupFolder) {
+            $BackupFolder = if ($script:ActionLogPath) { Split-Path -Parent $script:ActionLogPath } else { Join-Path $env:TEMP 'Repair-AzVMDisk' }
+        }
+        New-Item -ItemType Directory -Path $BackupFolder -Force | Out-Null
+        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $bk1 = Join-Path $BackupFolder ("gpt-disk{0}-{1}-primary-lba0-{2}.bin" -f $DiskNumber, $stamp, ($pri.Info.EntryLba + [math]::Ceiling($len / $ss) - 1))
+        $bk2 = Join-Path $BackupFolder ("gpt-disk{0}-{1}-backup-lba{2}-{3}.bin" -f $DiskNumber, $stamp, $bak.Info.EntryLba, $altLba)
+        $priSectors = [int]($pri.Info.EntryLba + [math]::Ceiling($len / $ss))
+        [IO.File]::WriteAllBytes($bk1, (Read-GptDiskSectors -DiskNumber $DiskNumber -SectorSize $ss -Lba 0 -Count $priSectors))
+        [IO.File]::WriteAllBytes($bk2, (Read-GptDiskSectors -DiskNumber $DiskNumber -SectorSize $ss -Lba $bak.Info.EntryLba -Count ([int]($altLba - $bak.Info.EntryLba + 1))))
+        Write-Host "GPT backup: $bk1" -ForegroundColor DarkGray
+        Write-Host "GPT backup: $bk2" -ForegroundColor DarkGray
+
+        Switch-GptEntrySlot -Header $pri.Header -Entries $pri.Entries -FromSlot $esp.Slot -ToSlot $TargetSlot
+        Switch-GptEntrySlot -Header $bak.Header -Entries $bak.Entries -FromSlot $esp.Slot -ToSlot $TargetSlot
+
+        $wasOnline = -not $disk.IsOffline
+        if ($wasOnline) {
+            foreach ($p in @(Get-Partition -DiskNumber $DiskNumber -ErrorAction SilentlyContinue)) {
+                $v = $p | Get-Volume -ErrorAction SilentlyContinue
+                if ($v -and $v.FileSystem) { try { $v | Write-VolumeCache -ErrorAction Stop } catch { } }
+            }
+            Set-Disk -Number $DiskNumber -IsOffline $true
+        }
+        try {
+            Write-ActionLog -Event 'MoveGptEspSlot' -Details @{
+                DiskNumber   = $DiskNumber
+                EspGuid      = $EspGuid.ToString()
+                OldSlot      = $esp.Slot
+                NewSlot      = $TargetSlot
+                Partner      = $partnerText
+                BackupFiles  = @($bk1, $bk2)
+            }
+            Write-GptDiskSectors -DiskNumber $DiskNumber -SectorSize $ss -Lba $pri.Info.EntryLba -Bytes $pri.Entries
+            Write-GptDiskSectors -DiskNumber $DiskNumber -SectorSize $ss -Lba 1 -Bytes $pri.Header
+            Write-GptDiskSectors -DiskNumber $DiskNumber -SectorSize $ss -Lba $bak.Info.EntryLba -Bytes $bak.Entries
+            Write-GptDiskSectors -DiskNumber $DiskNumber -SectorSize $ss -Lba $altLba -Bytes $bak.Header
+
+            $pri2 = Read-GptDiskCopy -DiskNumber $DiskNumber -SectorSize $ss -HeaderLba 1
+            $bak2 = Read-GptDiskCopy -DiskNumber $DiskNumber -SectorSize $ss -HeaderLba $altLba
+            $now = @($pri2.Info.Slots | Where-Object { $_.Guid -eq $EspGuid })
+            $ok = $pri2.Info.HeaderCrcOk -and $pri2.Info.EntriesCrcOk -and $bak2.Info.HeaderCrcOk -and $bak2.Info.EntriesCrcOk -and
+                  $now.Count -eq 1 -and $now[0].Slot -eq $TargetSlot -and @($pri2.Info.Slots).Count -eq @($pri.Info.Slots).Count
+            if (-not $ok) {
+                throw "Verification after the GPT write failed on disk $DiskNumber. Restore LBA 0 from $bk1 and LBA $($bak.Info.EntryLba) from $bk2."
+            }
+        }
+        finally {
+            Update-HostStorageCache -ErrorAction SilentlyContinue
+            if ($wasOnline) { Set-Disk -Number $DiskNumber -IsOffline $false -ErrorAction Continue }
+        }
+        Write-Host "ESP $EspGuid moved from GPT slot $($esp.Slot) to slot $TargetSlot ($partnerText moved to slot $($esp.Slot))." -ForegroundColor Green
+        return [pscustomobject]@{ Changed = $true; OldSlot = $esp.Slot; NewSlot = $TargetSlot; Partner = $partnerText; BackupFiles = @($bk1, $bk2) }
+    }
+
+    function Format-UefiDevicePath {
+        param([byte[]]$Bytes, [int]$Offset = 0, [int]$Length = -1)
+        if ($Length -lt 0) { $Length = $Bytes.Length - $Offset }
+        $end = [math]::Min($Bytes.Length, $Offset + $Length)
+        $parts = @()
+        $hd = $null
+        $file = $null
+        $o = $Offset
+        while ($o + 4 -le $end) {
+            $t = $Bytes[$o]
+            $s = $Bytes[$o + 1]
+            $l = [int][BitConverter]::ToUInt16($Bytes, $o + 2)
+            if ($t -eq 0x7F -and $s -eq 0xFF) { break }
+            if ($l -lt 4 -or $o + $l -gt $end) { $parts += '<malformed>'; break }
+            if ($t -eq 4 -and $s -eq 1 -and $l -ge 42) {
+                $pn = [int][BitConverter]::ToUInt32($Bytes, $o + 4)
+                $start = [BitConverter]::ToUInt64($Bytes, $o + 8)
+                $size = [BitConverter]::ToUInt64($Bytes, $o + 16)
+                $sigType = [int]$Bytes[$o + 41]
+                $g = $null
+                if ($sigType -eq 2) { $g = New-UefiGuidFromBytes -Bytes $Bytes -Offset ($o + 24); $sig = "GPT,$g" }
+                elseif ($sigType -eq 1) { $sig = 'MBR,{0:X8}' -f [BitConverter]::ToUInt32($Bytes, $o + 24) }
+                else { $sig = "Sig$sigType" }
+                $hd = [pscustomobject]@{ PartitionNumber = $pn; Start = $start; Size = $size; SigType = $sigType; Guid = $g }
+                $parts += ('HD({0},{1},0x{2:X},0x{3:X})' -f $pn, $sig, $start, $size)
+            }
+            elseif ($t -eq 4 -and $s -eq 4) {
+                $file = [Text.Encoding]::Unicode.GetString($Bytes, $o + 4, $l - 4).TrimEnd([char]0)
+                $parts += $file
+            }
+            elseif ($t -eq 3 -and $s -eq 2 -and $l -ge 8) {
+                $parts += ('Scsi({0},{1})' -f [BitConverter]::ToUInt16($Bytes, $o + 4), [BitConverter]::ToUInt16($Bytes, $o + 6))
+            }
+            elseif ($t -eq 1 -and $s -eq 4 -and $l -ge 20) { $parts += "VenHw($(New-UefiGuidFromBytes -Bytes $Bytes -Offset ($o + 4)))" }
+            elseif ($t -eq 3 -and $s -eq 10 -and $l -ge 20) { $parts += "VenMsg($(New-UefiGuidFromBytes -Bytes $Bytes -Offset ($o + 4)))" }
+            elseif ($t -eq 1 -and $s -eq 1 -and $l -ge 6) { $parts += ('Pci(0x{0:X},0x{1:X})' -f $Bytes[$o + 5], $Bytes[$o + 4]) }
+            elseif ($t -eq 2 -and $s -eq 1) { $parts += 'Acpi' }
+            else { $parts += "Path($t,$s)" }
+            $o += $l
+        }
+        return [pscustomobject]@{ Text = ($parts -join '/'); HD = $hd; FilePath = $file }
+    }
+
+    # Parse a Windows measured boot (TCG crypto-agile) log for the UEFI boot
+    # variables the firmware used, the images it loaded and the GPT it measured.
+    function Read-UefiTcgLog {
+        param([string]$Path)
+        $item = Get-Item -LiteralPath $Path -Force
+        $res = [pscustomobject]@{ File = $item.Name; Time = $item.LastWriteTime; BootOrder = @(); Entries = @(); Loaded = @(); Gpt = $null; Error = $null }
+        $evVarBoot = [long]2147483650    # EV_EFI_VARIABLE_BOOT   0x80000002
+        $evVarBoot2 = [long]2147483660   # EV_EFI_VARIABLE_BOOT2  0x8000000C
+        $evApp = [long]2147483651        # EV_EFI_BOOT_SERVICES_APPLICATION 0x80000003
+        $evGpt = [long]2147483654        # EV_EFI_GPT_EVENT       0x80000006
+        try {
+            $b = [IO.File]::ReadAllBytes($item.FullName)
+            if ($b.Length -lt 64) { throw 'Log is too short.' }
+            $hsize = [int][BitConverter]::ToUInt32($b, 28)
+            if ([Text.Encoding]::ASCII.GetString($b, 32, 15) -ne 'Spec ID Event03') { throw 'Not a crypto-agile TCG event log.' }
+            $nAlg = [int][BitConverter]::ToUInt32($b, 56)
+            $digestSize = @{}
+            for ($i = 0; $i -lt $nAlg -and $i -lt 16; $i++) {
+                $digestSize[[int][BitConverter]::ToUInt16($b, 60 + $i * 4)] = [int][BitConverter]::ToUInt16($b, 62 + $i * 4)
+            }
+            $vars = [ordered]@{}
+            $o = 32 + $hsize
+            while ($o + 12 -le $b.Length) {
+                $type = [long][BitConverter]::ToUInt32($b, $o + 4)
+                $dc = [int][BitConverter]::ToUInt32($b, $o + 8)
+                if ($dc -gt 8) { break }
+                $p = $o + 12
+                $bad = $false
+                for ($k = 0; $k -lt $dc; $k++) {
+                    if ($p + 2 -gt $b.Length) { $bad = $true; break }
+                    $alg = [int][BitConverter]::ToUInt16($b, $p)
+                    if (-not $digestSize.ContainsKey($alg)) { $bad = $true; break }
+                    $p += 2 + $digestSize[$alg]
+                }
+                if ($bad -or $p + 4 -gt $b.Length) { break }
+                $esz = [int][BitConverter]::ToUInt32($b, $p)
+                $d = $p + 4
+                if ($esz -lt 0 -or $d + $esz -gt $b.Length) { break }
+                $dEnd = $d + $esz
+
+                if (($type -eq $evVarBoot -or $type -eq $evVarBoot2) -and $esz -ge 32) {
+                    $nameLen = [int][BitConverter]::ToUInt64($b, $d + 16)
+                    $dataLen = [int][BitConverter]::ToUInt64($b, $d + 24)
+                    $vd = $d + 32 + $nameLen * 2
+                    if ($nameLen -gt 0 -and $vd + $dataLen -le $dEnd) {
+                        $name = [Text.Encoding]::Unicode.GetString($b, $d + 32, $nameLen * 2).TrimEnd([char]0)
+                        if ($name -eq 'BootOrder') {
+                            $order = @()
+                            for ($q = 0; $q + 1 -lt $dataLen; $q += 2) { $order += ('Boot{0:X4}' -f [BitConverter]::ToUInt16($b, $vd + $q)) }
+                            $res.BootOrder = $order
+                        }
+                        elseif ($name -match '^Boot[0-9A-Fa-f]{4}$' -and $dataLen -ge 8) {
+                            $vEnd = $vd + $dataLen
+                            $attr = [BitConverter]::ToUInt32($b, $vd)
+                            $fpl = [int][BitConverter]::ToUInt16($b, $vd + 4)
+                            $q = $vd + 6
+                            while ($q + 1 -lt $vEnd -and ($b[$q] -ne 0 -or $b[$q + 1] -ne 0)) { $q += 2 }
+                            $desc = [Text.Encoding]::Unicode.GetString($b, $vd + 6, $q - ($vd + 6))
+                            $dpStart = $q + 2
+                            $dp = Format-UefiDevicePath -Bytes $b -Offset $dpStart -Length ([math]::Max(0, [math]::Min($fpl, $vEnd - $dpStart)))
+                            $vars[$name] = [pscustomobject]@{
+                                Name        = $name
+                                Active      = [bool]($attr -band 1)
+                                Description = $desc
+                                Path        = $dp.Text
+                                HD          = $dp.HD
+                                FilePath    = $dp.FilePath
+                            }
+                        }
+                    }
+                }
+                elseif ($type -eq $evApp -and $esz -ge 32) {
+                    $dpl = [int][BitConverter]::ToUInt64($b, $d + 24)
+                    if ($dpl -gt 0 -and $d + 32 + $dpl -le $dEnd) {
+                        $res.Loaded += Format-UefiDevicePath -Bytes $b -Offset ($d + 32) -Length $dpl
+                    }
+                }
+                elseif ($type -eq $evGpt -and $esz -ge 100) {
+                    $entrySize = [int][BitConverter]::ToUInt32($b, $d + 84)
+                    $count = [int][BitConverter]::ToUInt64($b, $d + 92)
+                    $gptEntries = @()
+                    for ($i = 0; $i -lt $count -and $entrySize -ge 128; $i++) {
+                        $e = $d + 100 + $i * $entrySize
+                        if ($e + 128 -gt $dEnd) { break }
+                        $gptEntries += [pscustomobject]@{
+                            Type     = New-UefiGuidFromBytes -Bytes $b -Offset $e
+                            Guid     = New-UefiGuidFromBytes -Bytes $b -Offset ($e + 16)
+                            FirstLba = [BitConverter]::ToInt64($b, $e + 32)
+                            LastLba  = [BitConverter]::ToInt64($b, $e + 40)
+                            Name     = [Text.Encoding]::Unicode.GetString($b, $e + 56, 72).TrimEnd([char]0)
+                        }
+                    }
+                    $res.Gpt = [pscustomobject]@{ DiskGuid = New-UefiGuidFromBytes -Bytes $b -Offset ($d + 56); Entries = $gptEntries }
+                }
+                $o = $dEnd
+            }
+            $res.Entries = @($vars.Values)
+        }
+        catch { $res.Error = $_.Exception.Message }
+        return $res
+    }
+
+    # Non-ESP partitions that carry a copy of the Windows EFI boot files. The
+    # firmware's fallback option loads \EFI\Boot\bootx64.efi from the first FAT
+    # volume it finds, so a stray FAT copy can hijack the boot with a BCD whose
+    # devices do not resolve (winload 0xc000000e).
+    function Find-StrayEfiFolder {
+        param([int]$DiskNumber)
+        $found = @()
+        foreach ($p in @(Get-Partition -DiskNumber $DiskNumber -ErrorAction SilentlyContinue)) {
+            if ($p.Type -eq 'System') { continue }
+            $root = @($p.AccessPaths | Where-Object { $_ -match '^[A-Za-z]:\\?$' } | Select-Object -First 1)
+            if (-not $root) { continue }
+            $root = $root[0].TrimEnd('\') + '\'
+            $hits = @('EFI\Boot\bootx64.efi', 'EFI\Microsoft\Boot\bootmgfw.efi', 'EFI\Microsoft\Boot\BCD') |
+                Where-Object { Test-Path -LiteralPath ($root + $_) }
+            if (-not $hits) { continue }
+            $fs = [string](($p | Get-Volume -ErrorAction SilentlyContinue).FileSystem)
+            $found += [pscustomobject]@{
+                PartitionNumber = $p.PartitionNumber
+                Path            = $root + 'EFI'
+                FileSystem      = $fs
+                IsFat           = ($fs -match '^FAT')
+                Files           = @($hits)
+            }
+        }
+        return $found
+    }
+
+    function Rename-StrayEfiFolder {
+        param([Parameter(Mandatory = $true)]$Stray)
+        $newName = 'EFI.old.' + (Get-Date -Format 'yyyyMMddHHmmss')
+        Invoke-Logged -Description 'Rename stray EFI folder' -Details @{ Path = $Stray.Path; NewName = $newName; PartitionNumber = $Stray.PartitionNumber } -ScriptBlock {
+            Rename-Item -LiteralPath $Stray.Path -NewName $newName -Force -ErrorAction Stop
+        } | Out-Null
+        Write-Host "Renamed $($Stray.Path) -> $newName (partition $($Stray.PartitionNumber), $($Stray.FileSystem))" -ForegroundColor Green
+    }
+
+    function Get-UefiBootAnalysis {
+        param(
+            [Parameter(Mandatory = $true)][int]$DiskNumber,
+            [Parameter(Mandatory = $true)][string]$WinRoot,
+            [string]$EspGuid,
+            [int]$MaxLogs = 50
+        )
+        $parts = @(Get-Partition -DiskNumber $DiskNumber -ErrorAction SilentlyContinue)
+        $esps = @($parts | Where-Object { $_.Type -eq 'System' })
+        $esp = if ($esps.Count -eq 1) { $esps[0] } else { $null }
+        $espGuidNow = if ($esp -and $esp.Guid) { [guid]$esp.Guid } else { $null }
+
+        $slots = @()
+        $slotError = $null
+        try { $slots = @(Get-GptSlotMap -DiskNumber $DiskNumber) } catch { $slotError = $_.Exception.Message }
+        $espSlot = $null
+        if ($espGuidNow) { $espSlot = ($slots | Where-Object { $_.Guid -eq $espGuidNow } | Select-Object -First 1).Slot }
+        $nextFreeSlot = 1
+        while (@($slots | Where-Object { $_.Slot -eq $nextFreeSlot }).Count -gt 0) { $nextFreeSlot++ }
+
+        $partByGuid = @{}
+        foreach ($p in $parts) { if ($p.Guid) { $partByGuid[([guid]$p.Guid).ToString()] = $p.PartitionNumber } }
+
+        $logDir = $WinRoot.TrimEnd('\') + '\Windows\Logs\MeasuredBoot'
+        $files = @(Get-ChildItem -LiteralPath $logDir -Filter '*.log' -File -Force -ErrorAction SilentlyContinue |
+                Sort-Object -Property LastWriteTime, Name -Descending | Select-Object -First $MaxLogs)
+        $cand = [ordered]@{}
+        $parsed = 0
+        $latestLog = $null
+        $logsByFile = @{}
+        foreach ($f in $files) {
+            $log = Read-UefiTcgLog -Path $f.FullName
+            if ($log.Error) { continue }
+            $parsed++
+            if (-not $latestLog) { $latestLog = $log }
+            $logsByFile[[string]$log.File] = $log
+            foreach ($e in $log.Entries) {
+                if ($e.Description -ne 'Windows Boot Manager' -or -not $e.HD -or $e.HD.SigType -ne 2) { continue }
+                if ($e.FilePath -notmatch '(?i)bootmgfw\.efi') { continue }
+                $key = '{0}|{1}' -f $e.HD.Guid, $e.HD.PartitionNumber
+                if (-not $cand.Contains($key)) {
+                    $cand[$key] = [pscustomobject]@{
+                        Guid = $e.HD.Guid; Slot = $e.HD.PartitionNumber; Start = $e.HD.Start; Size = $e.HD.Size
+                        BootVar = $e.Name; Seen = 0; FirstSeen = $log.Time; LastSeen = $log.Time; LastLog = $log.File
+                        Status = $null; PartitionNumber = $null
+                    }
+                }
+                $c = $cand[$key]
+                $c.Seen++
+                if ($log.Time -lt $c.FirstSeen) { $c.FirstSeen = $log.Time }
+                if ($log.Time -gt $c.LastSeen) { $c.LastSeen = $log.Time; $c.LastLog = $log.File }
+            }
+        }
+        $candidates = @($cand.Values | Sort-Object -Property LastSeen -Descending)
+        foreach ($c in $candidates) {
+            $k = $c.Guid.ToString()
+            if ($espGuidNow -and $c.Guid -eq $espGuidNow) { $c.Status = 'CurrentEsp'; $c.PartitionNumber = $esp.PartitionNumber }
+            elseif ($partByGuid.ContainsKey($k)) { $c.Status = 'InUse'; $c.PartitionNumber = $partByGuid[$k] }
+            else { $c.Status = 'Missing' }
+        }
+        $current = @($candidates | Where-Object { $_.Status -eq 'CurrentEsp' })
+        $missing = @($candidates | Where-Object { $_.Status -eq 'Missing' })
+
+        $target = $null
+        if ($EspGuid) {
+            $g = [guid]$EspGuid.Trim().Trim('{', '}')
+            $target = $candidates | Where-Object { $_.Guid -eq $g } | Select-Object -First 1
+            if (-not $target) { $target = [pscustomobject]@{ Guid = $g; Slot = $null; Status = 'UserSupplied'; Seen = 0; LastSeen = $null } }
+        }
+        # The previous ESP is the newest recorded GUID that no partition has any more. GUIDs still on
+        # the disk (the current ESP, or another FAT partition) are never picked. When the current ESP is
+        # also recorded, the old GUID wins only if the firmware used it more often, so a one-off boot on
+        # another host never flips a restored ESP back.
+        elseif ($missing.Count -gt 0) { $target = $missing[0] }
+
+        if ($esps.Count -eq 0) { $status = 'NoEsp' }
+        elseif ($esps.Count -gt 1) { $status = 'MultipleEsp' }
+        elseif ($candidates.Count -eq 0) { $status = 'NoLogs' }
+        elseif ($current.Count -gt 0) {
+            $currentLast = ($current | Sort-Object -Property LastSeen -Descending | Select-Object -First 1).LastSeen
+            $currentSeen = ($current | Measure-Object -Property Seen -Sum).Sum
+            $prevSeen = if ($target -and -not $EspGuid) { ($missing | Where-Object { $_.Guid -eq $target.Guid } | Measure-Object -Property Seen -Sum).Sum } else { 0 }
+            if (-not $EspGuid -and $target -and $prevSeen -gt $currentSeen) { $status = 'Replaced' }
+            else {
+                if (-not $EspGuid) { $target = $null }
+                $newer = @($candidates | Where-Object { $_.Status -ne 'CurrentEsp' -and $_.LastSeen -gt $currentLast })
+                $status = if ($newer.Count -gt 0) { 'Mixed' } else { 'Match' }
+            }
+        }
+        elseif ($missing.Count -gt 0) { $status = 'Stale' }
+        else { $status = 'Ambiguous' }
+
+        # With no ESP, check whether the old ESP's extent is still unallocated. Windows rewrites the
+        # GPT entry array sorted by start LBA, so an ESP recreated there takes slot 1 + (number of
+        # partitions that start before it) - even when an earlier Remove-Partition packed the array.
+        $targetExtentFree = $false
+        $predictedSlot = $null
+        if ($esps.Count -eq 0 -and $target -and $target.Start -and $target.Size -and $slots.Count -gt 0 -and -not $slotError) {
+            $tStart = [long]$target.Start
+            $tEnd = $tStart + [long]$target.Size - 1
+            $targetExtentFree = @($slots | Where-Object { $_.FirstLba -le $tEnd -and $_.LastLba -ge $tStart }).Count -eq 0
+            if ($targetExtentFree) { $predictedSlot = 1 + @($slots | Where-Object { $_.FirstLba -lt $tStart }).Count }
+        }
+
+        $slotMismatch = $false
+        if ($target -and $target.Slot) {
+            $compareSlot = if ($espSlot) { $espSlot } elseif ($esps.Count -eq 0) { $predictedSlot } else { $null }
+            if ($compareSlot -and $target.Slot -ne $compareSlot) { $slotMismatch = $true }
+        }
+
+        # Azure Trusted Launch / CVM keep their saved 'Windows Boot Manager' entry and match it on GUID
+        # + GPT slot. Hyper-V and Standard-security VMs start without that entry, so a boot there says
+        # nothing about Azure TL.
+        $fwEntry = if ($target -and $target.Slot) { $target }
+        elseif ($current.Count -gt 0) { $current | Sort-Object -Property LastSeen -Descending | Select-Object -First 1 }
+        else { $null }
+        $azureVerdict = switch ($status) {
+            'NoEsp' { 'NoEsp' }
+            'Stale' { 'NoMatch' }
+            'Replaced' { 'NoMatch' }
+            'Match' {
+                if (-not $espSlot -or -not $fwEntry) { 'Unknown' }
+                elseif ($fwEntry.Slot -ne $espSlot) { 'NoMatch' }
+                else { 'Match' }
+            }
+            default { 'Unknown' }
+        }
+
+        # When the saved entry misses, the firmware moves on down its saved BootOrder. Many TL VMs also
+        # keep an 'EFI SCSI Device' entry (a whole-disk path with no HD node), which loads
+        # \EFI\Boot\bootx64.efi from the first FAT partition that has it - the ESP, unless a stray
+        # FAT \EFI copy sits earlier on the disk.
+        $strayEfi = @(Find-StrayEfiFolder -DiskNumber $DiskNumber)
+        $strayFatCount = @($strayEfi | Where-Object { $_.IsFat }).Count
+        $fwLog = if ($fwEntry -and $fwEntry.LastLog -and $logsByFile.ContainsKey([string]$fwEntry.LastLog)) { $logsByFile[[string]$fwEntry.LastLog] } else { $latestLog }
+        $fallbackEntry = $null
+        if ($fwLog) {
+            foreach ($bn in @($fwLog.BootOrder)) {
+                $be = @($fwLog.Entries | Where-Object { $_.Name -eq $bn }) | Select-Object -First 1
+                if ($be -and $be.Active -and -not $be.HD -and $be.Path -match 'Scsi\(') { $fallbackEntry = $be; break }
+            }
+        }
+        $fallbackBooted = $false
+        if ($fwLog -and $espGuidNow) {
+            $fallbackBooted = @($fwLog.Loaded | Where-Object {
+                    $_.HD -and $_.HD.Guid -eq $espGuidNow -and (-not $espSlot -or $_.HD.PartitionNumber -eq $espSlot) -and
+                    $_.FilePath -match '(?i)\\EFI\\Boot\\bootx64\.efi$'
+                }).Count -gt 0
+        }
+        $espBootFile = $null
+        if ($esp) {
+            $espRoot = @($esp.AccessPaths | Where-Object { $_ -match '^[A-Za-z]:\\?$' }) + @($esp.AccessPaths | Where-Object { $_ -match '^\\\\\?\\Volume' }) | Select-Object -First 1
+            if ($espRoot) {
+                try { $espBootFile = [bool](Test-Path -LiteralPath ($espRoot.TrimEnd('\') + '\EFI\Boot\bootx64.efi')) } catch { $espBootFile = $null }
+            }
+        }
+        # Measured on Azure Trusted Launch: when the saved entry misses, the VM does NOT boot through an
+        # 'EFI SCSI Device' fallback, even when \EFI\Boot\bootx64.efi is on the ESP. The fallback fields
+        # above are informational only. The fix is to give the ESP the entry's GUID and GPT slot.
+        $requiredSlot = if ($azureVerdict -in @('NoMatch', 'NoEsp') -and $fwEntry -and $fwEntry.Slot) { [int]$fwEntry.Slot } else { $null }
+        $slotMoveNeeded = [bool]($requiredSlot -and (
+                ($espSlot -and $espSlot -ne $requiredSlot) -or
+                ($esps.Count -eq 0 -and $predictedSlot -ne $requiredSlot)))
+
+        return [pscustomobject]@{
+            DiskNumber    = $DiskNumber
+            Status        = $status
+            EspPartition  = if ($esp) { $esp.PartitionNumber } else { $null }
+            EspGuid       = $espGuidNow
+            EspSlot       = $espSlot
+            NextFreeSlot  = $nextFreeSlot
+            PredictedSlot = $predictedSlot
+            TargetExtentFree = $targetExtentFree
+            SlotError     = $slotError
+            LogDirectory  = $logDir
+            LogsFound     = $files.Count
+            LogsParsed    = $parsed
+            LatestLog     = $latestLog
+            Candidates    = $candidates
+            Target        = $target
+            SlotMismatch  = $slotMismatch
+            RequiredSlot  = $requiredSlot
+            SlotMoveNeeded = $slotMoveNeeded
+            AzureEntry    = $fwEntry
+            AzureVerdict  = $azureVerdict
+            AzureLog      = $fwLog
+            FallbackEntry = $fallbackEntry
+            FallbackBooted = $fallbackBooted
+            EspBootFile   = $espBootFile
+            StrayEfi      = $strayEfi
+        }
+    }
+
+    function Get-UefiAzureVerdictText {
+        param($Analysis)
+        $a = $Analysis
+        $e = $a.AzureEntry
+        $notProof = 'A boot on Hyper-V or on a Standard-security VM does not prove Azure TL will boot: those start with no saved entries and fall back to \EFI\Boot\bootx64.efi. Azure TL does not.'
+        $eSlot = if ($e -and $e.Slot) { $e.Slot } else { '?' }
+        $eGuid = if ($e) { $e.Guid } else { '?' }
+        switch ($a.AzureVerdict) {
+            'Match' { return "should boot - the ESP has the GUID ($($a.EspGuid)) and GPT slot ($($a.EspSlot)) of the saved 'Windows Boot Manager' entry." }
+            'NoMatch' {
+                $fix = @()
+                if ($e -and $a.EspGuid -and $e.Guid -ne $a.EspGuid) { $fix += "give the ESP GUID $eGuid" }
+                if ($a.SlotMoveNeeded) { $fix += "move the ESP from GPT slot $($a.EspSlot) to slot $eSlot" }
+                if (@($a.StrayEfi | Where-Object { $_.IsFat }).Count -gt 0) { $fix += 'rename the stray FAT \EFI copy' }
+                $how = if ($fix.Count -gt 0) { " Run -FixUefiBootEntry to $($fix -join ', ')." } else { '' }
+                return "will NOT boot - the saved entry expects GUID $eGuid in GPT slot $eSlot; the ESP has GUID $($a.EspGuid) in slot $($a.EspSlot).$how $notProof"
+            }
+            'NoEsp' {
+                $after = if (-not $e -or -not $e.Slot) { '' }
+                elseif ($a.PredictedSlot -and $a.PredictedSlot -eq $e.Slot) { " -RecreateBootPartition will put the ESP back in GPT slot $($e.Slot) with GUID $($e.Guid), matching the saved entry." }
+                else { " -RecreateBootPartition restores GUID $($e.Guid) and moves the new ESP to GPT slot $($e.Slot) (it would otherwise land in slot $(if ($a.PredictedSlot) { $a.PredictedSlot } else { 'unknown' })), matching the saved entry." }
+                return "will NOT boot - there is no EFI System Partition.$after $notProof"
+            }
+            default { return "cannot tell from the measured boot logs ($($a.Status))." }
+        }
+    }
+
+    function Get-UefiBootStatusText {
+        param($Analysis)
+        $a = $Analysis
+        switch ($a.Status) {
+            'NoEsp' { return 'No EFI System Partition on the disk. Run -RecreateBootPartition (it restores the previous ESP GUID automatically when the logs identify it).' }
+            'MultipleEsp' { return 'More than one EFI System Partition on the disk. Remove the extra one before changing boot entries.' }
+            'NoLogs' { return "No 'Windows Boot Manager' entry found in the measured boot logs. If you know the previous ESP GUID, pass it with -EspGuid." }
+            'Match' { return "The ESP GUID matches the firmware's most recent 'Windows Boot Manager' entry." }
+            'Mixed' { return "The ESP GUID matches an older 'Windows Boot Manager' entry, but a newer boot recorded a different GUID (for example after booting the disk on another host). Pass -EspGuid to choose one explicitly." }
+            'Stale' { return "The firmware's 'Windows Boot Manager' entry points at ESP GUID $($a.Target.Guid), which no longer exists on the disk. VMs that keep their UEFI variables (Trusted Launch / Confidential VM) will not find the boot loader." }
+            'Replaced' { return "The ESP was recreated: the firmware mostly booted from previous ESP GUID $($a.Target.Guid), which is no longer on the disk, and only briefly from the current GUID $($a.EspGuid) (for example on another host). If the VM fails to boot in Azure (Trusted Launch / Confidential VM keep the old entry), run -FixUefiBootEntry to give the ESP its previous GUID (and GPT slot) back." }
+            'Ambiguous' { return "The recorded 'Windows Boot Manager' GUIDs all belong to other partitions on the disk, not the ESP. Pass -EspGuid to choose one explicitly." }
+        }
+    }
+
+    function Show-UefiBootAnalysis {
+        param($Analysis)
+        $a = $Analysis
+        Write-Host "`nUEFI boot entry analysis (disk $($a.DiskNumber))" -ForegroundColor Cyan
+        if ($a.EspPartition) {
+            $slotText = if ($a.EspSlot) { "GPT slot $($a.EspSlot)" } else { 'GPT slot unknown' }
+            Write-Host "  ESP             : partition $($a.EspPartition), $slotText, GUID $($a.EspGuid)"
+        }
+        else {
+            $where = if ($a.PredictedSlot) { "the previous ESP's extent is free; an ESP recreated there takes GPT slot $($a.PredictedSlot)" } else { "next free GPT slot: $($a.NextFreeSlot)" }
+            Write-Host "  ESP             : none ($where)" -ForegroundColor Yellow
+        }
+        if ($a.SlotError) { Write-Host "  GPT slots       : could not read ($($a.SlotError))" -ForegroundColor Yellow }
+        $newest = if ($a.LatestLog) { " - newest $($a.LatestLog.File) [$($a.LatestLog.Time.ToString('yyyy-MM-dd HH:mm'))]" } else { '' }
+        Write-Host "  Measured boot   : $($a.LogsParsed) of $($a.LogsFound) log(s) parsed$newest"
+        if ($a.Candidates.Count -gt 0) {
+            Write-Host "  'Windows Boot Manager' entries recorded by the firmware:"
+            foreach ($c in $a.Candidates) {
+                $where = if ($c.PartitionNumber) { " (partition $($c.PartitionNumber))" } else { '' }
+                $color = switch ($c.Status) { 'CurrentEsp' { 'Green' } 'Missing' { 'Yellow' } default { 'Gray' } }
+                Write-Host ("    {0}  slot {1}  seen {2,3}x  {3:yyyy-MM-dd HH:mm} .. {4:yyyy-MM-dd HH:mm}  {5}{6}" -f $c.Guid, $c.Slot, $c.Seen, $c.FirstSeen, $c.LastSeen, $c.Status, $where) -ForegroundColor $color
+            }
+        }
+        foreach ($s in $a.StrayEfi) {
+            $color = if ($s.IsFat) { 'Red' } else { 'Yellow' }
+            Write-Host "  Stray \EFI      : $($s.Path) (partition $($s.PartitionNumber), $($s.FileSystem)) - $($s.Files -join ', ')" -ForegroundColor $color
+        }
+        $color = switch ($a.Status) { 'Match' { 'Green' } 'Stale' { 'Red' } 'NoEsp' { 'Red' } default { 'Yellow' } }
+        Write-Host "  Result          : $($a.Status) - $(Get-UefiBootStatusText -Analysis $a)" -ForegroundColor $color
+        $color = switch ($a.AzureVerdict) { 'Match' { 'Green' } 'Unknown' { 'Yellow' } default { 'Red' } }
+        Write-Host "  Azure TL / CVM  : $(Get-UefiAzureVerdictText -Analysis $a)" -ForegroundColor $color
+        if ($a.SlotMoveNeeded) {
+            $repairSwitch = if ($a.EspSlot) { '-FixUefiBootEntry' } else { '-RecreateBootPartition' }
+            Write-Host "  Slot mismatch   : the saved entry uses GPT slot $($a.RequiredSlot) but the ESP $(if ($a.EspSlot) { "is in slot $($a.EspSlot)" } else { "would be created in slot $($a.PredictedSlot)" }). $repairSwitch moves it to slot $($a.RequiredSlot) (the partitions' location and contents are not changed)." -ForegroundColor Yellow
+        }
+    }
+
+    # Point the ESP's BCD {bootmgr} (and {memdiag}) device at the ESP again after
+    # its GUID changed. Assigns a drive letter to the ESP when it has none.
+    function Set-EspBootmgrDevice {
+        param([int]$DiskNumber, [int]$PartitionNumber)
+        $p = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber
+        $root = @($p.AccessPaths | Where-Object { $_ -match '^[A-Za-z]:\\?$' } | Select-Object -First 1)
+        if (-not $root) {
+            $used = @((Get-Volume | Where-Object { $_.DriveLetter }).DriveLetter | ForEach-Object { ([string]$_).ToUpper() }) + @((Get-PSDrive -PSProvider FileSystem).Name)
+            $letter = [char[]](70..90) | Where-Object { $used -notcontains [string]$_ } | Select-Object -Last 1
+            if (-not $letter) { throw 'No free drive letter to mount the ESP.' }
+            Invoke-Logged -Description 'Assign drive letter to ESP' -Details @{ DiskNumber = $DiskNumber; PartitionNumber = $PartitionNumber; Letter = [string]$letter } -ScriptBlock {
+                Set-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -NewDriveLetter $letter -ErrorAction Stop
+            } | Out-Null
+            $root = @("${letter}:\")
+        }
+        $espDrive = $root[0].TrimEnd('\')
+        $script:BootDriveLetter = "$espDrive\"
+        $store = "$espDrive\EFI\Microsoft\Boot\BCD"
+        if (-not (Test-Path -LiteralPath $store)) {
+            Write-Warning "No BCD store at $store. Run -FixBoot to rebuild it."
+            return
+        }
+        foreach ($bcdId in @('{bootmgr}', '{memdiag}')) {
+            $global:LASTEXITCODE = 0
+            $null = & bcdedit.exe /store $store /enum $bcdId 2>&1
+            if ($LASTEXITCODE -ne 0) { continue }
+            $global:LASTEXITCODE = 0
+            $r = Invoke-NativeCommandLogged -Description "bcdedit set $bcdId device" -Details @{ Store = $store; Device = "partition=$espDrive" } -ScriptBlock {
+                & bcdedit.exe /store $store /set $bcdId device "partition=$espDrive"
+            }
+            if (-not $r.Success) { throw "bcdedit /set $bcdId device failed (exit $($r.ExitCode)): $($r.Output -join ' ')" }
+        }
+        Write-Host "BCD {bootmgr} device set to the ESP ($espDrive)." -ForegroundColor Green
+        if (-not (Test-Path -LiteralPath "$espDrive\EFI\Microsoft\Boot\bootmgfw.efi")) {
+            Write-Warning "$espDrive\EFI\Microsoft\Boot\bootmgfw.efi is missing. Run -FixBoot to repopulate the ESP."
+        }
+    }
+
+    # Re-resolve the Windows drive letter after the disk went offline/online.
+    function Sync-WindowsDriveLetter {
+        param([int]$DiskNumber, [int]$WindowsPartitionNumber)
+        if (-not $WindowsPartitionNumber) { return }
+        $wp = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $WindowsPartitionNumber -ErrorAction SilentlyContinue
+        if (-not $wp) { return }
+        if (-not $wp.DriveLetter -or $wp.DriveLetter -eq [char]0) {
+            $wp | Add-PartitionAccessPath -AssignDriveLetter -ErrorAction SilentlyContinue
+            $wp = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $WindowsPartitionNumber
+        }
+        if ($wp.DriveLetter -and $wp.DriveLetter -ne [char]0) {
+            $newRoot = "$($wp.DriveLetter):\"
+            if ($newRoot -ne $script:WinDriveLetter) {
+                Write-Host "Windows partition is now at $newRoot (was $($script:WinDriveLetter))." -ForegroundColor Yellow
+                $script:WinDriveLetter = $newRoot
+            }
+        }
+    }
+
+    # Restore the ESP GUID and refresh the BCD. Returns $true when the GUID changed.
+    function Restore-UefiEspGuid {
+        param([int]$DiskNumber, [int]$EspPartitionNumber, [guid]$Guid)
+        $winPartNumber = $null
+        try { $winPartNumber = (Get-Partition -DriveLetter $script:WinDriveLetter.Substring(0, 1) -ErrorAction Stop).PartitionNumber } catch { }
+        $r = Set-GptPartitionGuid -DiskNumber $DiskNumber -PartitionNumber $EspPartitionNumber -NewGuid $Guid
+        Sync-WindowsDriveLetter -DiskNumber $DiskNumber -WindowsPartitionNumber $winPartNumber
+        Set-EspBootmgrDevice -DiskNumber $DiskNumber -PartitionNumber $EspPartitionNumber
+        if ($r.Changed) {
+            Write-ActionLog -Event 'UefiEspGuidRestored' -Details @{ DiskNumber = $DiskNumber; PartitionNumber = $EspPartitionNumber; OldGuid = $r.OldGuid.ToString(); NewGuid = $Guid.ToString() }
+            Write-Host "To undo: .\Repair-AzVMDisk.ps1 -DiskNumber $DiskNumber -FixUefiBootEntry -EspGuid $($r.OldGuid)" -ForegroundColor DarkCyan
+        }
+        return [bool]$r.Changed
+    }
+
+    function GetUefiBootEntry {
+        if ($script:VMGen -ne 2) {
+            Write-Host "-GetUefiBootEntry applies to Gen2 (UEFI/GPT) disks only." -ForegroundColor Yellow
+            return
+        }
+        $a = Get-UefiBootAnalysis -DiskNumber $script:DiskNumber -WinRoot $script:WinDriveLetter
+        Show-UefiBootAnalysis -Analysis $a
+        if ($a.LatestLog) {
+            Write-Host "`nBoot options in the newest measured boot log ($($a.LatestLog.File)):" -ForegroundColor Cyan
+            if ($a.LatestLog.BootOrder) { Write-Host "  BootOrder: $($a.LatestLog.BootOrder -join ', ')" }
+            foreach ($e in $a.LatestLog.Entries) { Write-Host "  $($e.Name)  $($e.Description)`n      $($e.Path)" }
+            $last = @($a.LatestLog.Loaded | Where-Object { $_.FilePath }) | Select-Object -Last 1
+            if ($last) { Write-Host "  Last image loaded: $($last.Text)" }
+        }
+        if ($a.Status -eq 'NoEsp') {
+            Write-Host "`nTo repair: .\Repair-AzVMDisk.ps1 -DiskNumber $($script:DiskNumber) -RecreateBootPartition" -ForegroundColor Yellow
+        }
+        elseif ($a.Status -in @('Stale', 'Replaced') -or $a.SlotMoveNeeded -or $a.AzureVerdict -eq 'NoMatch' -or @($a.StrayEfi | Where-Object { $_.IsFat }).Count -gt 0) {
+            Write-Host "`nTo repair: .\Repair-AzVMDisk.ps1 -DiskNumber $($script:DiskNumber) -FixUefiBootEntry" -ForegroundColor Yellow
+        }
+    }
+
+    # Move the ESP to the GPT slot of the saved UEFI boot entry (swapping it with the
+    # partition in that slot), then re-resolve the Windows drive letter and the BCD
+    # {bootmgr} device. Run it after any GUID change: Windows layout writes re-sort the
+    # GPT entries by start LBA and would undo the move.
+    function Repair-UefiEspSlot {
+        param([int]$DiskNumber, [guid]$EspGuid, [int]$TargetSlot)
+        $winGuid = $null
+        try { $winGuid = [guid](Get-Partition -DriveLetter $script:WinDriveLetter.Substring(0, 1) -ErrorAction Stop).Guid } catch { }
+        $r = Move-GptEspSlot -DiskNumber $DiskNumber -EspGuid $EspGuid -TargetSlot $TargetSlot
+        if (-not $r.Changed) { return $r }
+        $parts = @(Get-Partition -DiskNumber $DiskNumber -ErrorAction SilentlyContinue)
+        $esp = $parts | Where-Object { $_.Guid -and ([guid]$_.Guid) -eq $EspGuid } | Select-Object -First 1
+        if (-not $esp) { throw "The ESP $EspGuid is not visible to Windows after the GPT slot move. Run -GetUefiBootEntry to review." }
+        if ($winGuid) {
+            $wp = $parts | Where-Object { $_.Guid -and ([guid]$_.Guid) -eq $winGuid } | Select-Object -First 1
+            if ($wp) { Sync-WindowsDriveLetter -DiskNumber $DiskNumber -WindowsPartitionNumber $wp.PartitionNumber }
+        }
+        Set-EspBootmgrDevice -DiskNumber $DiskNumber -PartitionNumber $esp.PartitionNumber
+        $now = @(Get-GptSlotMap -DiskNumber $DiskNumber | Where-Object { $_.Guid -eq $EspGuid })
+        if ($now.Count -ne 1 -or $now[0].Slot -ne $TargetSlot) {
+            throw "The ESP is in GPT slot $(if ($now.Count -eq 1) { $now[0].Slot } else { '?' }) after the move, not slot $TargetSlot. GPT backups: $($r.BackupFiles -join ', ')"
+        }
+        Write-ActionLog -Event 'UefiEspSlotMoved' -Details @{
+            DiskNumber      = $DiskNumber
+            EspGuid         = $EspGuid.ToString()
+            OldSlot         = $r.OldSlot
+            NewSlot         = $TargetSlot
+            Partner         = $r.Partner
+            PartitionNumber = $esp.PartitionNumber
+        }
+        Write-Host "To undo: .\Repair-AzVMDisk.ps1 -DiskNumber $DiskNumber -FixUefiBootEntry -EspGuid $EspGuid -EspSlot $($r.OldSlot)" -ForegroundColor DarkCyan
+        return $r
+    }
+
+    function FixUefiBootEntry {
+        param([string]$EspGuid, [int]$EspSlot = 0)
+        if ($script:VMGen -ne 2) {
+            Write-Host "-FixUefiBootEntry applies to Gen2 (UEFI/GPT) disks only." -ForegroundColor Yellow
+            return
+        }
+        if ($EspGuid) {
+            $parsedGuid = [guid]::Empty
+            if (-not [guid]::TryParse($EspGuid.Trim().Trim('{', '}'), [ref]$parsedGuid) -or $parsedGuid -eq [guid]::Empty) {
+                Write-Error "-EspGuid '$EspGuid' is not a valid GUID."
+                return
+            }
+        }
+        if ($EspSlot -lt 0 -or $EspSlot -gt 128) {
+            Write-Error "-EspSlot $EspSlot is outside 1..128."
+            return
+        }
+        $a = Get-UefiBootAnalysis -DiskNumber $script:DiskNumber -WinRoot $script:WinDriveLetter -EspGuid $EspGuid
+        Show-UefiBootAnalysis -Analysis $a
+        if ($a.Status -eq 'NoEsp') { Write-Host "Run -RecreateBootPartition first." -ForegroundColor Yellow; return }
+        if ($a.Status -eq 'MultipleEsp') { return }
+
+        $strayFat = @($a.StrayEfi | Where-Object { $_.IsFat })
+        foreach ($s in @($a.StrayEfi | Where-Object { -not $_.IsFat })) {
+            Write-Host "Leaving $($s.Path) in place: the firmware cannot read $($s.FileSystem), so it cannot hijack the boot." -ForegroundColor DarkCyan
+        }
+        $newGuid = $null
+        if ($a.Target -and $a.Target.Guid -ne $a.EspGuid) { $newGuid = $a.Target.Guid }
+        elseif ($a.Target -and $a.Target.Guid -eq $a.EspGuid) {
+            Write-Host "The ESP already has GUID $($a.EspGuid)." -ForegroundColor Green
+        }
+
+        # The GPT slot the ESP must end up in. A GUID change rewrites the layout through
+        # Windows, which can re-sort the entries, so the slot is re-applied after it.
+        $wantSlot = 0
+        if ($EspSlot -gt 0) { $wantSlot = $EspSlot }
+        elseif ($a.RequiredSlot) { $wantSlot = [int]$a.RequiredSlot }
+        elseif ($newGuid -and $a.Target.Slot) { $wantSlot = [int]$a.Target.Slot }
+        elseif ($newGuid -and $a.EspSlot) { $wantSlot = [int]$a.EspSlot }
+        $slotChange = $wantSlot -gt 0 -and $wantSlot -ne $a.EspSlot
+        if ($wantSlot -gt 0 -and -not $slotChange) {
+            Write-Host "The ESP is already in GPT slot $wantSlot." -ForegroundColor Green
+        }
+
+        if (-not $newGuid -and -not $slotChange -and $strayFat.Count -eq 0) {
+            Write-Host "No UEFI boot entry change needed or possible." -ForegroundColor Green
+            return
+        }
+
+        $lines = @()
+        foreach ($s in $strayFat) { $lines += "- Rename stray $($s.Path) (partition $($s.PartitionNumber), $($s.FileSystem)) so the firmware fallback cannot load it" }
+        if ($newGuid) {
+            $lines += "- Change ESP partition $($a.EspPartition) GUID $($a.EspGuid) -> $newGuid (the disk goes offline briefly)"
+            $lines += "- Point BCD {bootmgr} at the ESP again"
+        }
+        if ($slotChange) {
+            $partnerText = 'an empty slot'
+            try {
+                $p = @(Get-GptSlotMap -DiskNumber $script:DiskNumber | Where-Object { $_.Slot -eq $wantSlot }) | Select-Object -First 1
+                if ($p) { $partnerText = "the $($p.TypeName) partition $($p.Guid)" }
+            }
+            catch { $partnerText = 'the partition in that slot' }
+            $from = if ($a.EspSlot) { $a.EspSlot } else { '?' }
+            $lines += "- Move the ESP from GPT slot $from to slot $wantSlot; $partnerText takes slot $from. Only the order of the GPT entries changes - no partition is moved, resized or reformatted. Both GPT copies are backed up first and the disk goes offline briefly"
+        }
+        $confirmed = Confirm-CriticalOperation -Operation 'Fix UEFI boot entry match' -Details ($lines -join "`n")
+        if (-not $confirmed) { return }
+
+        foreach ($s in $strayFat) { Rename-StrayEfiFolder -Stray $s }
+        $espGuidNow = $a.EspGuid
+        if ($newGuid) {
+            $null = Restore-UefiEspGuid -DiskNumber $script:DiskNumber -EspPartitionNumber $a.EspPartition -Guid $newGuid
+            $espGuidNow = $newGuid
+        }
+        if ($wantSlot -gt 0) {
+            $null = Repair-UefiEspSlot -DiskNumber $script:DiskNumber -EspGuid $espGuidNow -TargetSlot $wantSlot
+        }
+        Write-Host "UEFI boot entry fix complete." -ForegroundColor Green
+    }
+
     function RecreateBootPartition {
         Write-Host "Checking boot partition status..." -ForegroundColor Yellow
         try {
@@ -7357,7 +8557,7 @@ dependencies on the Windows partition.
                 $existingEsp = $partitions | Where-Object { $_.Type -eq 'System' }
                 if ($existingEsp) {
                     Write-Host "EFI System Partition already exists (Partition $($existingEsp.PartitionNumber)). No action needed." -ForegroundColor Green
-                    Write-Host "If the BCD is missing or corrupt, use -FixBoot to rebuild it." -ForegroundColor DarkCyan
+                    Write-Host "If the BCD is missing or corrupt, use -FixBoot to rebuild it. If the VM still cannot find the boot loader, check -GetUefiBootEntry." -ForegroundColor DarkCyan
                     return
                 }
 
@@ -7371,10 +8571,43 @@ dependencies on the Windows partition.
                 $useSize = if ($freeSpace -ge $idealSize) { $idealSize } else { $freeSpace }
                 $sizeMB = [math]::Round($useSize / 1MB, 0)
 
+                # Find the ESP GUID the VM's saved UEFI boot entry expects, so the
+                # new ESP can take it over (Trusted Launch / CVM keep their UEFI variables).
+                $uefiPre = $null
+                try { $uefiPre = Get-UefiBootAnalysis -DiskNumber $script:DiskNumber -WinRoot $script:WinDriveLetter }
+                catch { Write-Warning "UEFI boot entry analysis failed: $($_.Exception.Message)" }
+                $restoreGuid = $null
+                $useOffset = $null
+                $extraLines = @()
+                if ($uefiPre) {
+                    Show-UefiBootAnalysis -Analysis $uefiPre
+                    # Recreate the ESP where the previous one was, so it takes the same GPT slot even
+                    # when the partition entry array was packed after the old ESP was deleted.
+                    if ($uefiPre.TargetExtentFree) {
+                        $sector = [long]$disk.LogicalSectorSize
+                        $origSize = [long]$uefiPre.Target.Size * $sector
+                        if ($origSize -ge $minSize) {
+                            $useOffset = [long]$uefiPre.Target.Start * $sector
+                            $useSize = $origSize
+                            $sizeMB = [math]::Round($useSize / 1MB, 0)
+                            $extraLines += "- Place it where the previous ESP was (offset $([math]::Round($useOffset / 1MB, 0)) MB), which gives it GPT slot $($uefiPre.PredictedSlot)"
+                        }
+                    }
+                    if ($uefiPre.Target) {
+                        $restoreGuid = $uefiPre.Target.Guid
+                        $slotNote = if ($uefiPre.Target.Slot) { " and place it in GPT slot $($uefiPre.Target.Slot) (swapping GPT entries if needed; GPT backup saved)" } else { '' }
+                        $extraLines += "- Give the new ESP the previous ESP GUID $restoreGuid$slotNote, so the VM's saved UEFI boot entry matches it"
+                    }
+                    foreach ($s in @($uefiPre.StrayEfi | Where-Object { $_.IsFat })) {
+                        $extraLines += "- Rename stray $($s.Path) (partition $($s.PartitionNumber), $($s.FileSystem)) so the firmware fallback cannot load it"
+                    }
+                }
+                $extraText = if ($extraLines.Count -gt 0) { "`n" + ($extraLines -join "`n") } else { '' }
+
                 $confirmed = Confirm-CriticalOperation -Operation "Recreate EFI System Partition (Gen2/UEFI)" -Details @"
 - Create a $sizeMB MB FAT32 partition with GPT type 'EFI System Partition'
 - Run bcdboot to populate it with EFI boot files and a fresh BCD store
-- The Windows partition at $($script:WinDriveLetter) will be referenced as the OS source
+- The Windows partition at $($script:WinDriveLetter) will be referenced as the OS source$extraText
 "@
                 if (-not $confirmed) { return }
 
@@ -7382,10 +8615,12 @@ dependencies on the Windows partition.
                 $newPart = Invoke-LoggedValue -Description 'Create EFI System Partition' -Details @{
                     DiskNumber = $script:DiskNumber
                     Size = $useSize
+                    Offset = $useOffset
                     GptType = '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
                 } -ScriptBlock {
-                    New-Partition -DiskNumber $script:DiskNumber -Size $useSize `
-                        -GptType '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}' -AssignDriveLetter
+                    $np = @{ DiskNumber = $script:DiskNumber; Size = $useSize; GptType = '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'; AssignDriveLetter = $true }
+                    if ($useOffset) { $np.Offset = $useOffset }
+                    New-Partition @np
                 } | Select-Object -First 1
                 $newLetter = $newPart.DriveLetter
                 if (-not $newLetter -or $newLetter -eq "`0") {
@@ -7413,9 +8648,13 @@ dependencies on the Windows partition.
                 $WinDrive = $script:WinDriveLetter.TrimEnd('\')
                 $rebuildCmd = "bcdboot $WinDrive\Windows /s $bootDrive /v /f UEFI"
                 Write-Host "Running: $rebuildCmd" -ForegroundColor Cyan
-                Invoke-Logged -Description "bcdboot (recreate ESP)" -Details @{ Command = $rebuildCmd } -ScriptBlock {
-                    & cmd.exe /c $rebuildCmd
-                } | Out-Host
+                $bcdbootResult = Invoke-NativeCommandLogged -Description "bcdboot (recreate ESP)" -Details @{ Command = $rebuildCmd } -ScriptBlock {
+                    & bcdboot.exe "$WinDrive\Windows" /s $bootDrive /v /f UEFI
+                }
+                $bcdbootResult.Output | Out-Host
+                if (-not $bcdbootResult.Success) {
+                    throw "bcdboot failed (exit $($bcdbootResult.ExitCode)). The new ESP (partition $($newPart.PartitionNumber)) exists but has no boot files; run -FixBoot after fixing the cause."
+                }
 
                 $script:BootDriveLetter = "$bootDrive\"
 
@@ -7429,6 +8668,32 @@ dependencies on the Windows partition.
                 }
 
                 Write-Host "EFI System Partition created and boot files populated successfully." -ForegroundColor Green
+
+                # Neutralise stray FAT \EFI copies and restore the previous ESP GUID.
+                try {
+                    $uefiPost = Get-UefiBootAnalysis -DiskNumber $script:DiskNumber -WinRoot $script:WinDriveLetter
+                    foreach ($s in @($uefiPost.StrayEfi | Where-Object { $_.IsFat })) { Rename-StrayEfiFolder -Stray $s }
+                    if ($restoreGuid) {
+                        if ($uefiPost.EspPartition -ne $newPart.PartitionNumber) {
+                            Write-Warning "Could not identify the new ESP for the GUID restore. Run -FixUefiBootEntry -EspGuid $restoreGuid."
+                        }
+                        else {
+                            $null = Restore-UefiEspGuid -DiskNumber $script:DiskNumber -EspPartitionNumber $newPart.PartitionNumber -Guid $restoreGuid
+                            $wantSlot = if ($uefiPre.RequiredSlot) { [int]$uefiPre.RequiredSlot } elseif ($uefiPre.Target.Slot) { [int]$uefiPre.Target.Slot } else { 0 }
+                            if ($wantSlot -gt 0) {
+                                $null = Repair-UefiEspSlot -DiskNumber $script:DiskNumber -EspGuid ([guid]$restoreGuid) -TargetSlot $wantSlot
+                            }
+                            $bootDrive = $script:BootDriveLetter.TrimEnd('\')
+                        }
+                    }
+                    elseif ($uefiPre -and $uefiPre.Status -in @('NoLogs', 'Ambiguous')) {
+                        Write-Host "The previous ESP GUID could not be determined. If a Trusted Launch VM cannot find the boot loader, pass it with -FixUefiBootEntry -EspGuid <guid>." -ForegroundColor Yellow
+                    }
+                }
+                catch {
+                    Write-Warning "UEFI boot entry fix-up failed: $($_.Exception.Message). Run -GetUefiBootEntry to review."
+                }
+
                 Write-Host "Boot drive is now: $bootDrive" -ForegroundColor Green
             }
             else {
@@ -14486,6 +15751,10 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
         $sevBcdImcHive = 2   # BCD has imcdevice/imchivename entries (BSOD 0x67 CONFIG_INITIALIZATION_FAILED)
         $sevBootPartitionNotActive = 2   # Gen1 (MBR) boot partition not flagged as Active (BIOS cannot find boot sector)
         $sevBootPartitionMissing = 2   # Separate boot partition (System Reserved / EFI SP) not found on disk
+        $sevStrayEfiFat = 2   # Gen2: non-ESP FAT partition holds \EFI boot files (firmware fallback can load its stale BCD)
+        $sevStrayEfiNtfs = 1   # Gen2: non-ESP NTFS partition holds \EFI boot files (not bootable by firmware, but confusing)
+        $sevUefiEntryStale = 2   # Gen2: firmware 'Windows Boot Manager' entry points at an ESP GUID no longer on the disk
+        $sevUefiEntryMixed = 1   # Gen2: ESP GUID matches an older firmware entry but a newer boot recorded a different GUID
         $sevBcdMultipleLoaders = 1   # More than one Windows Boot Loader entry found in BCD
         $sevBcdSetupEntry = 1   # BCD contains Windows Setup or other stale setup loader entries
         $sevMultipleWindowsInstalls = 1   # More than one Windows installation was detected on the disk
@@ -14555,7 +15824,7 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
         $sevNetSvcDisabled = 1   # Secondary networking services disabled (DNS/DHCP/NLA/SMB)
         $sevNsiDisabled = 2   # nsi (Network Store Interface) disabled - total networking loss
         $sevStaticIpNoAzureDhcp = 2   # EnableDHCP=0 on NIC - VM gets no Azure IP assignment
-        $sevNetProviderOrphaned = 2   # NetworkProvider\Order lists a provider whose DLL is missing - logon hangs forever
+        $sevNetProviderOrphaned = 2   # NetworkProvider\Order lists a provider whose DLL is missing - logon can stall
         $sevSanPolicy = 0   # SAN policy is not OnlineAll
         $sevOrphanedNdis = 2   # Orphaned NDIS bindings with missing binary
 
@@ -14966,6 +16235,44 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
             }
             else {
                 & $emit 'BCD' 'OK' "EFI System Partition present (Partition $($espExists.PartitionNumber))"
+            }
+
+            # UEFI boot entry match (measured boot logs) and stray \EFI copies
+            try {
+                $uefiA = Get-UefiBootAnalysis -DiskNumber $script:DiskNumber -WinRoot $script:WinDriveLetter
+                foreach ($s in @($uefiA.StrayEfi)) {
+                    if ($s.IsFat) {
+                        & $emit 'BCD' (& $toSev $sevStrayEfiFat) "Non-ESP FAT partition $($s.PartitionNumber) holds EFI boot files ($($s.Path)) - the firmware fallback can load its BCD instead of the ESP (winload 0xc000000e)" $(if ($uefiA.Status -eq 'NoEsp') { '-RecreateBootPartition' } else { '-FixUefiBootEntry' })
+                    }
+                    else {
+                        & $emit 'BCD' (& $toSev $sevStrayEfiNtfs) "Non-ESP $($s.FileSystem) partition $($s.PartitionNumber) holds EFI boot files ($($s.Path)) - not used by the firmware, but may confuse repairs" ''
+                    }
+                }
+                $slotNote = if ($uefiA.SlotMoveNeeded) { " The entry also uses GPT slot $($uefiA.RequiredSlot) and the ESP is in slot $($uefiA.EspSlot); -FixUefiBootEntry moves it." } else { '' }
+                switch ($uefiA.Status) {
+                    'Match' {
+                        if ($uefiA.AzureVerdict -eq 'NoMatch') {
+                            & $emit 'BCD' (& $toSev $sevUefiEntryStale) "ESP GUID matches the firmware's 'Windows Boot Manager' entry, but the entry uses GPT slot $($uefiA.AzureEntry.Slot) and the ESP is in slot $($uefiA.EspSlot) - Trusted Launch/CVM will not find the boot loader" '-FixUefiBootEntry'
+                        }
+                        else { & $emit 'BCD' 'OK' "ESP GUID and GPT slot match the firmware's most recent 'Windows Boot Manager' entry" }
+                    }
+                    'Stale' {
+                        & $emit 'BCD' (& $toSev $sevUefiEntryStale) "Firmware 'Windows Boot Manager' entry points at ESP GUID $($uefiA.Target.Guid), which is no longer on the disk (current ESP: $($uefiA.EspGuid)) - Trusted Launch/CVM will not find the boot loader.$slotNote" '-FixUefiBootEntry'
+                    }
+                    'Mixed' { & $emit 'BCD' (& $toSev $sevUefiEntryMixed) "ESP GUID matches an older firmware 'Windows Boot Manager' entry, but a newer boot recorded a different GUID (disk booted on another host?)" '-GetUefiBootEntry' }
+                    'Replaced' {
+                        & $emit 'BCD' (& $toSev $sevUefiEntryMixed) "ESP was recreated: previous ESP GUID $($uefiA.Target.Guid) (GPT slot $($uefiA.Target.Slot)) is no longer on the disk (current ESP: $($uefiA.EspGuid)). Trusted Launch/CVM keep the old entry and will not find the boot loader until the ESP gets that GUID and slot back.$slotNote" '-FixUefiBootEntry'
+                    }
+                    'Ambiguous' { & $emit 'BCD' (& $toSev $sevUefiEntryMixed) "Recorded firmware 'Windows Boot Manager' GUIDs belong to other partitions, not the ESP" '-GetUefiBootEntry' }
+                    'MultipleEsp' { & $emit 'BCD' 'WARN' "More than one EFI System Partition on the disk" '-GetUefiBootEntry' }
+                    'NoLogs' { & $emit 'BCD' 'INFO' "No 'Windows Boot Manager' entry in the measured boot logs - UEFI boot entry match not checked" }
+                    'NoEsp' {
+                        if ($uefiA.Target) { & $emit 'BCD' 'INFO' "Previous ESP GUID $($uefiA.Target.Guid) (GPT slot $($uefiA.Target.Slot)) found in the measured boot logs - -RecreateBootPartition will restore it$(if ($uefiA.Target.Slot) { " and place the ESP in GPT slot $($uefiA.Target.Slot)" })" }
+                    }
+                }
+            }
+            catch {
+                & $emit 'BCD' 'INFO' "UEFI boot entry check skipped: $($_.Exception.Message)"
             }
         }
         else {
@@ -16326,9 +17633,10 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
                 }
 
                 # -- NetworkProvider\Order orphan check --------------------------------
-                # If a provider is listed in ProviderOrder but its DLL is missing,
-                # Windows hangs indefinitely at logon ("Please wait..." forever).
-                # Common after uninstalling VPN software (Cisco AnyConnect, GlobalProtect, Zscaler).
+                # A provider listed in ProviderOrder whose DLL is missing can stall logon
+                # ("Please wait..."). Common after uninstalling VPN or remote-access software.
+                # ProviderPath is read raw: Get-ItemProperty would expand %SystemRoot% and
+                # %ProgramFiles% against the rescue VM, not the guest.
                 $npOrderPath = "$ctrlRoot\NetworkProvider\Order"
                 if (Test-Path $npOrderPath) {
                     $providerOrder = (Get-ItemProperty $npOrderPath -ErrorAction SilentlyContinue).ProviderOrder
@@ -16341,17 +17649,21 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
                                 $orphanedProviders.Add("$prov (service key missing)")
                                 continue
                             }
-                            $provDllRaw = (Get-ItemProperty $provSvcPath -ErrorAction SilentlyContinue).ProviderPath
-                            if (-not $provDllRaw) { continue }
-                            # Resolve %SystemRoot% and map to offline drive
-                            $provDll = $provDllRaw -replace '(?i)%SystemRoot%', (Join-Path $script:WinDriveLetter 'Windows')
-                            $provDll = $provDll -replace '(?i)\\SystemRoot\\', (Join-Path $script:WinDriveLetter 'Windows\')
-                            if (-not (Test-Path -LiteralPath $provDll)) {
-                                $orphanedProviders.Add("$prov ($provDllRaw -> not found)")
+                            $provDllRaw = $null
+                            $provKey = Get-Item -LiteralPath $provSvcPath -ErrorAction SilentlyContinue
+                            if ($provKey) {
+                                try { $provDllRaw = $provKey.GetValue('ProviderPath', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
+                                finally { $provKey.Close() }
+                            }
+                            if ($provDllRaw -isnot [string] -or -not $provDllRaw.Trim()) { continue }
+                            $provDll = Resolve-NetworkProviderDllPath $provDllRaw
+                            if (-not $provDll) { continue }
+                            if (-not (Test-Path -LiteralPath $provDll -PathType Leaf)) {
+                                $orphanedProviders.Add("$prov ($provDllRaw -> $provDll not found)")
                             }
                         }
                         if ($orphanedProviders.Count -gt 0) {
-                            & $emit 'Networking' (& $toSev $sevNetProviderOrphaned) "NetworkProvider\Order lists $($orphanedProviders.Count) provider(s) with missing DLL - logon will hang indefinitely: $($orphanedProviders -join '; ')" "-FixNetBindings"
+                            & $emit 'Networking' (& $toSev $sevNetProviderOrphaned) "NetworkProvider\Order lists $($orphanedProviders.Count) provider(s) with missing DLL - logon can stall at 'Please wait': $($orphanedProviders -join '; ')" "Manual: remove the listed name(s) from Control\NetworkProvider\Order ProviderOrder (and HwOrder) in the offline SYSTEM hive, after confirming the software is really uninstalled"
                         }
                     }
                 }
@@ -24872,14 +26184,15 @@ No destructive file or registry cleanup is performed.
             foreach ($accessPath in $accessPaths) {
                 $role = Get-PartitionRole -AccessPath $accessPath -PartitionInfo $part
                 Write-Host "  Partition $($part.PartitionNumber) ($accessPath): $role"
+                $apRoot = $accessPath.TrimEnd('\') + '\'
 
-                if ((Test-Path (Join-Path $accessPath "Windows\System32\ntdll.dll")) -and -not $winDrive) {
+                if ((Test-Path -LiteralPath ($apRoot + "Windows\System32\ntdll.dll")) -and -not $winDrive) {
                     $winDrive = $accessPath
                 }
 
                 if ($script:VMGen -eq 1) {
                     # Active MBR partition with Boot\BCD present
-                    if ($part.IsActive -and (Test-BcdStorePath -StorePath (Join-Path $accessPath "Boot\BCD")) -and -not $bootDrive) {
+                    if ($part.IsActive -and (Test-BcdStorePath -StorePath ($apRoot + "Boot\BCD")) -and -not $bootDrive) {
                         $bootDrive = $accessPath
                     }
                     # Fallback: active MBR partition even without BCD (BCD missing/corrupted)
@@ -24890,11 +26203,11 @@ No destructive file or registry cleanup is performed.
                 }
                 elseif ($script:VMGen -eq 2) {
                     # GPT System partition with EFI\Microsoft\Boot\BCD present
-                    if ($part.Type -eq 'System' -and (Test-BcdStorePath -StorePath (Join-Path $accessPath "EFI\Microsoft\Boot\BCD")) -and -not $bootDrive) {
+                    if ($part.Type -eq 'System' -and (Test-BcdStorePath -StorePath ($apRoot + "EFI\Microsoft\Boot\BCD")) -and -not $bootDrive) {
                         $bootDrive = $accessPath
                     }
                     # Fallback 1: GPT System partition with EFI\Microsoft\Boot folder (BCD deleted)
-                    elseif ($part.Type -eq 'System' -and (Test-Path (Join-Path $accessPath "EFI\Microsoft\Boot")) -and -not $bootDrive) {
+                    elseif ($part.Type -eq 'System' -and (Test-Path -LiteralPath ($apRoot + "EFI\Microsoft\Boot")) -and -not $bootDrive) {
                         $bootDrive = $accessPath
                         Write-Host "  ** Boot partition identified by GPT System type + EFI folder (BCD missing - run -FixBoot to rebuild)" -ForegroundColor Yellow
                     }
@@ -25018,6 +26331,10 @@ No destructive file or registry cleanup is performed.
             [string]$BootsectPath = '',
             [switch]$FixBootStorageDrivers,
             [switch]$RecreateBootPartition,
+            [switch]$GetUefiBootEntry,
+            [switch]$FixUefiBootEntry,
+            [string]$EspGuid = '',
+            [int]$EspSlot = 0,
             [switch]$RepairComponentStore,
             [string]$RepairSource = '',
             [string]$RepairSystemFileSource = '',
@@ -25214,7 +26531,18 @@ PARAMETERS:
                          natively from the NTFS backup boot sector and a healthy local MBR.
     -BootsectPath <path> Optional explicit path to bootsect.exe (ADK, or \boot\bootsect.exe on Windows media)
     -FixBootStorageDrivers Repair boot storage Start/StartOverride settings and recreate safe missing inbox service keys
-  -RecreateBootPartition Recreate missing boot partition (System Reserved for Gen1, EFI SP for Gen2) and run bcdboot
+  -RecreateBootPartition Recreate missing boot partition (System Reserved for Gen1, EFI SP for Gen2) and run bcdboot.
+                         Gen2: also renames a stray FAT \EFI folder, restores the previous ESP GUID and moves the
+                         ESP to the GPT slot of the saved firmware boot entry when the guest's measured-boot logs
+                         identify them, so a Trusted Launch / Confidential VM finds the boot loader.
+  -GetUefiBootEntry      Gen2: report the ESP GUID/slot against the firmware boot entries recorded in the guest's
+                         measured-boot (TCG) logs, and list stray \EFI folders on other partitions (read-only)
+  -FixUefiBootEntry      Gen2: rename stray FAT \EFI folders, set the ESP partition GUID back to the one the VM
+                         firmware expects and move the ESP's GPT entry to the slot the firmware expects (Trusted
+                         Launch / CVM match both). Partition location and contents are not changed; both GPT
+                         copies are backed up first.
+    -EspGuid <guid>      Optional explicit GUID to restore instead of the one found in the logs
+    -EspSlot <n>         Optional explicit GPT slot (1-128) for the ESP instead of the one found in the logs
   -RemoveSafeModeFlag    Remove Safe Mode flag
   -TryLKGC               Select the existing LastKnownGood ControlSet for Current and Default
                          (legacy alias: -TryLGKC); preserves Failed/LastKnownGood and control-set contents
@@ -25411,8 +26739,8 @@ AVAILABLE DISKS:
 
         # Initialize logging and target (resolve VM/disk, bring disk online, detect partitions)
         # Determine if any write/repair action was requested (exclude pure read-only switches)
-        $readOnlySwitches = @('SysCheck', 'CheckDiskHealth', 'ScanNetBindings', 'CheckRDPPolicies', 'CollectEventLogs', 'CollectCrashDumps', 'ShowLastSession', 'GetServicesReport', 'GetCatalogStoreReport', 'GetAppLockerReport', 'ListInstalledUpdates', 'ListStartupPrograms', 'AnalyzeCriticalBootFiles', 'AnalyzeSyntheticDrivers', 'AnalyzeProxyState', 'GetBootPathReport', 'AnalyzeBcdConsistency', 'AnalyzeComponentStore', 'AnalyzeServicingState', 'AnalyzeRecentChanges', 'AnalyzeDomainTrustState')
-        $hasRepairAction = $PSBoundParameters.Keys | Where-Object { $readOnlySwitches -notcontains $_ -and $_ -notin @('VMName', 'DiskNumber', 'Force', 'LeaveDiskOnline', 'DriveLetter', 'RepairSource', 'CodeIntegrityPolicySourcePath', 'RepairSystemFileSource', 'SkipOfflineSfc', 'RepairSystemFileDonorDisk', 'RepairSystemFileMsu', 'SkipMsuDownload', 'AllowSystemFileDowngrade', 'IncludeServices', 'IssuesOnly', 'KeepDefaultFilters', 'DriverStartType', 'RecentChangeDays', 'LoadHive', 'UnloadHive', 'TransactionLogScope') }
+        $readOnlySwitches = @('SysCheck', 'CheckDiskHealth', 'ScanNetBindings', 'CheckRDPPolicies', 'CollectEventLogs', 'CollectCrashDumps', 'ShowLastSession', 'GetServicesReport', 'GetCatalogStoreReport', 'GetAppLockerReport', 'ListInstalledUpdates', 'ListStartupPrograms', 'AnalyzeCriticalBootFiles', 'AnalyzeSyntheticDrivers', 'AnalyzeProxyState', 'GetBootPathReport', 'AnalyzeBcdConsistency', 'AnalyzeComponentStore', 'AnalyzeServicingState',         'AnalyzeRecentChanges', 'AnalyzeDomainTrustState', 'GetUefiBootEntry')
+                $hasRepairAction = $PSBoundParameters.Keys | Where-Object { $readOnlySwitches -notcontains $_ -and $_ -notin @('VMName', 'DiskNumber', 'Force', 'LeaveDiskOnline', 'DriveLetter', 'RepairSource', 'CodeIntegrityPolicySourcePath', 'EspGuid', 'EspSlot', 'RepairSystemFileSource', 'SkipOfflineSfc', 'RepairSystemFileDonorDisk', 'RepairSystemFileMsu', 'SkipMsuDownload', 'AllowSystemFileDowngrade', 'IncludeServices', 'IssuesOnly', 'KeepDefaultFilters', 'DriverStartType', 'RecentChangeDays', 'LoadHive', 'UnloadHive', 'TransactionLogScope') }
         if ($hasRepairAction) {
             Write-Host "  Tip: if you haven't already, a VM snapshot or disk backup before making changes is always a safe starting point." -ForegroundColor DarkGray
             Write-Host ""
@@ -25437,6 +26765,8 @@ AVAILABLE DISKS:
             if ($FixBootSector) { FixBootSector }
             if ($FixBootStorageDrivers) { FixBootStorageDrivers }
             if ($RecreateBootPartition) { RecreateBootPartition }
+            if ($FixUefiBootEntry) { FixUefiBootEntry -EspGuid $EspGuid -EspSlot $EspSlot }
+            if ($GetUefiBootEntry) { GetUefiBootEntry }
             if ($RepairComponentStore) { RunDismHealth -RepairSource $RepairSource }
             if ($AnalyzeComponentStore) { AnalyzeComponentStore }
             if ($RunSFC) { RunSFC }
@@ -25595,6 +26925,8 @@ AVAILABLE DISKS:
     # Promote dynamic sub-parameters to local variables so the rest of the script can use them.
     # Dynamic params are in $PSBoundParameters but not in automatic $variables.
     $CodeIntegrityPolicySourcePath = if ($PSBoundParameters.ContainsKey('CodeIntegrityPolicySourcePath')) { $PSBoundParameters['CodeIntegrityPolicySourcePath'] } else { '' }
+    $EspGuid = if ($PSBoundParameters.ContainsKey('EspGuid')) { $PSBoundParameters['EspGuid'] } else { '' }
+    $EspSlot = if ($PSBoundParameters.ContainsKey('EspSlot')) { [int]$PSBoundParameters['EspSlot'] } else { 0 }
     $DriveLetter = if ($PSBoundParameters.ContainsKey('DriveLetter')) { $PSBoundParameters['DriveLetter'] }      else { '' }
     $RepairSource = if ($PSBoundParameters.ContainsKey('RepairSource')) { $PSBoundParameters['RepairSource'] }     else { '' }
     $RepairSystemFileSource = if ($PSBoundParameters.ContainsKey('RepairSystemFileSource')) { $PSBoundParameters['RepairSystemFileSource'] } else { '' }

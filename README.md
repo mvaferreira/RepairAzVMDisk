@@ -104,7 +104,20 @@ You can also target a Hyper-V VM by name instead of disk number:
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixBootSector
 
 # Recreate the entire boot partition (Gen1 or Gen2/UEFI)
+# Gen2: a missing ESP is recreated with its original partition GUID and GPT slot when
+# the guest's Measured Boot logs identify them.
 .\Repair-AzVMDisk.ps1 -DiskNumber 3 -RecreateBootPartition
+
+# Gen2: check whether the VM's saved UEFI 'Windows Boot Manager' entry still matches the ESP.
+# Trusted Launch and Confidential VMs keep that entry and only boot when the ESP has the
+# original partition GUID and GPT slot (start offset and size do not need to match).
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -GetUefiBootEntry
+
+# Gen2: give the ESP back its original GUID and GPT slot, as read from the Measured Boot logs.
+# Both GPT copies are backed up first; no partition is moved, resized or reformatted.
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixUefiBootEntry
+# Override the detected values when the logs are missing or ambiguous
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -FixUefiBootEntry -EspGuid 11111111-2222-3333-4444-555555555555 -EspSlot 3
 
 # Full Gen2 / UEFI boot repair
 # -RecreateBootPartition exits without deleting/recreating if the EFI System Partition already exists.
@@ -578,6 +591,7 @@ first.
 | **0xC0000225** | "boot selection failed; a required device is inaccessible" | Missing boot partition / BCD device mismatch | `-FixBoot` → `-RecreateBootPartition` → `-FixBootSector` | [Boot errors][be] |
 | **0xC0000359** | "Critical system driver is missing or corrupt" | A 32-bit system driver was installed on the x64 Windows guest | `-RepairSystemFile <driver.sys>` | [0xC0000359][c359] |
 | "An operating system wasn't found" / **0xC000000E** | Boot manager finds no bootable OS | Inactive/missing boot partition or empty BCD | `-FixBoot` → `-RecreateBootPartition` → `-FixBootSector` | [OS not found][osnf] |
+| "Unknown Device – The boot loader did not load an operating system" (Gen2) | UEFI firmware cannot resolve the saved 'Windows Boot Manager' entry | ESP was recreated or moved, so its partition GUID or GPT slot no longer matches the entry Trusted Launch / Confidential VMs keep | `-GetUefiBootEntry` → `-FixUefiBootEntry` (or `-RecreateBootPartition` when no ESP exists) | — |
 | **0x0000007B** | INACCESSIBLE_BOOT_DEVICE | Storage driver `Start`/filters/SAN policy after migration | `-FixBootStorageDrivers` → `-EnsureSyntheticDriversEnabled` → `-FixDeviceFilters` → `-FixSanPolicy` | [INACCESSIBLE_BOOT_DEVICE][7b], [Server 2012 R2 / platform update][2012] |
 | **0x000000ED** | UNMOUNTABLE_BOOT_VOLUME | File-system corruption on boot volume | `-CheckDiskHealth` → `-FixFileSystem` | [Check-disk boot error][chk] |
 | **0x00000074** / **0xC000014C** | BAD_SYSTEM_CONFIG_INFO / STATUS_REGISTRY_CORRUPT | Corrupt SYSTEM/SOFTWARE hive | `-CheckRegistryHealth` → `-FixRegistryCorruption` → `-RestoreRegistryFromRegBack` | [Fix corrupted hive][hive] |
