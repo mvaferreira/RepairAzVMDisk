@@ -32,7 +32,13 @@ are also available at fixed URLs.
 
 ## Quick Start
 
-Identify the disk number of the attached broken VM disk:
+Run without arguments to show help and the available disks without mounting a target:
+
+```powershell
+.\Repair-AzVMDisk.ps1
+```
+
+You can also identify the disk number of the attached broken VM disk with:
 
 ```powershell
 Get-Disk
@@ -41,14 +47,18 @@ Get-Disk
 Then run a full diagnostic check:
 
 ```powershell
-.\Repair-AzVMDisk.ps1 -DiskNumber 3 -SysCheck
+.\Repair-AzVMDisk.ps1 -DiskNumber 3
 ```
 
 You can also target a Hyper-V VM by name instead of disk number:
 
 ```powershell
-.\Repair-AzVMDisk.ps1 -VMName "BrokenVM" -SysCheck
+.\Repair-AzVMDisk.ps1 -VMName "BrokenVM"
 ```
+
+When a target is supplied without an action option, the script defaults to `-SysCheck`.
+Explicit action options run as requested without adding a system check. Keep specifying
+`-SysCheck` when using its sub-options, such as `-BootOnly` or `-SaveOutput`.
 
 ## Usage Examples
 

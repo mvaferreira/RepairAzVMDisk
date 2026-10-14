@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.9.5
+        Version: 0.9.6
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -28,6 +28,8 @@
         A built-in system check (-SysCheck) inspects the offline disk for common issues across
         disk health, boot configuration, RDP/NLA policy, Windows Update/CBS state, credential guard,
         network bindings, Azure VM agent presence, and more - and prints actionable fix suggestions.
+        With no target, the script shows help and available disks. With -DiskNumber or -VMName
+        and no action option, it defaults to -SysCheck; explicit actions are run as requested.
 
         Repair mutations to the offline guest disk are logged to a JSON-line audit file
         (Repair-AzVMDisk_actions.log) alongside the script. Infrastructure steps required
@@ -46,9 +48,11 @@
 
     .PARAMETER DiskNumber
         Disk number of the attached broken VM disk (from Get-Disk). Use instead of -VMName.
+        Defaults to -SysCheck when no action option is supplied.
 
     .PARAMETER VMName
         Name of the Hyper-V VM whose disk should be attached automatically. Use instead of -DiskNumber.
+        Defaults to -SysCheck when no action option is supplied.
 
     .PARAMETER TryLKGC
         Selects the existing ControlSet recorded in offline Select\LastKnownGood, rather
@@ -181,6 +185,18 @@
         of the whole registry, and no longer creates SMI\Store\Machine\Backup. Only the deleted
         log files are backed up, under Windows\Temp\RepairAzVMDisk. The guest-visible outcome is
         the same: the same log files are gone from the same three folders.
+
+    .EXAMPLE
+        # Show help and available disks without mounting a target
+        PS> .\Repair-AzVMDisk.ps1
+
+    .EXAMPLE
+        # Run the default full diagnostic check on disk 3
+        PS> .\Repair-AzVMDisk.ps1 -DiskNumber 3
+
+    .EXAMPLE
+        # Run the default full diagnostic check on a Hyper-V VM's OS disk
+        PS> .\Repair-AzVMDisk.ps1 -VMName BrokenVM
 
     .EXAMPLE
         # Clear transaction logs for a 0x800719e4 / ERROR_LOG_FULL update failure
@@ -26771,7 +26787,7 @@ No destructive file or registry cleanup is performed.
             }
         }
 
-        # Show usage/disk list when called with no actionable parameters
+        # Show usage/disk list when no target is supplied
         if ($DiskNumber -lt 0 -and [string]::IsNullOrWhiteSpace($VMName)) {
             Write-Host @"
 ====================================================================
@@ -26779,8 +26795,14 @@ No destructive file or registry cleanup is performed.
 ====================================================================
 
 USAGE:
+  .\$(Split-Path -Leaf $PSCommandPath)
   .\$(Split-Path -Leaf $PSCommandPath) -DiskNumber <N> [Options]
   .\$(Split-Path -Leaf $PSCommandPath) -VMName <Name> [Options]
+
+DEFAULT BEHAVIOR:
+  No target: show this help and available disks without mounting a target.
+  Target without an action option: run -SysCheck (read-only diagnostics, no repairs).
+  Explicit action options: run only the requested actions.
 
 PARAMETERS:
   -DiskNumber <int>      Disk number visible in Disk Management
@@ -26792,6 +26814,13 @@ PARAMETERS:
                            Example: -LoadHive SYSTEM  -> HKLM:\BROKENSYSTEM available in regedit
   -UnloadHive <hive[,...]> Unmount previously loaded hives and take the disk offline
 
+--- SESSION HISTORY (no target required) --------------------------------------
+  -ShowLastSession       Show the last repair session from the action log
+    -Detailed              (sub-option) include individual action details
+    -All                   (sub-option) show all sessions
+    -SessionId <id>        (sub-option) show a specific session
+    -ExportTo <path>       (sub-option) export sessions to HTML
+
 --- AZURE AGENT ---------------------------------------------------------------
   -FixAzureGuestAgent    Enable Azure Guest Agent and RdAgent services (registry already present)
   -InstallAzureVMAgent   Install Azure VM Agent fully offline from host files (use when agent is missing)
@@ -26802,6 +26831,7 @@ PARAMETERS:
   -CollectEventLogs      Copy guest event logs and crash dumps to C:\temp on the host
   -CollectCrashDumps     Copy Minidump, MEMORY.DMP and LiveKernelReports to C:\temp on the host
   -AnalyzeCriticalBootFiles  Validate presence of critical boot/system binaries used during startup
+  -SkipCatalogVerification  Skip catalog-store verification when checking driver signatures
   -AnalyzeSyntheticDrivers  Validate Azure/Hyper-V synthetic drivers (vmbus/storvsc/netvsc)
   -AnalyzeProxyState     Show machine proxy/PAC settings that may block remote management
   -AnalyzeBcdConsistency Validate BCD loader/device/path consistency for current boot mode
@@ -26816,6 +26846,7 @@ PARAMETERS:
   -ScanNetBindings       Report third-party network binding components (non-ms_ ComponentId)
   -SysCheck              Full offline diagnostic scan: BCD, services, device filters, RDP, networking,
                            Azure Agent, security settings, crash artefacts - with fix suggestions
+                           Default when -DiskNumber or -VMName is supplied without an action option
     -BootOnly              (sub-option) check only boot: BCD, ESP/UEFI, hives, boot files and drivers
     -RDPOnly               (sub-option) check only RDP: listener, NLA/CredSSP, certificate, firewall
     -ConnectivityOnly      (sub-option) check only networking: TCP/IP, bindings, DNS, proxy, agent
@@ -26943,9 +26974,9 @@ PARAMETERS:
   -DisableFirewall       Disable Windows Firewall for all profiles (Domain/Private/Public)
   -EnableBFE             Re-enable Base Filtering Engine service
   -FixFirewallDebugLoopbackApps  Archive mpssvc DebugedLoopbackApps and recreate an empty value
-  -FixWFPRules               Neutralise IPsec connection security rules that block inbound RDP
                                   when duplicate SIDs risk the Firewall error 0x45b start/stop loop;
                                   captures/restores the existing AppCs owner/DACL around the repair
+  -FixWFPRules           Neutralise IPsec connection security rules that block inbound RDP
   -FixNetBindings        Remove orphaned third-party network binding components (missing binary; prevents NDIS init failure)
   -ResetNetworkStack     Reset TCP/IP stack, Winsock, firewall and DNS at next boot (also clears static DNS offline)
   -ResetInterfacesToDHCP Reset interface IPv4 settings to DHCP and clear static DNS/gateway values
@@ -27046,6 +27077,15 @@ AVAILABLE DISKS:
             }
             Write-Host ""
             return
+        }
+
+        # Target and global modifiers alone select the default read-only diagnostic action.
+        $requestedOptions = @($PSBoundParameters.Keys | Where-Object {
+            $_ -notin @('VMName', 'DiskNumber', 'Force', 'LeaveDiskOnline', 'SkipCatalogVerification')
+        })
+        if ($requestedOptions.Count -eq 0) {
+            $SysCheck = $true
+            $PSBoundParameters['SysCheck'] = $true
         }
 
         # Refuse to operate on the local OS disk when -DiskNumber is supplied directly
