@@ -17,7 +17,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.9.6
+        Version: 0.9.7
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -11860,11 +11860,8 @@ Runs DISM /StartComponentCleanup only if no pending servicing markers remain.
         }
         else {
             Write-Host "Running DISM /Cleanup-Image /StartComponentCleanup (best-effort reclaim of superseded components)" -ForegroundColor Yellow
-            # Armed with real limits. Offline component cleanup can spin indefinitely: measured on
-            # a 14393 image it burned 4,950s of CPU over 85 minutes while its I/O byte counter and
-            # DISM log barely moved. Because that trickle still reads as progress, the stall check
-            # alone never fires, so the absolute cap is what actually bounds the run.
-            $cleanupResult = Invoke-DismWithWatchdog -Description 'DISM StartComponentCleanup' -ImageDriveLetter $WinDriveLetter -StallMinutes 15 -MaximumMinutes 45 -Details @{
+            Write-Host "  No automatic timeout. Press Ctrl+C to stop the script; DISM will be force-stopped and its offline hive mounts released." -ForegroundColor DarkGray
+            $cleanupResult = Invoke-DismWithWatchdog -Description 'DISM StartComponentCleanup' -ImageDriveLetter $WinDriveLetter -Details @{
                 Image = $WinDriveLetter
             } -ArgumentList @("/Image:$WinDriveLetter", '/Cleanup-Image', '/StartComponentCleanup', '/ScratchDir:C:\Temp')
             $cleanupResult.Output | Out-Host
